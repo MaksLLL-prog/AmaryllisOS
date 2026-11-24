@@ -1,0 +1,638 @@
+use alloc::vec::Vec;
+
+use super::elf::{
+    Elf64Header,
+    Elf64ProgramHeader,
+    ELFCLASS64,
+    ELFDATA2LSB,
+    ELF_MAGIC,
+    EM_X86_64,
+    ET_EXEC,
+    PF_R,
+    PF_X,
+    PT_LOAD,
+};
+
+const ELF_BASE_VADDR: u64 = 0x0000_0000_0040_0000;
+const CODE_FILE_OFFSET: usize = 0x80;
+
+struct MiniElfBuilder {
+    code: Vec<u8>,
+    data: Vec<u8>,
+    lea_patches: Vec<(usize, usize)>, // (disp32_offset_in_code, offset_in_data)
+}
+
+impl MiniElfBuilder {
+    fn new() -> Self {
+        Self {
+            code: Vec::new(),
+            data: Vec::new(),
+            lea_patches: Vec::new(),
+        }
+    }
+
+    fn emit(&mut self, bytes: &[u8]) {
+        self.code.extend_from_slice(bytes);
+    }
+
+    fn add_string(&mut self, text: &[u8]) -> (usize, u32) {
+        let off = self.data.len();
+        self.data.extend_from_slice(text);
+        (off, text.len() as u32)
+    }
+
+    fn emit_mov_eax(&mut self, imm: u32) {
+        self.emit(&[0xB8]);
+        self.emit(&imm.to_le_bytes());
+    }
+
+    fn emit_mov_edi(&mut self, imm: u32) {
+        self.emit(&[0xBF]);
+        self.emit(&imm.to_le_bytes());
+    }
+
+    fn emit_mov_edx(&mut self, imm: u32) {
+        self.emit(&[0xBA]);
+        self.emit(&imm.to_le_bytes());
+    }
+
+    fn emit_lea_rsi_data(&mut self, data_off: usize) {
+        // lea rsi, [rip + disp32] => 48 8D 35 disp32
+        self.emit(&[0x48, 0x8D, 0x35]);
+        let disp_off = self.code.len();
+        self.emit(&[0, 0, 0, 0]);
+        self.lea_patches.push((disp_off, data_off));
+    }
+
+    fn emit_syscall(&mut self) {
+        self.emit(&[0x0F, 0x05]);
+    }
+
+    fn emit_write_literal(&mut self, msg: &[u8]) {
+        let (off, len) = self.add_string(msg);
+        self.emit_mov_eax(1); // SYS_WRITE
+        self.emit_mov_edi(1); // stdout
+        self.emit_lea_rsi_data(off);
+        self.emit_mov_edx(len);
+        self.emit_syscall();
+    }
+
+    fn emit_print_rax_u64_ln(&mut self) {
+        // Allocates 32 bytes on user stack, converts RAX to ASCII decimal + '\n', writes to fd 1.
+        self.emit(&[0x48, 0x83, 0xEC, 32]); // sub rsp, 32
+        self.emit(&[0x48, 0x8D, 0x74, 0x24, 32]); // lea rsi, [rsp + 32]
+        self.emit(&[0x48, 0xFF, 0xCE]); // dec rsi
+        self.emit(&[0xC6, 0x06, 0x0A]); // mov byte ptr [rsi], '\n'
+        self.emit(&[0x41, 0xB8, 0x01, 0x00, 0x00, 0x00]); // mov r8d, 1
+        self.emit(&[0xB9, 0x0A, 0x00, 0x00, 0x00]); // mov ecx, 10
+
+        let loop_start = self.code.len();
+        self.emit(&[0x31, 0xD2]); // xor edx, edx
+        self.emit(&[0x48, 0xF7, 0xF1]); // div rcx
+        self.emit(&[0x80, 0xC2, 0x30]); // add dl, '0'
+        self.emit(&[0x48, 0xFF, 0xCE]); // dec rsi
+        self.emit(&[0x88, 0x16]); // mov [rsi], dl
+        self.emit(&[0x49, 0xFF, 0xC0]); // inc r8
+        self.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+        let next_ip = self.code.len() + 2;
+        let rel8 = (loop_start as isize - next_ip as isize) as i8 as u8;
+        self.emit(&[0x75, rel8]); // jnz loop_start
+
+        self.emit(&[0x4C, 0x89, 0xC2]); // mov rdx, r8
+        self.emit_mov_eax(1); // SYS_WRITE
+        self.emit_mov_edi(1); // stdout
+        self.emit_syscall();
+        self.emit(&[0x48, 0x83, 0xC4, 32]); // add rsp, 32
+    }
+
+    fn emit_exit(&mut self, code: u32) {
+        self.emit_mov_eax(60); // SYS_EXIT
+        self.emit_mov_edi(code);
+        self.emit_syscall();
+    }
+
+    fn build(mut self) -> Vec<u8> {
+        let data_file_offset = CODE_FILE_OFFSET + self.code.len();
+        let total_size = data_file_offset + self.data.len();
+
+        for (disp_off, data_off) in self.lea_patches {
+            let next_rip = (CODE_FILE_OFFSET + disp_off + 4) as i64;
+            let target = (data_file_offset + data_off) as i64;
+            let disp = (target - next_rip) as i32;
+            self.code[disp_off..disp_off + 4].copy_from_slice(&disp.to_le_bytes());
+        }
+
+        let mut e_ident = [0u8; 16];
+        e_ident[0..4].copy_from_slice(&ELF_MAGIC);
+        e_ident[4] = ELFCLASS64;
+        e_ident[5] = ELFDATA2LSB;
+        e_ident[6] = 1; // EV_CURRENT
+
+        let ehdr = Elf64Header {
+            e_ident,
+            e_type: ET_EXEC,
+            e_machine: EM_X86_64,
+            e_version: 1,
+            e_entry: ELF_BASE_VADDR + CODE_FILE_OFFSET as u64,
+            e_phoff: core::mem::size_of::<Elf64Header>() as u64,
+            e_shoff: 0,
+            e_flags: 0,
+            e_ehsize: core::mem::size_of::<Elf64Header>() as u16,
+            e_phentsize: core::mem::size_of::<Elf64ProgramHeader>() as u16,
+            e_phnum: 1,
+            e_shentsize: 0,
+            e_shnum: 0,
+            e_shstrndx: 0,
+        };
+
+        let phdr = Elf64ProgramHeader {
+            p_type: PT_LOAD,
+            p_flags: PF_R | super::elf::PF_W | PF_X,
+            p_offset: 0,
+            p_vaddr: ELF_BASE_VADDR,
+            p_paddr: ELF_BASE_VADDR,
+            p_filesz: total_size as u64,
+            p_memsz: total_size as u64,
+            p_align: 0x1000,
+        };
+
+        let mut image = Vec::with_capacity(total_size);
+        image.resize(CODE_FILE_OFFSET, 0);
+
+        unsafe {
+            let ehdr_bytes = core::slice::from_raw_parts(
+                (&ehdr as *const Elf64Header) as *const u8,
+                core::mem::size_of::<Elf64Header>(),
+            );
+            image[0..ehdr_bytes.len()].copy_from_slice(ehdr_bytes);
+
+            let phdr_bytes = core::slice::from_raw_parts(
+                (&phdr as *const Elf64ProgramHeader) as *const u8,
+                core::mem::size_of::<Elf64ProgramHeader>(),
+            );
+            let ph_off = ehdr_bytes.len();
+            image[ph_off..ph_off + phdr_bytes.len()].copy_from_slice(phdr_bytes);
+        }
+
+        image.extend_from_slice(&self.code);
+        image.extend_from_slice(&self.data);
+        image
+    }
+}
+
+/// Standalone Ring 3 demo program: exercises SYS_WRITE, SYS_GETPID, SYS_UPTIME_MS, SYS_SLEEP_MS, SYS_EXIT.
+pub fn build_hello_elf() -> Vec<u8> {
+    let mut b = MiniElfBuilder::new();
+
+    b.emit_write_literal(b"[Ring 3] Hello from AmaryllisOS Userland!\n");
+    b.emit_write_literal(b"[Ring 3] Process PID: ");
+
+    b.emit_mov_eax(39); // SYS_GETPID
+    b.emit_syscall();
+    b.emit_print_rax_u64_ln();
+
+    b.emit_write_literal(b"[Ring 3] Kernel uptime (ms): ");
+    b.emit_mov_eax(96); // SYS_UPTIME_MS
+    b.emit_syscall();
+    b.emit_print_rax_u64_ln();
+
+    b.emit_write_literal(b"[Ring 3] Sleeping 200 ms via SYS_SLEEP_MS...\n");
+    b.emit_mov_eax(35); // SYS_SLEEP_MS
+    b.emit_mov_edi(200);
+    b.emit_syscall();
+
+    b.emit_write_literal(b"[Ring 3] Exiting cleanly with status 0.\n");
+    b.emit_exit(0);
+
+    b.build()
+}
+
+/// Interactive Ring 3 echo program: exercises SYS_READ (stdin) + SYS_WRITE + SYS_EXIT.
+pub fn build_echo_elf() -> Vec<u8> {
+    let mut b = MiniElfBuilder::new();
+
+    b.emit_write_literal(b"[Ring 3 echo] Enter a line: ");
+
+    // Reserve 128-byte user stack buffer and call SYS_READ(0, rsp, 127)
+    b.emit(&[0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00]); // sub rsp, 128
+    b.emit_mov_eax(0); // SYS_READ
+    b.emit_mov_edi(0); // stdin
+    b.emit(&[0x48, 0x89, 0xE6]); // mov rsi, rsp
+    b.emit_mov_edx(127);
+    b.emit_syscall();
+
+    // Preserve byte count read in R12
+    b.emit(&[0x49, 0x89, 0xC4]); // mov r12, rax
+
+    b.emit_write_literal(b"[Ring 3 echo] Read from user buffer: ");
+
+    b.emit_mov_eax(1); // SYS_WRITE
+    b.emit_mov_edi(1); // stdout
+    b.emit(&[0x48, 0x89, 0xE6]); // mov rsi, rsp
+    b.emit(&[0x4C, 0x89, 0xE2]); // mov rdx, r12
+    b.emit_syscall();
+
+    b.emit(&[0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00]); // add rsp, 128
+    b.emit_exit(0);
+
+    b.build()
+}
+
+/// Memory-protection test ELF: writes to NULL (0x0) from Ring 3 to prove hardware #PF isolation.
+pub fn build_fault_elf() -> Vec<u8> {
+    let mut b = MiniElfBuilder::new();
+
+    b.emit_write_literal(b"[Ring 3 fault] Triggering intentional Ring 3 #PF at 0x0...\n");
+    b.emit(&[0x31, 0xC0]); // xor eax, eax
+    b.emit(&[0x48, 0xC7, 0x00, 0x34, 0x12, 0x00, 0x00]); // mov qword ptr [rax], 0x1234
+    b.emit_exit(1);
+
+    b.build()
+}
+
+/// Interactive Ring 3 GUI ELF: creates a desktop window (320x180), animates plasma waves + clickable glow,
+/// handles CloseRequested (or 'q') cleanly via SYS_CREATE_WINDOW(300) / SYS_WINDOW_BLIT(301) / SYS_POLL_GUI_EVENT(302).
+pub fn build_gui_demo_elf() -> Vec<u8> {
+    const W: usize = 320;
+    const H: usize = 180;
+    let mut b = MiniElfBuilder::new();
+
+    let (title_off, title_len) = b.add_string(b"Amaryllis Ring 3 Demo (click / q)");
+    let fb_off = b.data.len();
+    b.data.resize(fb_off + W * H * 4, 0);
+
+    // Reserve stack space: 16 bytes for UserGuiEvent
+    b.emit(&[0x48, 0x83, 0xEC, 32]); // sub rsp, 32
+
+    // SYS_CREATE_WINDOW(title_ptr, title_len, (W << 16) | H) -> win_id in r12
+    b.emit_mov_eax(300);
+    // lea rdi, [rip + disp32] => 48 8D 3D disp32
+    b.emit(&[0x48, 0x8D, 0x3D]);
+    let t_disp = b.code.len();
+    b.emit(&[0, 0, 0, 0]);
+    b.lea_patches.push((t_disp, title_off));
+    // mov esi, title_len
+    b.emit(&[0xBE]);
+    b.emit(&title_len.to_le_bytes());
+    b.emit_mov_edx(((W as u32) << 16) | (H as u32));
+    b.emit_syscall();
+    // If rax < 0, exit(1)
+    b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+    let jns_ok = b.code.len();
+    b.emit(&[0x79, 0x0C]); // jns +12 (skip exit)
+    b.emit_mov_eax(60);
+    b.emit_mov_edi(1);
+    b.emit_syscall();
+    let ok_pos = b.code.len();
+    b.code[jns_ok + 1] = (ok_pos - (jns_ok + 2)) as u8;
+
+    // r12 = win_id, r13 = frame counter, r14 = beacon_x (160), r15 = beacon_y (90)
+    b.emit(&[0x49, 0x89, 0xC4]); // mov r12, rax
+    b.emit(&[0x45, 0x31, 0xED]); // xor r13d, r13d
+    b.emit(&[0x41, 0xBE, 160, 0, 0, 0]); // mov r14d, 160
+    b.emit(&[0x41, 0xBF, 90, 0, 0, 0]); // mov r15d, 90
+
+    // Frame loop start
+    let frame_loop = b.code.len();
+
+    // rbx = framebuffer pointer
+    b.emit(&[0x48, 0x8D, 0x1D]); // lea rbx, [rip + disp32]
+    let fb_disp = b.code.len();
+    b.emit(&[0, 0, 0, 0]);
+    b.lea_patches.push((fb_disp, fb_off));
+
+    // Loop y = 0..H (ecx = y)
+    b.emit(&[0x31, 0xC9]); // xor ecx, ecx
+    let y_loop = b.code.len();
+    // Loop x = 0..W (r8d = x)
+    b.emit(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+    let x_loop = b.code.len();
+
+    // Compute pixel color in eax without fragile SIB lea:
+    // edx = (r8d + r13d) ^ (ecx + r13d)
+    b.emit(&[0x44, 0x89, 0xC0]); // mov eax, r8d
+    b.emit(&[0x44, 0x01, 0xE8]); // add eax, r13d
+    b.emit(&[0x89, 0xCA]); // mov edx, ecx
+    b.emit(&[0x44, 0x01, 0xEA]); // add edx, r13d
+    b.emit(&[0x31, 0xD0]); // xor eax, edx
+    b.emit(&[0x83, 0xE0, 0x3F]); // and eax, 0x3F
+    b.emit(&[0x83, 0xC0, 0x12]); // add eax, 0x12 (R)
+    b.emit(&[0xC1, 0xE0, 16]); // shl eax, 16
+
+    // G channel in edx
+    b.emit(&[0x44, 0x89, 0xC2]); // mov edx, r8d
+    b.emit(&[0x44, 0x01, 0xEA]); // add edx, r13d
+    b.emit(&[0x83, 0xE2, 0x7F]); // and edx, 0x7F
+    b.emit(&[0x83, 0xC2, 0x38]); // add edx, 0x38
+    b.emit(&[0xC1, 0xE2, 8]); // shl edx, 8
+    b.emit(&[0x09, 0xD0]); // or eax, edx
+
+    // B channel in edx
+    b.emit(&[0x89, 0xCA]); // mov edx, ecx
+    b.emit(&[0x44, 0x01, 0xEA]); // add edx, r13d
+    b.emit(&[0x83, 0xE2, 0x7F]); // and edx, 0x7F
+    b.emit(&[0x83, 0xC2, 0x55]); // add edx, 0x55
+    b.emit(&[0x09, 0xD0]); // or eax, edx
+
+    // Check Manhattan distance to beacon (r14d, r15d)
+    b.emit(&[0x44, 0x89, 0xC2]); // mov edx, r8d
+    b.emit(&[0x44, 0x29, 0xF2]); // sub edx, r14d
+    b.emit(&[0x85, 0xD2]); // test edx, edx
+    b.emit(&[0x79, 0x02]); // jns +2
+    b.emit(&[0xF7, 0xDA]); // neg edx
+
+    b.emit(&[0x89, 0xCE]); // mov esi, ecx
+    b.emit(&[0x44, 0x29, 0xFE]); // sub esi, r15d
+    b.emit(&[0x85, 0xF6]); // test esi, esi
+    b.emit(&[0x79, 0x02]); // jns +2
+    b.emit(&[0xF7, 0xDE]); // neg esi
+
+    b.emit(&[0x01, 0xF2]); // add edx, esi
+    b.emit(&[0x83, 0xFA, 24]); // cmp edx, 24
+    b.emit(&[0x7D, 0x05]); // jge +5
+    b.emit(&[0xB8, 0x96, 0xE8, 0x28, 0x00]); // mov eax, 0x0028E896 (Amaryllis mint glow)
+
+    // Write pixel: mov [rbx], eax; add rbx, 4
+    b.emit(&[0x89, 0x03]);
+    b.emit(&[0x48, 0x83, 0xC3, 4]);
+
+    // inc r8d; cmp r8d, W; jl x_loop
+    b.emit(&[0x41, 0xFF, 0xC0]);
+    b.emit(&[0x41, 0x81, 0xF8]);
+    b.emit(&(W as u32).to_le_bytes());
+    let j_x = b.code.len() + 6;
+    let rel_x = (x_loop as isize - j_x as isize) as i32;
+    b.emit(&[0x0F, 0x8C]);
+    b.emit(&rel_x.to_le_bytes());
+
+    // inc ecx; cmp ecx, H; jl y_loop
+    b.emit(&[0xFF, 0xC1]);
+    b.emit(&[0x81, 0xF9]);
+    b.emit(&(H as u32).to_le_bytes());
+    let j_y = b.code.len() + 6;
+    let rel_y = (y_loop as isize - j_y as isize) as i32;
+    b.emit(&[0x0F, 0x8C]);
+    b.emit(&rel_y.to_le_bytes());
+
+    // SYS_WINDOW_BLIT(win_id=r12, buf_ptr, (W<<16)|H)
+    b.emit_mov_eax(301);
+    b.emit(&[0x4C, 0x89, 0xE7]); // mov rdi, r12
+    b.emit_lea_rsi_data(fb_off);
+    b.emit_mov_edx(((W as u32) << 16) | (H as u32));
+    b.emit_syscall();
+
+    // SYS_POLL_GUI_EVENT(win_id=r12, rsp, 20)
+    b.emit_mov_eax(302);
+    b.emit(&[0x4C, 0x89, 0xE7]); // mov rdi, r12
+    b.emit(&[0x48, 0x89, 0xE6]); // mov rsi, rsp
+    b.emit_mov_edx(20);
+    b.emit_syscall();
+
+    // Check event
+    b.emit(&[0x8B, 0x04, 0x24]); // mov eax, [rsp] (kind)
+    b.emit(&[0x83, 0xF8, 1]); // cmp eax, 1 (CloseRequested)
+    let je_exit1 = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]); // patched later
+
+    b.emit(&[0x83, 0xF8, 3]); // cmp eax, 3 (KeyChar)
+    let jne_key = b.code.len();
+    b.emit(&[0x75, 0x00]); // dynamically patched below
+    b.emit(&[0x83, 0x7C, 0x24, 4, b'q' as u8]); // cmp dword ptr [rsp+4], 'q'
+    let je_exit2 = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]); // patched later
+    let after_key = b.code.len();
+    b.code[jne_key + 1] = (after_key - (jne_key + 2)) as u8;
+
+    // If MouseDown (kind == 2): update r14d = [rsp+4], r15d = [rsp+8], beep
+    b.emit(&[0x83, 0xF8, 2]); // cmp eax, 2
+    let jne_next = b.code.len();
+    b.emit(&[0x75, 0x00]); // dynamically patched below
+    b.emit(&[0x44, 0x8B, 0x74, 0x24, 4]); // mov r14d, [rsp+4]
+    b.emit(&[0x44, 0x8B, 0x7C, 0x24, 8]); // mov r15d, [rsp+8]
+    b.emit_mov_eax(200); // SYS_BEEP
+    b.emit_mov_edi(680);
+    b.emit(&[0xBE, 35, 0, 0, 0]); // mov esi, 35
+    b.emit_syscall();
+    let after_mouse = b.code.len();
+    b.code[jne_next + 1] = (after_mouse - (jne_next + 2)) as u8;
+
+    // inc r13d; jmp frame_loop
+    b.emit(&[0x41, 0xFF, 0xC5]); // inc r13d
+    let jmp_end = b.code.len() + 5;
+    let rel_loop = (frame_loop as isize - jmp_end as isize) as i32;
+    b.emit(&[0xE9]);
+    b.emit(&rel_loop.to_le_bytes());
+
+    // Exit label
+    let exit_label = b.code.len();
+    let disp1 = (exit_label as isize - (je_exit1 + 6) as isize) as i32;
+    b.code[je_exit1 + 2..je_exit1 + 6].copy_from_slice(&disp1.to_le_bytes());
+    let disp2 = (exit_label as isize - (je_exit2 + 6) as isize) as i32;
+    b.code[je_exit2 + 2..je_exit2 + 6].copy_from_slice(&disp2.to_le_bytes());
+
+    b.emit(&[0x48, 0x83, 0xC4, 32]); // add rsp, 32
+    b.emit_exit(0);
+
+    b.build()
+}
+
+/// Preemptive multitasking counter ELF: loops 8 iterations printing its PID and uptime every 350 ms.
+/// Launch two copies with 'execbg /counter.elf' or Files to observe concurrent Ring 3 scheduling!
+pub fn build_counter_elf() -> Vec<u8> {
+    let mut b = MiniElfBuilder::new();
+
+    // Reserve r12 = loop counter (1..=8), r13 = my pid
+    b.emit_mov_eax(39); // SYS_GETPID
+    b.emit_syscall();
+    b.emit(&[0x49, 0x89, 0xC5]); // mov r13, rax
+
+    b.emit_write_literal(b"[counter] Multitasking Ring 3 worker started, PID=");
+    b.emit(&[0x4C, 0x89, 0xE8]); // mov rax, r13
+    b.emit_print_rax_u64_ln();
+
+    b.emit(&[0x41, 0xBC, 0x01, 0x00, 0x00, 0x00]); // mov r12d, 1
+
+    let loop_top = b.code.len();
+    b.emit_write_literal(b"  PID=");
+    b.emit(&[0x4C, 0x89, 0xE8]); // mov rax, r13
+    b.emit_print_rax_u64_ln();
+
+    b.emit_write_literal(b"  step=");
+    b.emit(&[0x4C, 0x89, 0xE0]); // mov rax, r12
+    b.emit_print_rax_u64_ln();
+
+    b.emit_write_literal(b"  uptime_ms=");
+    b.emit_mov_eax(96); // SYS_UPTIME_MS
+    b.emit_syscall();
+    b.emit_print_rax_u64_ln();
+
+    // SYS_SLEEP_MS(350)
+    b.emit_mov_eax(35);
+    b.emit_mov_edi(350);
+    b.emit_syscall();
+
+    // inc r12d; cmp r12d, 9; jl loop_top
+    b.emit(&[0x41, 0xFF, 0xC4]);
+    b.emit(&[0x41, 0x83, 0xFC, 9]);
+    let jmp_end = b.code.len() + 6;
+    let rel = (loop_top as isize - jmp_end as isize) as i32;
+    b.emit(&[0x0F, 0x8C]);
+    b.emit(&rel.to_le_bytes());
+
+    b.emit_write_literal(b"[counter] Worker finished cleanly.\n");
+    b.emit_exit(0);
+    b.build()
+}
+
+/// Ring 3 Network syscall demo ELF: exercises SYS_NET_PING(210) on QEMU SLIRP gateway 10.0.2.2
+/// and SYS_DNS_RESOLVE(211) on "example.com".
+pub fn build_net_demo_elf() -> Vec<u8> {
+    let mut b = MiniElfBuilder::new();
+    let (host_off, host_len) = b.add_string(b"example.com");
+
+    b.emit_write_literal(b"[net_demo] Ring 3 Network Syscall Demo\n");
+    b.emit_write_literal(b"[net_demo] Pinging 10.0.2.2 via SYS_NET_PING (210)...\n");
+
+    // SYS_NET_PING(0x0A000202, seq=1, timeout_ms=1200)
+    b.emit_mov_eax(210);
+    b.emit_mov_edi(0x0A00_0202);
+    b.emit(&[0xBE, 1, 0, 0, 0]); // mov esi, 1
+    b.emit_mov_edx(1200);
+    b.emit_syscall();
+
+    b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+    let jns_ok = b.code.len();
+    b.emit(&[0x79, 0x00]);
+    b.emit_write_literal(b"[net_demo] Ping timed out (run 'dhcp' or check e1000)\n");
+    let jmp_dns = b.code.len();
+    b.emit(&[0xEB, 0x00]);
+
+    let ping_ok = b.code.len();
+    b.code[jns_ok + 1] = (ping_ok - (jns_ok + 2)) as u8;
+    b.emit(&[0x49, 0x89, 0xC4]); // mov r12, rax
+    b.emit_write_literal(b"[net_demo] Ping OK, RTT(ms)=");
+    b.emit(&[0x4C, 0x89, 0xE0]); // mov rax, r12
+    b.emit_print_rax_u64_ln();
+
+    let dns_label = b.code.len();
+    b.code[jmp_dns + 1] = (dns_label - (jmp_dns + 2)) as u8;
+
+    b.emit_write_literal(b"[net_demo] Resolving example.com via SYS_DNS_RESOLVE (211)...\n");
+    b.emit(&[0x48, 0x83, 0xEC, 16]); // sub rsp, 16 (4-byte IP out buffer)
+    b.emit_mov_eax(211);
+    b.emit(&[0x48, 0x8D, 0x3D]); // lea rdi, [rip + disp32]
+    let h_disp = b.code.len();
+    b.emit(&[0, 0, 0, 0]);
+    b.lea_patches.push((h_disp, host_off));
+    b.emit(&[0xBE]);
+    b.emit(&host_len.to_le_bytes());
+    b.emit(&[0x48, 0x89, 0xE2]); // mov rdx, rsp
+    b.emit_syscall();
+
+    b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+    let jz_dns_ok = b.code.len();
+    b.emit(&[0x74, 0x00]);
+    b.emit_write_literal(b"[net_demo] DNS lookup failed or timed out.\n");
+    let jmp_done = b.code.len();
+    b.emit(&[0xEB, 0x00]);
+
+    let dns_ok = b.code.len();
+    b.code[jz_dns_ok + 1] = (dns_ok - (jz_dns_ok + 2)) as u8;
+    b.emit_write_literal(b"[net_demo] DNS resolved first octet=");
+    b.emit(&[0x0F, 0xB6, 0x04, 0x24]); // movzx eax, byte ptr [rsp]
+    b.emit_print_rax_u64_ln();
+
+    let done_label = b.code.len();
+    b.code[jmp_done + 1] = (done_label - (jmp_done + 2)) as u8;
+    b.emit(&[0x48, 0x83, 0xC4, 16]);
+    b.emit_exit(0);
+    b.build()
+}
+
+/// Demand-paged lazy allocation & hardened copy_*_user demo ELF (`/lazy_demo.elf`):
+/// 1) Reserves 128 KiB via SYS_MMAP(9) (0 physical pages committed initially)
+/// 2) Touches bytes across page 0 & page 31, triggering hardware #PF demand-paging
+/// 3) Expands user stack by -68 KiB cleanly via lazy stack growth #PF
+/// 4) Calls SYS_STAT(4) pointing into an untouched lazy mmap page (copy_to_user commits on demand!)
+pub fn build_lazy_demo_elf() -> Vec<u8> {
+    let mut b = MiniElfBuilder::new();
+    let (stat_path_off, stat_path_len) = b.add_string(b"/disk");
+
+    b.emit_write_literal(b"[lazy_demo] Demand-Paged #PF + Hardened copy_*_user Test\n");
+    b.emit_write_literal(b"[lazy_demo] Calling SYS_MMAP(131072, RW)...\n");
+
+    // SYS_MMAP(addr=0, len=131072, prot=3)
+    b.emit_mov_eax(9);
+    b.emit_mov_edi(0);
+    b.emit(&[0xBE, 0x00, 0x00, 0x02, 0x00]); // mov esi, 131072
+    b.emit_mov_edx(3);
+    b.emit_syscall();
+
+    // Save mmap base in r12
+    b.emit(&[0x49, 0x89, 0xC4]); // mov r12, rax
+    b.emit_write_literal(b"[lazy_demo] mmap base (0 pages mapped yet)=");
+    b.emit(&[0x4C, 0x89, 0xE0]); // mov rax, r12
+    b.emit_print_rax_u64_ln();
+
+    // 1) Touch page 0 and page 31 (triggers 2 demand-paged #PFs directly from Ring 3!)
+    b.emit(&[0x41, 0xC7, 0x04, 0x24, 0x42, 0x00, 0x00, 0x00]); // mov dword ptr [r12], 0x42
+    b.emit(&[0x49, 0xC7, 0x84, 0x24, 0x00, 0xF0, 0x01, 0x00, 0x99, 0x00, 0x00, 0x00]); // mov qword ptr [r12 + 0x1F000], 0x99
+
+    // 2) Lazy stack expansion (-68 KiB crosses initial 64 KiB mapped boundary!)
+    b.emit(&[0x48, 0x81, 0xEC, 0x00, 0x10, 0x01, 0x00]); // sub rsp, 0x11000
+    b.emit(&[0x48, 0xC7, 0x04, 0x24, 0x55, 0x00, 0x00, 0x00]); // mov qword ptr [rsp], 0x55
+    b.emit(&[0x48, 0x81, 0xC4, 0x00, 0x10, 0x01, 0x00]); // add rsp, 0x11000
+
+    b.emit_write_literal(b"[lazy_demo] Touched mmap p0+p31 & -68KiB stack cleanly!\n");
+
+    // 3) Hardened copy_to_user onto untouched lazy mmap page 16 (r12 + 0x10000)
+    b.emit_mov_eax(4); // SYS_STAT("/disk", len, r12 + 0x10000)
+    b.emit(&[0x48, 0x8D, 0x3D]); // lea rdi, [rip + disp32]
+    let p_disp = b.code.len();
+    b.emit(&[0, 0, 0, 0]);
+    b.lea_patches.push((p_disp, stat_path_off));
+    b.emit(&[0xBE]);
+    b.emit(&stat_path_len.to_le_bytes());
+    b.emit(&[0x49, 0x8D, 0x94, 0x24, 0x00, 0x00, 0x01, 0x00]); // lea rdx, [r12 + 0x10000]
+    b.emit_syscall();
+
+    b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+    let jnz_stat_fail = b.code.len();
+    b.emit(&[0x75, 0x00]);
+    b.emit_write_literal(b"[lazy_demo] SYS_STAT onto untouched lazy page OK, bytes=");
+    b.emit(&[0x49, 0x8B, 0x84, 0x24, 0x00, 0x00, 0x01, 0x00]); // mov rax, [r12 + 0x10000]
+    b.emit_print_rax_u64_ln();
+    let jmp_unmap = b.code.len();
+    b.emit(&[0xEB, 0x00]);
+
+    let fail_lbl = b.code.len();
+    b.code[jnz_stat_fail + 1] = (fail_lbl - (jnz_stat_fail + 2)) as u8;
+    b.emit_write_literal(b"[lazy_demo] SYS_STAT returned error\n");
+
+    let unmap_lbl = b.code.len();
+    b.code[jmp_unmap + 1] = (unmap_lbl - (jmp_unmap + 2)) as u8;
+    // SYS_MUNMAP(r12, 131072)
+    b.emit_mov_eax(11);
+    b.emit(&[0x4C, 0x89, 0xE7]); // mov rdi, r12
+    b.emit(&[0xBE, 0x00, 0x00, 0x02, 0x00]); // mov esi, 131072
+    b.emit_syscall();
+
+    b.emit_write_literal(b"[lazy_demo] All demand-paged & guard checks PASSED!\n");
+    b.emit_exit(0);
+    b.build()
+}
+
+/// Intentional User Stack Guard Page trigger ELF (`/guard_fault.elf`):
+/// Probes the unmapped 4 KiB guard page at `0x0000_007F_FFFA_F000` just below the 256 KiB stack limit
+/// so the kernel intercepts `#PF` (`GUARD_PAGE_HIT`) cleanly without corrupting any state.
+pub fn build_guard_fault_elf() -> Vec<u8> {
+    let mut b = MiniElfBuilder::new();
+    b.emit_write_literal(b"[guard_fault] Probing User Stack Guard Page (0x7FFFFAF000)...\n");
+    // mov rax, 0x0000007FFFFAF000 -> 48 B8 <u64>
+    b.emit(&[0x48, 0xB8]);
+    b.emit(&super::elf::USER_STACK_GUARD_ADDR.to_le_bytes());
+    // mov qword ptr [rax], 1 => triggers hardware #PF in StackGuard VMA
+    b.emit(&[0x48, 0xC7, 0x00, 0x01, 0x00, 0x00, 0x00]);
+    b.emit_exit(1);
+    b.build()
+}

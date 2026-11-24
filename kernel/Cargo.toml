@@ -1,0 +1,18 @@
+
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["kensei"]
+license = "Apache-2.0"
+license-file = "LICENSE"
+description = "ANU (Amaryllis is Not Unix) — 64-bit no_std Rust hybrid kernel"
+
+[dependencies]
+bootloader_api = "0.11.17"
+font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
+
+x86_64 = "0.15.2"
+lazy_static = { version = "1.5", features = ["spin_no_std"] }
+spin = "0.9"
+fontdue = { version = "0.9", default-features = false }

@@ -1,0 +1,24 @@
+[package]
+name = "amaryllis_os"
+version = "0.11.0"
+edition = "2021"
+authors = ["kensei"]
+license = "Apache-2.0"
+license-file = "LICENSE"
+description = "Amaryllis OS — 64-bit hybrid operating system powered by the ANU kernel"
+
+[workspace]
+resolver = "3"
+members = ["kernel", "amaryllis-sdk"]
+
+[build-dependencies]
+bootloader = "0.11.17"
+kernel = { path = "kernel", artifact = "bin", target = "x86_64-unknown-none" }
+
+[profile.dev]
+opt-level = 3
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
