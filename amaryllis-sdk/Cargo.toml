@@ -1,9 +1,11 @@
 [package]
 name = "amaryllis-sdk"
-version = "0.1.0"
+version = "0.11.0"
 edition = "2021"
-description = "Bare-metal no_std Rust SDK for building preemptive Ring 3 ELF64 programs for AmaryllisOS"
-license = "MIT"
+authors = ["MaksLLL-prog"]
+description = "Bare-metal #![no_std] Rust SDK for building preemptive Ring 3 ELF64 programs for Amaryllis OS (ANU kernel)"
+repository = "https://github.com/MaksLLL-prog/AmaryllisOS"
+license = "Apache-2.0"
 
 [lib]
 name = "amaryllis_sdk"
@@ -33,12 +35,17 @@ path = "examples/fs_alloc_demo.rs"
 name = "ipc_shm_gui"
 path = "examples/ipc_shm_gui.rs"
 
+[[example]]
+name = "fork_demo"
+path = "examples/fork_demo.rs"
+
 [profile.dev]
 opt-level = 2
 panic = "abort"
 
 [profile.release]
 opt-level = 3
+codegen-units = 1
 panic = "abort"
 lto = true
 strip = "debuginfo"

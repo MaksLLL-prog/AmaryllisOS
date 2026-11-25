@@ -1,10 +1,10 @@
-# AmaryllisOS
+# Amaryllis OS
 
 **Amaryllis OS** is an independent bare-metal operating system developed from scratch in Rust.
 
 It is powered by **ANU (Amaryllis is Not Unix)** — an independently designed x86_64 hybrid kernel inspired by architectural concepts from Mach, BSD, IOKit, and Libkern.
 
-The project focuses on building a complete operating system environment, including its own memory management, SMP infrastructure, preemptive scheduler, userland execution environment, storage subsystem, networking stack, device infrastructure, and graphical desktop.
+The project includes its own memory management, SMP infrastructure, preemptive scheduler, kernel threads, userland execution environment, storage subsystem, networking stack, device infrastructure, and graphical desktop environment.
 
 > **Amaryllis OS is an experimental operating system under active development.**
 
@@ -14,7 +14,7 @@ The project focuses on building a complete operating system environment, includi
 
 | Property | Value |
 |---|---|
-| Version | v0.11 |
+| Version | v0.11.0 |
 | Kernel | ANU — Amaryllis is Not Unix |
 | Architecture | x86_64 |
 | Language | Rust |
@@ -23,21 +23,9 @@ The project focuses on building a complete operating system environment, includi
 | Desktop | Amaryllis Desktop |
 | License | Apache License 2.0 |
 
-### Project Statistics
-
-| Metric | Value |
-|---|---:|
-| Total codebase | 73,150 lines |
-| Source and configuration files | 143 |
-| Version | v0.11 |
-
-*Statistics represent the reported project snapshot as of November 24, 2026.*
-
----
-
 ## Architecture
 
-ANU is a custom hybrid kernel that combines architectural ideas from several established operating system designs.
+ANU is a custom hybrid kernel combining architectural ideas from several established operating system designs.
 
 | Inspiration | Architectural concepts |
 |---|---|
@@ -64,13 +52,7 @@ The kernel is organized into separate subsystems for architecture, memory, sched
 - Ring 3 exception recovery.
 - `SWAPGS` and per-CPU context management.
 - `syscall` / `sysret`.
-- ACPI parsing:
-  - RSDP
-  - RSDT / XSDT
-  - FADT
-  - MADT
-  - MCFG
-  - HPET
+- ACPI parsing: RSDP, RSDT/XSDT, FADT, MADT, MCFG, HPET.
 - Hardware reboot and shutdown through FADT.
 - Local APIC periodic timer at 1000 Hz.
 - IOAPIC GSI routing.
@@ -82,6 +64,7 @@ The kernel is organized into separate subsystems for architecture, memory, sched
 
 **SMP implementation:**
 
+- 4-core SMP configuration.
 - AP startup using INIT-SIPI-SIPI.
 - 16-bit Real Mode → 32-bit Protected Mode → 64-bit Long Mode trampoline.
 - Physical trampoline address `0x8000`.
@@ -96,7 +79,10 @@ The kernel is organized into separate subsystems for architecture, memory, sched
 **Implemented:**
 
 - Bitmap-based Physical Memory Manager.
-- 4 KiB physical frame allocation and deallocation.
+- Physical frame allocation and deallocation.
+- Physical frame reference counting (PMM refcount).
+- Copy-on-Write (CoW) memory management.
+- CoW page fault handling through `#PF`.
 - Four-level x86_64 paging.
 - Independent process address spaces.
 - CR3 switching.
@@ -111,7 +97,7 @@ The kernel is organized into separate subsystems for architecture, memory, sched
 - 4 KiB guard pages for user and kernel thread stacks.
 - Hardened `copy_from_user` and `copy_to_user`.
 
-**Planned:** Physical frame reference counting and Copy-on-Write (CoW).
+CoW allows processes to share physical memory pages until a write requires a private copy.
 
 ### 3. Scheduling and Kernel Threads
 
@@ -140,6 +126,8 @@ The kernel is organized into separate subsystems for architecture, memory, sched
 - `syscall` / `sysret` interface.
 - `brk`, `mmap`, and `munmap`.
 - Process memory reclamation.
+- `fork()` with Copy-on-Write address-space duplication.
+- `waitpid()` for child-process synchronization.
 - VFS file and directory descriptors.
 - File operations through system calls.
 - Process creation through `SYS_SPAWN_ELF`.
@@ -176,8 +164,26 @@ Additional functionality:
 - Filesystem interfaces.
 - Networking interfaces.
 - GUI integration.
+- Process interfaces.
 - Linker configuration.
 - Runnable example applications.
+
+**SDK examples:**
+
+- `hello`
+- `multitask_counter`
+- `gui_plasma`
+- `net_http_client`
+- `fs_alloc_demo`
+- `ipc_shm_gui`
+- `fork_demo`
+
+The `fork_demo` example demonstrates:
+
+- Calling `fork()`.
+- Copy-on-Write memory behavior.
+- Isolated writes to the process stack.
+- Waiting for child-process completion through `waitpid()`.
 
 See [`amaryllis-sdk/README.md`](amaryllis-sdk/README.md) for SDK usage and examples.
 
@@ -281,7 +287,7 @@ Additional functionality:
 
 Available diagnostic commands include:
 
-`sm​p`, `apic`, `ioreg`, `kthread`, `diskinfo`, `virtio`, `netinfo`.
+` smp `, `apic`, `ioreg`, `kthread`, `diskinfo`, `virtio`, `netinfo`.
 
 ### 11. Amaryllis Desktop
 
@@ -325,18 +331,9 @@ Amaryllis includes an independently developed graphical desktop environment.
 
 ## Development Roadmap
 
-The next development phase focuses on expanding the memory model, process interfaces, IPC architecture, and native filesystem.
+The next development phase focuses on expanding the IPC architecture, native filesystem, and overall system reliability.
 
-### 1. Mach-Inspired Virtual Memory
-
-- [ ] Physical frame reference counting in PMM.
-- [ ] Copy-on-Write (CoW).
-- [ ] File-backed `mmap` integrated with Page Cache.
-- [ ] `fork()`.
-- [ ] `waitpid()`.
-- [ ] POSIX signals.
-
-### 2. Mach-Inspired IPC
+### 1. Mach-Inspired IPC
 
 - [ ] Typed IPC message ports.
 - [ ] Send / Receive permissions.
@@ -345,17 +342,26 @@ The next development phase focuses on expanding the memory model, process interf
 - [ ] Service discovery infrastructure inspired by `launchd`.
 - [ ] Mach Exception Ports.
 
-### 3. FmFS — Native Amaryllis Filesystem
+### 2. FmFS — Native Amaryllis Filesystem
 
 - [ ] Extent-based storage architecture.
 - [ ] Filesystem access permissions.
 - [ ] Metadata checksums.
 - [ ] Journaling.
-- [ ] Copy-on-Write mechanisms.
+- [ ] Copy-on-Write filesystem mechanisms.
 - [ ] VFS integration.
 - [ ] Unified Page Cache integration.
 
 FmFS is planned as the native filesystem direction for Amaryllis OS, eventually replacing FAT32 as the primary filesystem.
+
+### 3. Reliability and Compatibility
+
+- [ ] Expanded SMP stress testing.
+- [ ] Memory pressure and CoW stress testing.
+- [ ] Process lifecycle and fault-recovery testing.
+- [ ] Storage consistency testing.
+- [ ] Expanded physical hardware compatibility.
+- [ ] Long-running workload validation.
 
 ---
 
@@ -420,7 +426,16 @@ The root `.cargo/config.toml` enables Cargo's unstable binary dependency support
 bindeps = true
 ```
 
-This is required for the kernel artifact dependency used by the root package.
+The release profile uses optimized compilation with a single code generation unit:
+
+```toml
+[profile.release]
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+```
+
+This configuration is intended to produce a more optimized final binary.
 
 **Boot configuration:** The current build creates a BIOS boot image. UEFI boot support is not established by this configuration.
 
@@ -437,12 +452,12 @@ The project follows four core principles:
 
 Current development priorities:
 
-- Expand VM capabilities.
 - Strengthen SMP and concurrency validation.
 - Improve process and IPC infrastructure.
 - Expand hardware compatibility.
 - Improve storage reliability.
 - Continue developing the native filesystem.
+- Validate CoW under memory pressure and concurrent workloads.
 - Validate the kernel under sustained workloads.
 
 ---
@@ -452,6 +467,7 @@ Current development priorities:
 - A successful compilation does not automatically prove runtime correctness.
 - Implemented functionality should be distinguished from fully validated functionality.
 - SMP, interrupt handling, memory management, and scheduling changes require careful regression testing.
+- CoW requires careful validation of page reference counts, write faults, and address-space teardown.
 - Avoid unnecessary rewrites of working subsystems.
 - Preserve memory-management validation results.
 - Maintain clear subsystem boundaries and avoid circular dependencies.
@@ -464,17 +480,23 @@ Current development priorities:
 
 ## Current Project State
 
-Amaryllis OS v0.11 has progressed beyond its initial kernel and graphical prototype stages.
+Amaryllis OS v0.11.0 has progressed beyond its initial kernel and graphical prototype stages.
 
-The project now contains a custom x86_64 hybrid kernel with SMP, virtual memory, preemptive scheduling, kernel threads, Ring 3 execution, an application SDK, storage and networking subsystems, device infrastructure, and an independent graphical desktop.
+The project now includes:
+
+- A custom x86_64 hybrid kernel.
+- 4-core SMP configuration and inter-processor communication.
+- Physical memory reference counting and Copy-on-Write.
+- Process creation through `fork()` and synchronization through `waitpid()`.
+- Preemptive scheduling and kernel threads.
+- Ring 3 execution and an application SDK.
+- Storage and networking subsystems.
+- Device infrastructure and audio support.
+- An independent graphical desktop environment.
 
 The fundamental architecture is in place. The current challenge is expanding its capabilities while improving correctness, robustness, and compatibility.
 
-The next major milestones are:
-
-1. Copy-on-Write and advanced virtual memory.
-2. Mach-inspired IPC ports and service discovery.
-3. Native FmFS filesystem.
+The next major milestones are Mach-inspired IPC Ports, native FmFS, and deeper system reliability validation.
 
 ---
 
