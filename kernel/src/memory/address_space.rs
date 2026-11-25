@@ -860,3 +860,28 @@ unsafe fn free_private_table_tree(
 
     Ok(())
 }
+
+impl AddressSpace {
+    pub fn destroy_forked_user_space(pml4: u64, regions: &[crate::userland::sched::VmRegion], mapping: &PhysicalMemoryMapping, allocator: &mut PhysicalFrameAllocator<'_>) {
+        if pml4 == 0 || pml4 % PAGE_SIZE != 0 { return; }
+        for r in regions {
+            if r.kind == crate::userland::sched::VmRegionKind::StackGuard { continue; }
+            let mut p = r.start & !(PAGE_SIZE - 1);
+            let e = (r.end.saturating_add(PAGE_SIZE - 1)) & !(PAGE_SIZE - 1);
+            while p < e {
+                if let Ok(v) = VirtAddr::try_new(p) {
+                    if let Some(t) = mapping.translate_virtual_address_in(pml4, v) {
+                        if t.page_size == PAGE_SIZE && t.flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+                            let ph = t.physical_address & !(PAGE_SIZE - 1);
+                            let _ = mapping.unmap_page_in(pml4, v);
+                            allocator.deallocate_frame(ph);
+                        }
+                    }
+                }
+                p = p.saturating_add(PAGE_SIZE);
+            }
+        }
+        let mut tmp = Self { id: 0, pml4_physical_address: pml4, kernel_pml4_physical_address: active_level_4_table_address() };
+        unsafe { let _ = tmp.destroy(mapping, allocator); }
+    }
+}

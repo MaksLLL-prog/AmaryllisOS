@@ -147,6 +147,7 @@ pub enum WaitReason {
         cap: usize,
         deadline_ms: u64,
     },
+    WaitPid { target_pid: isize, status_ptr: u64 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -155,6 +156,7 @@ pub enum UserTaskState {
     Running,
     Waiting(WaitReason),
     Exited(i64),
+    Zombie(i64),
     Faulted(UserFaultInfo),
 }
 
@@ -232,6 +234,7 @@ pub struct FinishedUserProcess {
 
 struct UserProcessSlot {
     pid: usize,
+    parent_pid: usize,
     name: String,
     pml4: u64,
     ctx: UserCpuContext,
@@ -402,9 +405,10 @@ pub fn has_ready_now() -> bool {
                 | WaitReason::TcpConnect { deadline_ms, .. }
                 | WaitReason::NetJob { deadline_ms, .. }
                 | WaitReason::PipeRead { deadline_ms, .. } => now_ms >= deadline_ms,
+                WaitReason::WaitPid { .. } => true,
             },
             UserTaskState::Exited(_) | UserTaskState::Faulted(_) => true,
-            UserTaskState::Running => false,
+            UserTaskState::Running | UserTaskState::Zombie(_) => false,
         })
     })
 }
@@ -473,6 +477,7 @@ pub fn register_process(
         if let Some(empty_idx) = sched.slots.iter().position(|s| s.is_none()) {
             sched.slots[empty_idx] = Some(UserProcessSlot {
                 pid,
+                parent_pid: 0,
                 name: String::from(name),
                 pml4,
                 ctx,
@@ -791,8 +796,10 @@ pub fn try_resolve_user_page_fault(
         return FaultResolveOutcome::NotHandled;
     }
 
-    // Bit 0 == 1 means page IS already present (protection violation, not demand-page).
     if (error_code & 0x1) != 0 {
+        if (error_code & 0x2) != 0 && vma.writable && resolve_cow_page_for_slot(slot_idx, cr2 & !(PAGE_SIZE - 1), vma, mapping, allocator) {
+            return FaultResolveOutcome::Resolved;
+        }
         return FaultResolveOutcome::NotHandled;
     }
     // Bit 1 == 1 means write access on a read-only VMA.
@@ -830,6 +837,12 @@ pub fn ensure_user_pages_committed(
                 return Err(-14);
             }
             if require_writable && !trans.flags.contains(PageTableFlags::WRITABLE) {
+                if trans.flags.contains(crate::memory::vmm::COW_PAGE_FLAG) {
+                    if let Some(a) = allocator.as_deref_mut() {
+                        let ci = without_interrupts(|| { let sc = USER_SCHED.lock(); let i = sc.find_slot_by_pml4(user_pml4)?; let p = sc.slots[i].as_ref()?; Some((i, p.find_vma(page)?)) });
+                        if let Some((i, v)) = ci { if resolve_cow_page_for_slot(i, page, v, mapping, a) { page = page.saturating_add(PAGE_SIZE); continue; } }
+                    }
+                }
                 return Err(-14);
             }
         } else {
@@ -1248,8 +1261,10 @@ pub unsafe fn finish_current_from_syscall(exit_code: i64) -> ! {
         let mut sched = USER_SCHED.lock();
         let start_ms = sched.quantum_start_ms;
         if let Some(idx) = sched.current_slot {
+            let ppid = sched.slots[idx].as_ref().map(|p| p.parent_pid).unwrap_or(0);
+            let live = ppid != 0 && sched.slots.iter().flatten().any(|p| p.pid == ppid && !matches!(p.state, UserTaskState::Exited(_) | UserTaskState::Zombie(_) | UserTaskState::Faulted(_)));
             if let Some(ref mut proc) = sched.slots[idx] {
-                proc.state = UserTaskState::Exited(exit_code);
+                proc.state = if live { UserTaskState::Zombie(exit_code) } else { UserTaskState::Exited(exit_code) };
                 let elapsed = now_ms.saturating_sub(start_ms);
                 proc.charge_runtime(elapsed);
             }
@@ -1414,6 +1429,15 @@ pub fn poll_wait_queues(
                 } else if now_ms >= deadline_ms {
                     wake_ret = Some(-110);
                 }
+            }
+            WaitReason::WaitPid { target_pid, status_ptr } => {
+                let z = without_interrupts(|| {
+                    let mut sc = USER_SCHED.lock();
+                    let mut found = false; let mut zi = None;
+                    for (i, sl) in sc.slots.iter().enumerate() { if let Some(c) = sl.as_ref() { if c.parent_pid == pid && (target_pid <= 0 || c.pid == target_pid as usize) { found = true; if matches!(c.state, UserTaskState::Zombie(_)) { zi = Some(i); break; } } } }
+                    if let Some(i) = zi { let p = sc.slots[i].take().unwrap(); let c = match p.state { UserTaskState::Zombie(x) => x, _ => 0 }; Some(Ok((p.pid, c, p.pml4, p.image, p.fds, p.has_gui_window, p.shm_attachments, p.owned_shm_ids, p.vmas))) } else if !found { Some(Err(-10)) } else { None }
+                });
+                match z { Some(Err(e)) => wake_ret = Some(e), Some(Ok((cpid, code, cpml4, cimg, cfds, gui, shms, owned, cvmas))) => { close_fd_list(cfds); cleanup_process_ipc_and_windows(cpid, cpml4, gui, shms, owned, mapping, allocator); if let Some(mut img) = cimg { elf::cleanup_loaded_image(&mut img, cpml4, mapping, allocator); } else { crate::memory::address_space::AddressSpace::destroy_forked_user_space(cpml4, &cvmas, mapping, allocator); } if status_ptr != 0 { let st: i32 = ((code as i32) & 0xFF) << 8; let _ = syscall::copy_to_user_bytes_in(mapping, Some(allocator), pml4, status_ptr, &st.to_le_bytes()); } wake_ret = Some(cpid as i64); } None => {} }
             }
             WaitReason::PipeRead {
                 pipe_id,
@@ -1902,9 +1926,11 @@ pub fn snapshot_processes() -> Vec<UserProcSnapshot> {
                     WaitReason::TcpConnect { .. } => "WaitTCP",
                     WaitReason::NetJob { .. } => "WaitNet",
                     WaitReason::PipeRead { .. } => "WaitPipe",
+                    WaitReason::WaitPid { .. } => "WaitPid",
                 },
                 UserTaskState::Exited(_) => "Exited",
                 UserTaskState::Faulted(_) => "Faulted",
+                UserTaskState::Zombie(_) => "Zombie",
             };
             out.push(UserProcSnapshot {
                 pid: proc.pid,
@@ -1945,4 +1971,125 @@ pub fn print_cli_process_table(console: &mut Console<'_>) {
 pub fn dump_console_fault_tag(console: &mut Console<'_>, ok: bool) {
     console.write("Scheduler PMM: ", GRAY);
     console.write(if ok { "OK\n" } else { "LEAK\n" }, if ok { GREEN } else { RED });
+}
+
+fn resolve_cow_page_for_slot(
+    slot_idx: usize,
+    page_vaddr: u64,
+    vma: VmRegion,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> bool {
+    if !vma.writable || vma.kind == VmRegionKind::SharedMem || vma.kind == VmRegionKind::StackGuard {
+        return false;
+    }
+    let Some(pml4) = without_interrupts(|| USER_SCHED.lock().slots[slot_idx].as_ref().map(|p| p.pml4)) else {
+        return false;
+    };
+    let Ok(virt) = VirtAddr::try_new(page_vaddr) else { return false; };
+    let Some(trans) = mapping.translate_virtual_address_in(pml4, virt) else { return false; };
+    if trans.page_size != PAGE_SIZE || trans.flags.contains(PageTableFlags::WRITABLE) {
+        return false;
+    }
+    let old_phys = trans.physical_address & !(PAGE_SIZE - 1);
+    if crate::memory::frame_ref_count(old_phys) <= 1 {
+        let mut fl = trans.flags;
+        fl.remove(crate::memory::vmm::COW_PAGE_FLAG);
+        fl.insert(PageTableFlags::WRITABLE);
+        if !mapping.update_page_flags_in(pml4, virt, fl) { return false; }
+    } else {
+        let Some(nf) = allocator.allocate_frame() else { return false; };
+        let (Some(src), Some(dst)) = (mapping.translate_frame(old_phys), mapping.translate_frame(nf)) else {
+            allocator.deallocate_frame(nf);
+            return false;
+        };
+        unsafe { core::ptr::copy_nonoverlapping(src.as_u64() as *const u8, dst.as_u64() as *mut u8, PAGE_SIZE as usize); }
+        let mut fl = trans.flags;
+        fl.remove(crate::memory::vmm::COW_PAGE_FLAG);
+        fl.insert(PageTableFlags::WRITABLE);
+        let _ = mapping.unmap_page_in(pml4, virt);
+        if mapping.map_page_in(allocator, pml4, virt, nf, fl).is_err() {
+            allocator.deallocate_frame(nf);
+            return false;
+        }
+        allocator.deallocate_frame(old_phys);
+    }
+    unsafe { asm!("invlpg [{}]", in(reg) page_vaddr, options(nostack, preserves_flags)); }
+    crate::arch::smp::tlb_shootdown_page(page_vaddr);
+    true
+}
+
+pub fn sys_waitpid_current(target_pid: isize, status_ptr: u64, options: usize, parent_ctx: UserCpuContext, mapping: &PhysicalMemoryMapping, allocator: &mut PhysicalFrameAllocator<'_>) -> i64 {
+    let res = without_interrupts(|| {
+        let mut sc = USER_SCHED.lock();
+        let ppid = sc.slots[sc.current_slot?].as_ref()?.pid;
+        let mut has_child = false;
+        let mut zidx = None;
+        for (i, s) in sc.slots.iter().enumerate() {
+            let Some(c) = s.as_ref() else { continue; };
+            if c.parent_pid != ppid || (target_pid > 0 && c.pid != target_pid as usize) { continue; }
+            has_child = true;
+            if matches!(c.state, UserTaskState::Zombie(_)) { zidx = Some(i); break; }
+        }
+        if let Some(zi) = zidx {
+            let z = sc.slots[zi].take().unwrap();
+            let code = match z.state { UserTaskState::Zombie(c) => c, _ => 0 };
+            Some(Ok((z.pid, code, z.pml4, z.image, z.fds, z.has_gui_window, z.shm_attachments, z.owned_shm_ids, z.vmas)))
+        } else if !has_child { Some(Err(-10)) } else { None }
+    });
+    match res {
+        Some(Err(e)) => e,
+        Some(Ok((cpid, code, cpml4, cimg, cfds, gui, shms, owned, cvmas))) => {
+            close_fd_list(cfds);
+            cleanup_process_ipc_and_windows(cpid, cpml4, gui, shms, owned, mapping, allocator);
+            if let Some(mut img) = cimg { elf::cleanup_loaded_image(&mut img, cpml4, mapping, allocator); } else { crate::memory::address_space::AddressSpace::destroy_forked_user_space(cpml4, &cvmas, mapping, allocator); }
+            if status_ptr != 0 {
+                let st: i32 = ((code as i32) & 0xFF) << 8;
+                if syscall::copy_to_user_bytes_in(mapping, Some(allocator), syscall::active_user_pml4_raw(), status_ptr, &st.to_le_bytes()).is_err() { return -14; }
+            }
+            cpid as i64
+        }
+        None => {
+            if (options & 1) != 0 { return 0; }
+            unsafe { suspend_current_from_syscall(parent_ctx, UserTaskState::Waiting(WaitReason::WaitPid { target_pid, status_ptr })); }
+        }
+    }
+}
+
+pub fn sys_fork_current(parent_ctx: UserCpuContext, mapping: &PhysicalMemoryMapping, allocator: &mut PhysicalFrameAllocator<'_>) -> i64 {
+    let snap = without_interrupts(|| {
+        let sc = USER_SCHED.lock();
+        let p = sc.slots[sc.current_slot?].as_ref()?;
+        let _ = sc.slots.iter().position(|s| s.is_none())?;
+        Some((p.pid, p.name.clone(), p.pml4, p.fpu_state, p.weight, p.entry_point, p.pages_mapped, p.bytes_loaded, p.brk_base, p.brk_current, p.mmap_next, p.shm_attach_next, p.shm_attachments.clone(), p.dynamic_bytes, p.vmas.clone(), p.fds.clone()))
+    });
+    let Some((ppid, name, ppml4, fpu, weight, entry, pages, bytes, brk_b, brk_c, mmap_n, shm_n, shms, dyn_b, vmas, fds)) = snap else { return -11; };
+    let Some(cspace) = crate::memory::address_space::AddressSpace::new(mapping, allocator) else { return -12; };
+    let cpml4 = cspace.pml4_physical_address();
+    core::mem::forget(cspace);
+    if mapping.clone_user_pages_cow(allocator, ppml4, cpml4, &vmas).is_err() {
+        crate::memory::address_space::AddressSpace::destroy_forked_user_space(cpml4, &vmas, mapping, allocator);
+        return -12;
+    }
+    for e in fds.iter().flatten() {
+        match e { FdEntry::PipeRead { pipe_id } => super::ipc::retain_pipe_end(*pipe_id, false), FdEntry::PipeWrite { pipe_id } => super::ipc::retain_pipe_end(*pipe_id, true), _ => {} }
+    }
+    for att in &shms { let _ = super::ipc::retain_shm_frames(att.shm_id); }
+    crate::arch::smp::tlb_shootdown_page(u64::MAX);
+    let mut cctx = parent_ctx; cctx.rax = 0;
+    without_interrupts(|| {
+        let mut sc = USER_SCHED.lock();
+        let Some(si) = sc.slots.iter().position(|s| s.is_none()) else { return -11; };
+        static NEXT_FORK_PID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1000);
+        let cpid = NEXT_FORK_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let vr = sc.min_runnable_vruntime();
+        sc.slots[si] = Some(UserProcessSlot {
+            pid: cpid, parent_pid: ppid, name, pml4: cpml4, ctx: cctx, fpu_state: fpu, state: UserTaskState::Ready,
+            cpu_ms: 0, vruntime_ms: vr, weight, preempt_count: 0, lazy_faults: 0, syscalls_served: 0,
+            entry_point: entry, pages_mapped: pages, bytes_loaded: bytes, brk_base: brk_b, brk_current: brk_c,
+            mmap_next: mmap_n, shm_attach_next: shm_n, shm_attachments: shms, owned_shm_ids: Vec::new(),
+            dynamic_bytes: dyn_b, vmas, image: None, fds, stdout_buf: String::new(), has_gui_window: false,
+        });
+        cpid as i64
+    })
 }

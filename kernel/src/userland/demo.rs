@@ -638,3 +638,63 @@ pub fn build_guard_fault_elf() -> Vec<u8> {
 }
 
 
+
+/// Copy-on-Write `fork()` + `waitpid()` verification ELF (`/fork_demo.elf`).
+pub fn build_fork_demo_elf() -> Vec<u8> {
+    let mut b = MiniElfBuilder::new();
+    b.emit_write_literal(b"[fork_demo] Mapping private CoW test page (VAL = 42)...\n");
+
+    // SYS_MMAP(0, 4096, PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=0x22, -1, 0)
+    b.emit_mov_eax(9);
+    b.emit(&[0x31, 0xFF]); // xor edi, edi
+    b.emit(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
+    b.emit_mov_edx(3);
+    b.emit(&[0x41, 0xBA, 0x22, 0x00, 0x00, 0x00]); // mov r10d, 0x22
+    b.emit(&[0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]); // mov r8, -1
+    b.emit(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    b.emit_syscall();
+    b.emit(&[0x49, 0x89, 0xC4]); // mov r12, rax
+
+    // Write initial value 42 into [r12]
+    b.emit(&[0x49, 0xC7, 0x04, 0x24, 42, 0, 0, 0]); // mov qword ptr [r12], 42
+
+    // SYS_FORK (57)
+    b.emit_mov_eax(57);
+    b.emit_syscall();
+
+    // test rax, rax; jz rel32 child_branch
+    b.emit(&[0x48, 0x85, 0xC0]);
+    let jz_child = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]);
+
+    // === PARENT BRANCH ===
+    b.emit(&[0x49, 0x89, 0xC5]); // mov r13, rax (child_pid)
+    b.emit_write_literal(b"[fork_demo] Parent waiting via SYS_WAITPID for child PID=");
+    b.emit(&[0x4C, 0x89, 0xE8]); // mov rax, r13
+    b.emit_print_rax_u64_ln();
+
+    // SYS_WAITPID(-1, r12 + 8, 0)
+    b.emit_mov_eax(61);
+    b.emit(&[0x48, 0xC7, 0xC7, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rdi, -1
+    b.emit(&[0x49, 0x8D, 0x74, 0x24, 0x08]); // lea rsi, [r12 + 8]
+    b.emit(&[0x31, 0xD2]); // xor edx, edx
+    b.emit_syscall();
+
+    b.emit_write_literal(b"[fork_demo] Child exited! Parent reads [r12] (must still be 42) = ");
+    b.emit(&[0x49, 0x8B, 0x04, 0x24]); // mov rax, [r12]
+    b.emit_print_rax_u64_ln();
+    b.emit_exit(0);
+
+    // === CHILD BRANCH ===
+    let child_lbl = b.code.len();
+    let rel32 = (child_lbl - (jz_child + 6)) as i32;
+    b.code[jz_child + 2..jz_child + 6].copy_from_slice(&rel32.to_le_bytes());
+    b.emit_write_literal(b"[fork_demo] Child running! Mutating shared CoW page [r12] -> 99...\n");
+    b.emit(&[0x49, 0xC7, 0x04, 0x24, 99, 0, 0, 0]); // mov qword ptr [r12], 99 (triggers CoW #PF!)
+    b.emit_write_literal(b"[fork_demo] Child verified isolated [r12] = ");
+    b.emit(&[0x49, 0x8B, 0x04, 0x24]); // mov rax, [r12]
+    b.emit_print_rax_u64_ln();
+    b.emit_exit(7);
+
+    b.build()
+}

@@ -46,7 +46,9 @@ pub const SYS_CONNECT: u64 = 42;
 pub const SYS_SEND: u64 = 44;
 pub const SYS_RECV: u64 = 45;
 pub const SYS_BIND: u64 = 49;
+pub const SYS_FORK: u64 = 57;
 pub const SYS_EXIT: u64 = 60;
+pub const SYS_WAITPID: u64 = 61;
 pub const SYS_GETDENTS: u64 = 78;
 pub const SYS_MKDIR: u64 = 83;
 pub const SYS_UNLINK: u64 = 87;
@@ -771,6 +773,8 @@ fn copy_from_user_bytes(
     Ok(())
 }
 
+pub(crate) fn active_user_pml4_raw() -> u64 { unsafe { ACTIVE_USER_PML4 } }
+
 pub(crate) fn copy_to_user_bytes_in(
     mapping: &PhysicalMemoryMapping,
     allocator: Option<&mut PhysicalFrameAllocator<'_>>,
@@ -1034,6 +1038,31 @@ extern "C" fn rust_syscall_dispatch(frame: &mut SyscallFrame) {
         },
 
         SYS_GETPID => unsafe { ACTIVE_PID as i64 },
+
+        SYS_FORK => {
+            if let (Some(mapping), Some(allocator)) = (mapping_opt, allocator_opt) {
+                let parent_ctx = build_resume_ctx_from_syscall(frame, 0);
+                sched::sys_fork_current(parent_ctx, mapping, allocator)
+            } else {
+                ENOMEM
+            }
+        }
+
+        SYS_WAITPID => {
+            if let (Some(mapping), Some(allocator)) = (mapping_opt, allocator_opt) {
+                let parent_ctx = build_resume_ctx_from_syscall(frame, 0);
+                sched::sys_waitpid_current(
+                    arg1 as isize,
+                    arg2,
+                    arg3 as usize,
+                    parent_ctx,
+                    mapping,
+                    allocator,
+                )
+            } else {
+                EINVAL
+            }
+        }
 
         SYS_YIELD => {
             let ctx = build_resume_ctx_from_syscall(frame, 0);
