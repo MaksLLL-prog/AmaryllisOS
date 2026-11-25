@@ -10,36 +10,36 @@
 
 # Table of Contents
 
-1. [Introduction](#1-introduction)
-2. [Project Overview](#2-project-overview)
-3. [System Requirements](#3-system-requirements)
-4. [Development Environment Setup](#4-development-environment-setup)
-5. [Repository Structure](#5-repository-structure)
-6. [Build System](#6-build-system)
-7. [Building Amaryllis OS](#7-building-amaryllis-os)
-8. [Running in QEMU](#8-running-in-qemu)
-9. [QEMU Virtual Hardware](#9-qemu-virtual-hardware)
-10. [Boot Process](#10-boot-process)
-11. [First Boot](#11-first-boot)
-12. [ANU Kernel Architecture](#12-anu-kernel-architecture)
-13. [CPU and SMP](#13-cpu-and-smp)
-14. [Memory Management](#14-memory-management)
-15. [Scheduling and Kernel Threads](#15-scheduling-and-kernel-threads)
-16. [Interrupts and Device Architecture](#16-interrupts-and-device-architecture)
-17. [Storage and VFS](#17-storage-and-vfs)
-18. [Networking](#18-networking)
-19. [Audio](#19-audio)
-20. [Userland and Ring 3](#20-userland-and-ring-3)
-21. [Amaryllis SDK](#21-amaryllis-sdk)
-22. [Inter-Process Communication](#22-inter-process-communication)
-23. [Graphics and Desktop Environment](#23-graphics-and-desktop-environment)
-24. [Shell Command Reference](#24-shell-command-reference)
-25. [Debugging and Diagnostics](#25-debugging-and-diagnostics)
-26. [Testing and Reliability](#26-testing-and-reliability)
-27. [Troubleshooting](#27-troubleshooting)
-28. [Known Limitations](#28-known-limitations)
-29. [Development Workflow](#29-development-workflow)
-30. [License](#30-license)
+1. Introduction
+2. Project Overview
+3. System Requirements
+4. Development Environment Setup
+5. Repository Structure
+6. Build System
+7. Building Amaryllis OS
+8. Running in QEMU
+9. QEMU Virtual Hardware
+10. Boot Process
+11. First Boot
+12. ANU Kernel Architecture
+13. CPU and SMP
+14. Memory Management
+15. Scheduling and Kernel Threads
+16. Interrupts and Device Architecture
+17. Storage and VFS
+18. Networking
+19. Audio
+20. Userland and Ring 3
+21. Amaryllis SDK
+22. Inter-Process Communication
+23. Graphics and Desktop Environment
+24. Shell Command Reference
+25. Debugging and Diagnostics
+26. Testing and Reliability
+27. Troubleshooting
+28. Known Limitations
+29. Development Workflow
+30. License
 
 ---
 
@@ -144,8 +144,6 @@ A version number does not imply complete hardware compatibility, production read
 
 ## 3.1 Recommended development hardware
 
-A reasonable development machine should have:
-
 | Component | Recommendation |
 |---|---|
 | CPU | Modern x86_64 processor |
@@ -154,8 +152,6 @@ A reasonable development machine should have:
 | Virtualization | Intel VT-x or AMD-V |
 | Display | QEMU-compatible virtual display |
 | Network | Standard Ethernet or Wi-Fi host connection |
-
-The kernel itself is designed for x86_64, but the development environment can run on different host architectures only if the required Rust target and emulator workflow are supported.
 
 ## 3.2 Required software
 
@@ -204,8 +200,6 @@ The kernel target is:
 x86_64-unknown-none
 ```
 
-This target is intended for bare-metal x86_64 development rather than a conventional operating-system environment.
-
 ---
 
 # 4. Development Environment Setup
@@ -245,11 +239,7 @@ Check KVM:
 ls -l /dev/kvm
 ```
 
-If `/dev/kvm` is available, check whether the current user has permission to access it.
-
-On Arch Linux, the user may need to be added to the appropriate virtualization group, depending on the system configuration.
-
-For example:
+If necessary, add the current user to the KVM group:
 
 ```bash
 sudo usermod -aG kvm "$USER"
@@ -259,15 +249,10 @@ Log out and back in after changing group membership.
 
 ## 4.2 Ubuntu
 
-Update the package database:
-
-```bash
-sudo apt update
-```
-
 Install the required software:
 
 ```bash
+sudo apt update
 sudo apt install git curl build-essential qemu-system-x86 qemu-utils
 ```
 
@@ -323,8 +308,6 @@ Therefore, the executable must be discoverable through `PATH`.
 The current QEMU configuration uses KVM and a PulseAudio audio backend. These options are Linux-oriented. Windows users may need a host-specific launcher configuration and an appropriate QEMU audio backend.
 
 ## 4.4 Virtual machines and WSL
-
-Running QEMU inside another virtual machine introduces an additional virtualization layer.
 
 KVM requires access to hardware virtualization features exposed by the host.
 
@@ -386,7 +369,7 @@ The `kernel/` directory contains the ANU kernel.
 
 This is the core of Amaryllis OS.
 
-It contains the implementation of hardware initialization, memory management, scheduling, device support, storage, networking, userland and graphical subsystems.
+It contains hardware initialization, memory management, scheduling, device support, storage, networking, userland and graphical subsystems.
 
 ## 5.3 SDK directory
 
@@ -397,8 +380,6 @@ It provides APIs for applications that execute outside kernel space.
 ## 5.4 Documentation
 
 The `docs/` directory contains project documentation.
-
-This guide describes building, running and developing Amaryllis OS.
 
 ---
 
@@ -421,8 +402,6 @@ The main packages are:
 - `amaryllis_os`
 - `kernel`
 - `amaryllis-sdk`
-
-The kernel is built as a separate binary artifact for the bare-metal target.
 
 ## 6.2 Build script
 
@@ -450,9 +429,7 @@ The bootloader dependency is:
 bootloader = "0.11.17"
 ```
 
-The resulting BIOS image is generated automatically during the Cargo build process.
-
-You should not need to manually construct the boot image.
+The BIOS image is generated automatically during the Cargo build process.
 
 ## 6.3 Build profiles
 
@@ -474,8 +451,6 @@ lto = true
 strip = "debuginfo"
 ```
 
-The SDK release profile is configured for optimized application builds.
-
 ## 6.4 Cargo configuration
 
 The root `.cargo/config.toml` contains:
@@ -486,8 +461,6 @@ bindeps = true
 ```
 
 This enables the unstable Cargo feature required by the workspace's binary dependency configuration.
-
-Do not remove this setting unless the build configuration is changed accordingly.
 
 The SDK also has its own Cargo configuration. Keep it intact when modifying the root build configuration.
 
@@ -528,17 +501,9 @@ The launcher retrieves the image path using:
 env!("BIOS_PATH")
 ```
 
-It then starts:
-
-```rust
-Command::new("qemu-system-x86_64")
-```
-
-The current launcher is configured for the Arch Linux QEMU environment described in this guide.
+It then starts QEMU.
 
 ## 7.4 Build only
-
-To compile without starting QEMU:
 
 ```bash
 cargo +nightly build --release
@@ -549,8 +514,6 @@ cargo +nightly build --release
 ```bash
 cargo +nightly check
 ```
-
-This is useful during development because it checks the project without performing a full release build.
 
 A successful check does not replace an actual kernel build or runtime test.
 
@@ -572,28 +535,20 @@ fn main() {
         "-enable-kvm".to_string(),
         "-cpu".to_string(),
         "host".to_string(),
-
         "-smp".to_string(),
         "4".to_string(),
-
         "-drive".to_string(),
         format!("format=raw,file={}", env!("BIOS_PATH")),
-
         "-m".to_string(),
         "1G".to_string(),
-
         "-serial".to_string(),
         "stdio".to_string(),
-
         "-netdev".to_string(),
         "user,id=net0".to_string(),
-
         "-device".to_string(),
         "e1000,netdev=net0".to_string(),
-
         "-audiodev".to_string(),
         "pa,id=snd0".to_string(),
-
         "-device".to_string(),
         "AC97,audiodev=snd0".to_string(),
     ];
@@ -629,7 +584,7 @@ fn main() {
 | Network adapter | Intel e1000 |
 | Audio backend | PulseAudio |
 | Audio controller | AC'97 |
-| Optional disk | VirtIO block device |
+| Additional disk | Optional VirtIO block device |
 
 ## 8.2 KVM acceleration
 
@@ -642,14 +597,6 @@ The following arguments enable KVM:
 
 KVM allows QEMU to use hardware virtualization instead of translating guest CPU execution entirely through software emulation.
 
-This is particularly useful for:
-
-- SMP testing.
-- Process scheduling.
-- Networking.
-- Filesystem workloads.
-- Graphical applications.
-
 ## 8.3 TCG fallback
 
 When KVM is unavailable, use:
@@ -661,7 +608,7 @@ When KVM is unavailable, use:
 
 Do not combine the TCG configuration with `-enable-kvm`.
 
-TCG is a software emulator. It is useful for compatibility and environments without hardware virtualization access, but it is generally slower.
+TCG is a software emulator and is generally slower.
 
 ## 8.4 Serial console
 
@@ -680,8 +627,6 @@ Serial output is useful for:
 - Panic information.
 - Debugging early initialization.
 
-The serial console and the graphical framebuffer are separate output mechanisms.
-
 ---
 
 # 9. QEMU Virtual Hardware
@@ -698,8 +643,6 @@ This creates four virtual CPUs.
 
 The kernel can use these CPUs for SMP initialization and multiprocessor execution.
 
-The number of virtual CPUs does not guarantee that every workload will execute in parallel. Actual parallelism depends on kernel scheduling, synchronization and workload behavior.
-
 ## 9.2 Memory
 
 ```text
@@ -708,11 +651,7 @@ The number of virtual CPUs does not guarantee that every workload will execute i
 
 The guest receives 1 GiB of RAM.
 
-This memory is used by the kernel, user processes, filesystem caches, stacks, heap allocations and other runtime structures.
-
 ## 9.3 Intel e1000 network adapter
-
-The network device is configured using:
 
 ```text
 -netdev user,id=net0
@@ -723,11 +662,7 @@ The e1000 device provides an emulated Intel Ethernet controller.
 
 The user networking backend provides a virtual network connection through the host.
 
-It is useful for testing network drivers and protocols without requiring a physical network adapter to be passed through to the guest.
-
 ## 9.4 AC'97 audio
-
-The audio configuration is:
 
 ```text
 -audiodev pa,id=snd0
@@ -736,33 +671,25 @@ The audio configuration is:
 
 This creates an AC'97 audio device and connects it to the host's PulseAudio backend.
 
-The host must have a compatible audio backend available.
-
 ## 9.5 VirtIO block device
 
-If the file `disk_virtio.img` exists in the working directory, the launcher attaches it:
+If `disk_virtio.img` exists in the working directory, the launcher attaches it:
 
 ```text
 -drive file=disk_virtio.img,if=virtio,format=raw
 ```
 
-VirtIO provides a paravirtualized block-device interface.
-
-It is intended for storage testing and is separate from the boot image.
-
 The disk image must already exist and contain a layout supported by the guest storage stack.
 
 ## 9.6 Creating a disk image
 
-For example, create a raw disk image with QEMU utilities:
+For example:
 
 ```bash
 qemu-img create -f raw disk_virtio.img 256M
 ```
 
-This creates an empty 256 MiB image.
-
-An empty image does not automatically contain a partition table or filesystem. It must be initialized using the storage tools supported by the guest.
+This creates an empty 256 MiB image. It does not automatically create a partition table or filesystem.
 
 ---
 
@@ -782,22 +709,6 @@ At a high level, the boot flow is:
 
 The exact low-level sequence depends on the bootloader implementation and kernel initialization code.
 
-## 10.1 Bootloader integration
-
-The root build script uses `bootloader` 0.11.17.
-
-This integration handles generation of the bootable BIOS image.
-
-The kernel does not need to be manually copied into an independently assembled disk image during the normal Cargo workflow.
-
-## 10.2 Kernel initialization
-
-After control reaches the kernel, initialization must establish the basic environment required by higher-level subsystems.
-
-This includes memory management, CPU state, interrupt handling and the hardware structures needed by the rest of the system.
-
-The exact initialization order should be checked against the current kernel entry point and initialization modules when changing the boot architecture.
-
 ---
 
 # 11. First Boot
@@ -809,10 +720,6 @@ cargo +nightly run --release
 ```
 
 QEMU should launch with the configured virtual hardware.
-
-The graphical environment and kernel console provide different ways to interact with the system.
-
-## 11.1 Initial checks
 
 Start with:
 
@@ -830,30 +737,20 @@ diskinfo
 netinfo
 ```
 
-These commands provide a first overview of the current system state.
-
-## 11.2 Kernel threads
-
-Try:
+Try the kernel-thread demonstration:
 
 ```text
 kthread demo
 ```
 
-This runs the kernel-thread demonstration.
-
-## 11.3 ELF application demonstration
-
-Try:
+Try the ELF demonstration:
 
 ```text
 mkelf fork
 exec /fork_demo.elf
 ```
 
-This exercises the built-in ELF demonstration workflow.
-
-The exact behavior depends on the current implementation of the shell command and demo application.
+The exact output depends on the current kernel configuration and available devices.
 
 ---
 
@@ -887,15 +784,11 @@ The kernel is not a pure microkernel.
 
 Important functionality remains in kernel space, while application code executes in isolated user processes.
 
-The architecture draws on several established operating-system design ideas without implementing the complete behavior or APIs of those systems.
-
 ## 12.3 Kernel and userland separation
 
 Kernel code has privileged access to hardware and kernel memory.
 
 Ring 3 applications execute with restricted CPU privileges and interact with the kernel through system calls.
-
-This separation is essential for process isolation.
 
 ---
 
@@ -919,12 +812,6 @@ The kernel includes ACPI parsing for:
 
 These tables provide information about the platform's hardware configuration.
 
-The MADT is particularly important for discovering local APICs and I/O APIC information.
-
-MCFG describes PCI Express configuration space access.
-
-HPET provides hardware timer information where supported.
-
 ## 13.2 Local APIC
 
 The kernel uses the Local APIC for processor-local interrupt handling.
@@ -937,8 +824,6 @@ A timer tick is approximately:
 T = \frac{1}{1000} = 1\text{ ms}
 \]
 
-The timer is used by the kernel's timing and scheduling mechanisms.
-
 ## 13.3 I/O APIC
 
 The I/O APIC handles external interrupt routing.
@@ -948,8 +833,6 @@ The kernel includes:
 - GSI routing.
 - ACPI interrupt source overrides.
 - Interrupt routing configuration.
-
-ACPI interrupt source overrides are important because legacy interrupt numbers do not always map directly to their expected GSI values.
 
 ## 13.4 Application processors
 
@@ -971,11 +854,7 @@ The kernel maintains per-CPU structures, including:
 
 The per-CPU storage is sized for up to 16 CPU entries.
 
-The current QEMU configuration uses four virtual CPUs.
-
 ## 13.5 Inter-processor interrupts
-
-The kernel uses inter-processor interrupts for coordination.
 
 Current dedicated vectors include:
 
@@ -988,21 +867,15 @@ Current dedicated vectors include:
 
 When address-space changes require remote processors to invalidate stale translations, the kernel can coordinate this using TLB Shootdown IPIs.
 
-This is important when multiple CPUs may hold cached translations for the same address space.
-
 ### Reschedule IPI
 
 A reschedule IPI allows one CPU to request scheduling activity on another CPU.
-
-This is useful for multiprocessor scheduling and coordination.
 
 ---
 
 # 14. Memory Management
 
 Memory management is one of the central components of ANU.
-
-The kernel manages both physical frames and virtual address spaces.
 
 ## 14.1 Physical memory manager
 
@@ -1016,13 +889,7 @@ Its responsibilities include:
 - Maintaining frame reference counts.
 - Providing physical memory to higher-level allocators.
 
-The current frame size is:
-
-```text
-4096 bytes
-```
-
-That is 4 KiB per frame.
+The current frame size is 4096 bytes (4 KiB).
 
 ## 14.2 Virtual memory
 
@@ -1040,17 +907,11 @@ The bootloader's dynamic mapping configuration means that assumptions about fixe
 
 ANU synchronizes the required shared kernel PML4 entries between address spaces.
 
-This is important for keeping kernel code, stacks, interrupt structures and required device mappings available while executing user processes.
-
 ## 14.4 NX and W^X
 
 The kernel supports NXE and uses W^X-oriented memory protections.
 
 The general W^X principle is that a memory region should not be writable and executable at the same time.
-
-This reduces the risk of certain memory-corruption exploitation techniques.
-
-Actual protection depends on the permissions assigned to each mapping.
 
 ## 14.5 Kernel heap
 
@@ -1062,13 +923,9 @@ The kernel has a configured heap size of:
 
 The heap is used for dynamic kernel allocations.
 
-The `alloc` crate provides standard allocation interfaces on top of the configured allocator.
-
 ## 14.6 Virtual memory regions
 
 The VM subsystem tracks virtual memory regions.
-
-These regions represent allocated or reserved portions of a process address space.
 
 The implementation includes support for:
 
@@ -1084,15 +941,11 @@ Demand Paging allows certain pages to be allocated or populated only when they a
 
 This can reduce unnecessary physical memory allocation.
 
-It also means that a virtual mapping does not necessarily imply that every physical page has already been allocated.
-
 ## 14.8 Stack growth and guard pages
 
 User stacks support growth through page-fault handling.
 
 Guard pages provide unmapped regions that help detect invalid stack accesses.
-
-The current stack guard configuration uses 4 KiB pages.
 
 ## 14.9 Copy-on-Write
 
@@ -1106,7 +959,7 @@ The physical memory manager tracks frame references to determine whether a page 
 
 The general sequence is:
 
-1. A process creates a child address space through the kernel's fork implementation.
+1. A process creates a child address space through `fork()`.
 2. Eligible memory pages are shared.
 3. Shared mappings are marked for Copy-on-Write.
 4. A process attempts to write to a protected page.
@@ -1117,8 +970,6 @@ The general sequence is:
 
 CoW reduces the cost of process creation when the child does not immediately modify all inherited memory.
 
-It does not mean that all memory is permanently shared.
-
 ## 14.10 User memory access
 
 The kernel includes hardened user-memory copying mechanisms:
@@ -1127,8 +978,6 @@ The kernel includes hardened user-memory copying mechanisms:
 - `copy_to_user`
 
 These are important because system-call arguments can contain pointers supplied by untrusted Ring 3 applications.
-
-The kernel must validate and safely handle such pointers.
 
 ---
 
@@ -1140,8 +989,6 @@ ANU includes a preemptive scheduler.
 
 A preemptive scheduler can interrupt a running task and select another task for execution.
 
-This differs from purely cooperative scheduling, where tasks must voluntarily yield control.
-
 The kernel uses a virtual-runtime-based scheduling approach.
 
 The `vruntime_ms` value is used to track scheduling progress.
@@ -1149,8 +996,6 @@ The `vruntime_ms` value is used to track scheduling progress.
 ## 15.2 Context switching
 
 The scheduler maintains CPU execution context information.
-
-The context includes register state required to resume a task.
 
 The implementation also handles FPU/SSE context state.
 
@@ -1165,19 +1010,33 @@ The kernel includes synchronization mechanisms such as:
 
 These help protect critical sections against unwanted preemption.
 
-They must be used carefully because disabling preemption for too long can negatively affect system responsiveness.
-
 ## 15.4 Kernel threads
 
-ANU supports kernel threads.
+ANU supports preemptive kernel threads.
 
 Kernel threads execute privileged kernel code and are scheduled by the kernel.
 
-The current implementation includes preemptive kernel threads with:
+The current implementation uses the following stack configuration:
 
-- 64 KiB stacks.
-- 4 KiB guard pages.
-- AP-core support.
+| Parameter | Size |
+|---|---:|
+| Kernel thread stack | **512 KiB** |
+| Guard region | **16 KiB** |
+| Guard region in pages | **4 × 4 KiB pages** |
+
+The kernel-thread stack allocation uses an isolated virtual-memory slot associated with the PML4 address:
+
+```text
+0x0A00_0000_0000
+```
+
+This layout separates the kernel-thread stack region from other virtual-memory areas.
+
+The guard region provides an unmapped boundary intended to detect stack overflows before they silently corrupt neighboring memory.
+
+Kernel-thread stacks are configured independently from ordinary user-process stacks.
+
+The implementation also supports execution on AP cores.
 
 Examples of kernel worker names include:
 
@@ -1218,8 +1077,6 @@ Interrupt handlers should perform only the work required to acknowledge and capt
 
 Long-running operations are better suited to deferred processing.
 
-This helps reduce interrupt latency.
-
 ## 16.2 Top-Half and Bottom-Half
 
 The device architecture uses an IRQ Top-Half and I/O Bottom-Half approach.
@@ -1227,8 +1084,6 @@ The device architecture uses an IRQ Top-Half and I/O Bottom-Half approach.
 The Top-Half handles urgent interrupt work.
 
 The Bottom-Half performs deferred processing in kernel-thread context.
-
-This is useful for devices that need more extensive processing than should be performed directly inside an interrupt handler.
 
 ## 16.3 IOKit-inspired device architecture
 
@@ -1242,15 +1097,13 @@ Important concepts include:
 - I/O work loops.
 - Deferred interrupt processing.
 
-The registry provides a structured way to inspect devices.
-
 Use:
 
 ```text
 ioreg
 ```
 
-to inspect the available device registry through the shell.
+to inspect the available device registry.
 
 ## 16.4 PCI
 
@@ -1264,11 +1117,7 @@ PCI devices can expose:
 - BAR resources.
 - Interrupt information.
 
-The device architecture uses this information to identify and initialize supported hardware.
-
 ## 16.5 Current driver coverage
-
-The project includes drivers and device support for:
 
 | Device | Implementation |
 |---|---|
@@ -1278,7 +1127,7 @@ The project includes drivers and device support for:
 | AHCI | SATA storage |
 | PS/2 | Keyboard and related legacy input |
 
-The presence of a driver does not imply support for every hardware revision or every physical device using the same general interface.
+The presence of a driver does not imply support for every hardware revision.
 
 ---
 
@@ -1291,8 +1140,6 @@ Amaryllis includes a storage subsystem with a virtual filesystem layer.
 The Virtual Filesystem provides a common interface for accessing files and directories.
 
 It separates filesystem operations from the underlying storage implementation.
-
-This allows different filesystem types and storage devices to be accessed through common interfaces.
 
 ## 17.2 RAMFS
 
@@ -1308,15 +1155,11 @@ The storage subsystem includes FAT32 read and write support.
 
 The implementation also includes Long File Name support.
 
-FAT32 provides compatibility with a widely used filesystem format.
-
 ## 17.4 Block devices
 
 The storage layer uses a common block-device abstraction.
 
-Drivers can provide block operations that higher-level storage components consume.
-
-The supported storage paths include:
+Supported storage paths include:
 
 - VirtIO-Blk.
 - AHCI SATA.
@@ -1343,16 +1186,14 @@ This figure is workload-dependent and should not be interpreted as a universal p
 
 ## 17.6 DMA
 
-The storage implementation supports DMA transfers.
-
-The configured transfer limit is up to:
+The storage implementation supports DMA transfers up to:
 
 ```text
 128 sectors
 64 KiB
 ```
 
-The exact transfer size also depends on the device and driver constraints.
+The exact transfer size also depends on device and driver constraints.
 
 ## 17.7 Storage commands
 
@@ -1363,8 +1204,6 @@ diskinfo
 ```
 
 to inspect storage information.
-
-Other filesystem shell commands depend on the current shell implementation and mounted filesystem state.
 
 ---
 
@@ -1386,11 +1225,7 @@ The virtual network backend is:
 -netdev user,id=net0
 ```
 
-This allows the guest to use QEMU user-mode networking.
-
 ## 18.2 Protocol support
-
-The current networking implementation includes:
 
 | Protocol | Purpose |
 |---|---|
@@ -1410,13 +1245,13 @@ The e1000 driver provides the device interface.
 
 The networking subsystem builds higher-level protocol functionality on top of the network device.
 
-The shell command:
+Use:
 
 ```text
 netinfo
 ```
 
-provides network information.
+to inspect network information.
 
 ## 18.4 Ring 3 networking
 
@@ -1432,8 +1267,6 @@ The current syscall interface includes operations for:
 
 It also includes higher-level network operations such as DNS resolution and HTTP GET.
 
-The exact set of supported socket behaviors depends on the kernel implementation.
-
 ## 18.5 HTTP example
 
 The SDK contains:
@@ -1444,13 +1277,9 @@ net_http_client
 
 This example demonstrates the HTTP client workflow.
 
-It should be used as a starting point for testing userland network functionality.
-
 ## 18.6 Current limitations
 
 Do not assume support for IPv6, TLS, a complete POSIX socket implementation or every TCP feature.
-
-These capabilities require separate implementation and validation.
 
 ---
 
@@ -1476,17 +1305,11 @@ The audio backend is configured through:
 
 The audio implementation uses Buffer Descriptor Lists (BDL) for DMA-oriented audio transfers.
 
-This allows the audio controller to access prepared audio buffers.
-
 ## 19.3 Mixer
 
 The current audio subsystem includes a nonblocking mixer.
 
 The audio path uses deferred work through the kernel's I/O architecture.
-
-The available functionality should be distinguished from a complete modern audio stack.
-
-For example, full support for modern audio devices, advanced routing and every sample format should not be assumed.
 
 ---
 
@@ -1525,15 +1348,50 @@ The kernel supports:
 - Copy-on-Write memory.
 - Process memory reclamation.
 
-## 20.4 Process creation
+## 20.4 Process creation and lifecycle
 
-The kernel includes process creation functionality through its ELF loading and spawn mechanisms.
+The kernel implements process creation and lifecycle operations, including:
 
-It also implements kernel-side `fork()` and `waitpid()` functionality.
+- ELF process loading.
+- `spawn`.
+- `fork`.
+- `waitpid`.
+- Process termination.
+- Address-space reclamation.
 
-The public SDK interface must be checked separately: the current SDK `proc.rs` interface described in this repository does not yet expose public `fork()` or `waitpid()` wrappers.
+The SDK exposes public Rust wrappers for `fork()` and `waitpid()` through:
 
-This distinction matters when developing applications.
+```text
+amaryllis-sdk/src/proc.rs
+```
+
+This allows Ring 3 applications to use process creation and child-process waiting through the SDK instead of invoking raw system calls directly.
+
+### Fork
+
+`fork()` creates a child process using the kernel's process and memory-management implementation.
+
+The kernel uses Copy-on-Write for eligible shared memory pages.
+
+This avoids eagerly duplicating all process memory during creation.
+
+### Waitpid
+
+`waitpid()` provides a way for a parent process to wait for a child process and retrieve its termination status.
+
+The exact supported flags and semantics are defined by the current kernel and SDK implementation.
+
+### Example
+
+The SDK includes:
+
+```text
+amaryllis-sdk/examples/fork_demo.rs
+```
+
+The example demonstrates the process creation workflow using the SDK.
+
+Build and run it as described in the SDK section below.
 
 ## 20.5 System calls
 
@@ -1554,7 +1412,13 @@ The current syscall interface includes operations for:
 - GUI.
 - Shared memory.
 
-Refer to the current `amaryllis-sdk/src/syscall.rs` for the authoritative syscall numbers and wrappers.
+Refer to:
+
+```text
+amaryllis-sdk/src/syscall.rs
+```
+
+for syscall numbers and wrappers.
 
 ## 20.6 File descriptors
 
@@ -1592,8 +1456,6 @@ applications using `alloc`.
 
 ## 21.1 SDK modules
 
-The SDK includes the following modules:
-
 | Module | Responsibility |
 |---|---|
 | `alloc_heap` | Application heap support |
@@ -1607,7 +1469,30 @@ The SDK includes the following modules:
 | `gui` | Graphical application interfaces |
 | `gui::ShmWindow` | Shared-memory-backed GUI windows |
 
-## 21.2 Building SDK examples
+## 21.2 Process API
+
+The public process API is located in:
+
+```text
+amaryllis-sdk/src/proc.rs
+```
+
+It provides process-related functionality, including:
+
+- `getpid()`
+- `yield_now()`
+- `exit(code)`
+- `spawn(cmdline)`
+- `spawn_with_args(cmdline)`
+- `active_count()`
+- `fork()`
+- `waitpid(...)`
+
+The `fork()` and `waitpid()` wrappers expose the corresponding kernel functionality to Ring 3 applications.
+
+Consult the current source for exact signatures, arguments, return types and supported options.
+
+## 21.3 Building SDK examples
 
 From the repository root:
 
@@ -1628,7 +1513,7 @@ The examples include:
 | `net_http_client` | HTTP client |
 | `fs_alloc_demo` | Filesystem and allocation |
 | `ipc_shm_gui` | Shared-memory GUI |
-| `fork_demo` | Process-related demonstration |
+| `fork_demo` | Process creation and fork demonstration |
 
 The normal Cargo target directory is typically:
 
@@ -1636,9 +1521,9 @@ The normal Cargo target directory is typically:
 target/x86_64-unknown-none/release/examples/
 ```
 
-The exact location depends on the workspace target-directory configuration.
+The exact location depends on workspace target-directory configuration.
 
-## 21.3 Running an application
+## 21.4 Running an application
 
 An ELF application must first be available inside the guest filesystem.
 
@@ -1658,17 +1543,18 @@ Applications stored under `/disk` can be launched through their `/disk/...` path
 
 The built-in `mkelf` command can also be used for supported ELF demonstrations.
 
-## 21.4 SDK development considerations
+## 21.5 SDK development considerations
 
 When writing a new application:
 
-1. Use the SDK rather than directly depending on kernel internals.
+1. Use the SDK rather than depending directly on kernel internals.
 2. Keep the application compatible with the target architecture.
 3. Avoid assuming that the host operating system's standard library is available.
 4. Use the provided system-call wrappers.
 5. Handle error return values.
 6. Validate pointers and buffer lengths.
 7. Test process termination and resource cleanup.
+8. Test parent-child process lifecycle when using `fork()` and `waitpid()`.
 
 The SDK is a developing interface. APIs may change as the kernel evolves.
 
@@ -1707,6 +1593,8 @@ writer.write(data)
 Both objects own file descriptors and close them when dropped.
 
 Pipes are useful for streaming data between processes.
+
+The current implementation uses POSIX-style 16 KiB pipes.
 
 ## 22.2 Shared memory
 
@@ -1832,11 +1720,7 @@ The graphical environment includes:
 - Colloid-inspired icons.
 - Lucide-style iconography.
 
-The visual design aims for consistent geometry, readable typography and minimal interface clutter.
-
 ## 23.5 Built-in applications
-
-The current desktop application set includes:
 
 | Application | Purpose |
 |---|---|
@@ -1870,15 +1754,11 @@ ipc_shm_gui
 
 demonstrates the shared-memory GUI path.
 
-These examples are useful starting points for understanding the current application-to-compositor interface.
-
 ---
 
 # 24. Shell Command Reference
 
 The kernel shell provides commands for interacting with the system.
-
-The following commands are part of the current project workflow.
 
 | Command | Purpose |
 |---|---|
@@ -1898,9 +1778,7 @@ The following commands are part of the current project workflow.
 help
 ```
 
-Use this command first when exploring the shell.
-
-It displays the available commands supported by the current build.
+Displays the available commands supported by the current build.
 
 ## 24.2 SMP
 
@@ -1910,8 +1788,6 @@ smp
 
 Displays multiprocessor-related information.
 
-Use it to inspect the CPU configuration recognized by the kernel.
-
 ## 24.3 APIC
 
 ```text
@@ -1920,8 +1796,6 @@ apic
 
 Displays APIC-related information.
 
-This is useful when diagnosing interrupt-controller initialization.
-
 ## 24.4 I/O Registry
 
 ```text
@@ -1929,8 +1803,6 @@ ioreg
 ```
 
 Displays the device registry.
-
-This can help verify which devices have been discovered and registered.
 
 ## 24.5 Storage
 
@@ -1947,8 +1819,6 @@ netinfo
 ```
 
 Displays network information.
-
-Use it when investigating device initialization or network configuration.
 
 ## 24.7 Kernel threads
 
@@ -1985,15 +1855,11 @@ The QEMU launcher connects serial output to the terminal:
 
 This is one of the most important debugging facilities during early boot.
 
-Use it to inspect initialization messages and kernel diagnostics.
-
 ## 25.2 Kernel logging
 
 Amaryllis includes a kernel logging system with a ring buffer.
 
 The logging infrastructure supports diagnostic output and the `dmesg`-oriented telemetry workflow.
-
-Logs are useful for understanding subsystem initialization and runtime behavior.
 
 ## 25.3 Panic investigation
 
@@ -2008,13 +1874,11 @@ When the kernel panics or stops responding:
 
 A triple fault may reset the virtual machine without providing a normal kernel panic message.
 
-In that situation, QEMU debugging options and earlier serial logging can be especially useful.
-
 ## 25.4 QEMU debugging
 
 QEMU supports debugger-oriented options.
 
-For example, the following options can be used to start QEMU with a GDB debugging endpoint and pause the guest:
+For example:
 
 ```bash
 qemu-system-x86_64 \
@@ -2031,14 +1895,6 @@ Do not expose a debugging endpoint to untrusted networks.
 
 ## 25.5 Build diagnostics
 
-When a Rust compilation fails:
-
-```bash
-cargo +nightly build --release
-```
-
-Read the first meaningful compiler error rather than only the final build failure.
-
 Useful checks include:
 
 ```bash
@@ -2047,7 +1903,7 @@ cargo +nightly check -p kernel
 cargo +nightly check -p amaryllis-sdk
 ```
 
-The package names must match the workspace manifest.
+A successful check does not replace runtime testing.
 
 ---
 
@@ -2069,8 +1925,6 @@ Test:
 - CPU-local state.
 - Lock contention.
 
-Pay particular attention to races involving shared scheduler and memory-management structures.
-
 ## 26.2 Memory testing
 
 Test:
@@ -2087,9 +1941,23 @@ Test:
 
 CoW tests should include both parent and child writing to previously shared pages.
 
-Also verify that terminating a process releases its mappings and frame references correctly.
+Verify that terminating a process releases its mappings and frame references correctly.
 
-## 26.3 Process testing
+## 26.3 Kernel-thread testing
+
+With the current 512 KiB stack and 16 KiB guard region, test:
+
+- Kernel threads on the bootstrap processor.
+- Kernel threads on AP cores.
+- Stack allocation and reclamation.
+- Guard-region fault detection.
+- Context switching.
+- Deep call chains.
+- Concurrent worker activity.
+
+The larger stack provides additional room for kernel-thread execution, but it does not eliminate stack-overflow risks.
+
+## 26.4 Process testing
 
 Test:
 
@@ -2097,12 +1965,16 @@ Test:
 - Process creation.
 - User-mode entry.
 - System-call transitions.
+- `fork()` behavior.
+- Copy-on-Write after `fork()`.
+- `waitpid()` behavior.
 - Process termination.
-- Parent-child lifecycle.
-- Wait operations.
 - Address-space reclamation.
+- Parent-child lifecycle.
 
-## 26.4 Storage testing
+The `fork_demo` SDK example is a useful starting point for testing the public process API.
+
+## 26.5 Storage testing
 
 Test:
 
@@ -2119,11 +1991,9 @@ Test:
 
 Do not use important personal data for experimental filesystem testing.
 
-## 26.5 Networking testing
+## 26.6 Networking testing
 
-Test each protocol independently where possible.
-
-A useful progression is:
+Test each protocol independently where possible:
 
 1. Verify e1000 initialization.
 2. Verify Ethernet transmission and reception.
@@ -2137,7 +2007,7 @@ A useful progression is:
 10. Verify HTTP.
 11. Verify the Ring 3 network interface.
 
-## 26.6 GUI testing
+## 26.7 GUI testing
 
 Test:
 
@@ -2153,7 +2023,7 @@ Test:
 - Application switching.
 - Long-running graphical workloads.
 
-## 26.7 Reliability principle
+## 26.8 Reliability principle
 
 Do not treat a subsystem as fully validated merely because one demonstration works.
 
@@ -2181,16 +2051,8 @@ rustup target add x86_64-unknown-none --toolchain nightly
 
 ## 27.2 Nightly toolchain unavailable
 
-Install Nightly:
-
 ```bash
 rustup toolchain install nightly
-```
-
-Then verify:
-
-```bash
-rustc +nightly --version
 ```
 
 ## 27.3 QEMU command not found
@@ -2202,8 +2064,6 @@ which qemu-system-x86_64
 ```
 
 Install QEMU or correct the host `PATH`.
-
-On Windows, verify that the QEMU installation directory is included in the system environment variables.
 
 ## 27.4 KVM initialization failure
 
@@ -2233,8 +2093,6 @@ Check:
 - Whether the QEMU audio backend is supported.
 - Whether the AC'97 device is initialized by the guest.
 
-The host audio backend and the guest audio driver are separate parts of the audio path.
-
 ## 27.6 No network connectivity
 
 Check:
@@ -2250,8 +2108,6 @@ Use:
 ```text
 netinfo
 ```
-
-to inspect the guest network state.
 
 ## 27.7 Additional disk not detected
 
@@ -2269,8 +2125,6 @@ Verify:
 ls -lh disk_virtio.img
 ```
 
-An empty disk image will not automatically contain a usable filesystem.
-
 ## 27.8 BIOS image not found
 
 The BIOS image is generated by the root build script.
@@ -2280,8 +2134,6 @@ Build through Cargo:
 ```bash
 cargo +nightly build --release
 ```
-
-Avoid manually guessing the Cargo output directory.
 
 ## 27.9 Kernel hangs during boot
 
@@ -2298,7 +2150,42 @@ Potential areas to inspect include:
 - Device initialization.
 - Scheduler startup.
 
-A hang does not necessarily indicate a bootloader failure.
+## 27.10 Kernel-thread stack faults
+
+The kernel-thread stack region uses a 512 KiB stack and a 16 KiB guard region in the isolated virtual-memory slot associated with:
+
+```text
+0x0A00_0000_0000
+```
+
+When investigating a kernel-thread stack fault, inspect:
+
+- Stack allocation.
+- Guard-region mappings.
+- Virtual-address reservation.
+- Per-CPU stack selection.
+- Context-switch stack pointers.
+- Stack reclamation.
+
+Do not assume that every page fault in this region is an ordinary user-stack growth event.
+
+## 27.11 `fork()` or `waitpid()` application errors
+
+Check that the application is built against the current `amaryllis-sdk`.
+
+The public wrappers are located in:
+
+```text
+amaryllis-sdk/src/proc.rs
+```
+
+Also verify that the application uses the correct process API signatures and handles returned errors.
+
+For a reference implementation, inspect:
+
+```text
+amaryllis-sdk/examples/fork_demo.rs
+```
 
 ---
 
@@ -2306,15 +2193,11 @@ A hang does not necessarily indicate a bootloader failure.
 
 Amaryllis OS is an actively developed independent operating system.
 
-The following limitations should be considered when evaluating the current project.
-
 ## 28.1 Hardware compatibility
 
 The current driver set is limited.
 
 The existence of e1000, AC'97, VirtIO-Blk, AHCI and PS/2 support does not imply universal support for physical hardware.
-
-QEMU testing and physical hardware testing are different validation environments.
 
 ## 28.2 Networking
 
@@ -2332,17 +2215,19 @@ Existing Linux binaries are not automatically compatible.
 
 ## 28.4 POSIX compatibility
 
-The presence of familiar operations such as `read`, `write`, `mmap`, `brk` or `waitpid` does not imply complete POSIX compatibility.
+The presence of familiar operations such as `read`, `write`, `mmap`, `brk`, `fork` or `waitpid` does not imply complete POSIX compatibility.
 
 The actual supported behavior is defined by the current kernel and SDK implementation.
 
 ## 28.5 SDK completeness
 
-The SDK is still evolving.
+The SDK exposes a growing set of kernel services.
 
-Some kernel capabilities may exist before they receive a public SDK wrapper.
+Some interfaces may have different semantics from their Unix or POSIX counterparts.
 
-For example, kernel-side `fork()` and `waitpid()` functionality should not be confused with a fully exposed SDK API.
+The public process API currently includes `fork()` and `waitpid()` wrappers in `amaryllis-sdk/src/proc.rs`.
+
+The `fork_demo` example demonstrates their use.
 
 ## 28.6 Reliability
 
@@ -2440,6 +2325,7 @@ When changing the SDK:
 - Return errors instead of silently ignoring failures.
 - Avoid exposing unnecessary kernel implementation details.
 - Keep examples synchronized with the actual public API.
+- Test process lifecycle APIs, including `fork()` and `waitpid()`.
 
 ---
 
