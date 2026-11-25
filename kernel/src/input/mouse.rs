@@ -77,6 +77,7 @@ static PACKET_QUEUE: [AtomicU64; PACKET_QUEUE_SIZE] =
 static PKT_HEAD: AtomicUsize = AtomicUsize::new(0);
 static PKT_TAIL: AtomicUsize = AtomicUsize::new(0);
 static INITIALIZED: AtomicU8 = AtomicU8::new(0);
+static PACKET_SIZE: AtomicU8 = AtomicU8::new(4);
 
 unsafe fn inb(port: u16) -> u8 {
     let value: u8;
@@ -196,6 +197,11 @@ fn mouse_command(command: u8) -> bool {
         match mouse_command_once(command) {
             Some(0xFA) => return true,
             Some(0xFE) => continue,
+            Some(0xAA) => {
+                // Consume late BAT self-test ID byte (0x00) and retry command.
+                let _ = read_aux_data();
+                continue;
+            }
             _ => return false,
         }
     }
@@ -211,10 +217,8 @@ fn write_configuration(config: u8) -> bool {
     controller_command(0x60) && write_controller_data(config)
 }
 
-fn initialize_inner() -> bool {
-    INITIALIZED.store(0, Ordering::Release);
-
-    // Сначала отключаем AUX-порт.
+fn initialize_aux_port() -> bool {
+    // Отключаем AUX-порт на время очистки буфера и чтения конфигурации.
     if !controller_command(0xA7) {
         return false;
     }
@@ -222,12 +226,7 @@ fn initialize_inner() -> bool {
     // Удаляем старые данные.
     flush_output_buffer();
 
-    // Включаем AUX-порт.
-    if !controller_command(0xA8) {
-        return false;
-    }
-
-    // Читаем конфигурацию i8042.
+    // Читаем конфигурацию i8042 (оба порта отключены, сканкоды не мешают).
     if !controller_command(0x20) {
         return false;
     }
@@ -236,50 +235,49 @@ fn initialize_inner() -> bool {
         return false;
     };
 
-    // Во время настройки IRQ12 выключен.
-    // AUX clock включён.
+    // Во время настройки IRQ12 выключен, клавиатурный порт заморожен (bit 4), AUX clock включён, IRQ1 разрешён.
     config &= !(1 << 1);
+    config |= 1 << 4;
     config &= !(1 << 5);
+    config |= 1 << 0;
 
     if !write_configuration(config) {
         return false;
     }
 
-    // Сбрасываем настройки мыши к значениям по умолчанию.
+    // Включаем AUX-порт.
+    if !controller_command(0xA8) {
+        return false;
+    }
+
+    // Сбрасываем настройки мыши к значениям по умолчанию (при сбое пробуем 0xFF Reset).
     if !mouse_command(0xF6) {
-        return false;
+        if !mouse_command(0xFF) {
+            return false;
+        }
+        let _ = read_aux_data(); // self-test 0xAA
+        let _ = read_aux_data(); // device ID 0x00
+        if !mouse_command(0xF6) {
+            return false;
+        }
     }
 
-    // Включаем режим IntelliMouse.
-    if !set_sample_rate(200) || !set_sample_rate(100) || !set_sample_rate(80) {
-        return false;
+    // Пробуем включить 4-байтовый режим IntelliMouse; при отсутствии поддержки работаем в 3-байтовом режиме.
+    let mut pkt_size: u8 = 3;
+    if set_sample_rate(200) && set_sample_rate(100) && set_sample_rate(80) && mouse_command(0xF2) {
+        if let Some(device_id) = read_aux_data() {
+            if device_id == 3 || device_id == 4 {
+                pkt_size = 4;
+            }
+        }
+    } else {
+        let _ = mouse_command(0xF6);
     }
+    PACKET_SIZE.store(pkt_size, Ordering::Release);
 
-    // Запрашиваем идентификатор.
-    if !mouse_command(0xF2) {
-        return false;
+    for slot in &PACKET {
+        slot.store(0, Ordering::Relaxed);
     }
-
-    let Some(device_id) = read_aux_data() else {
-        return false;
-    };
-
-    if device_id != 3 && device_id != 4 {
-        return false;
-    }
-
-    // Включаем потоковую передачу данных.
-    if !mouse_command(0xF4) {
-        return false;
-    }
-
-    // Теперь разрешаем IRQ12 в контроллере.
-    config |= 1 << 1;
-
-    if !write_configuration(config) {
-        return false;
-    }
-
     PACKET_INDEX.store(0, Ordering::Relaxed);
     HEAD.store(0, Ordering::Relaxed);
     TAIL.store(0, Ordering::Relaxed);
@@ -288,7 +286,37 @@ fn initialize_inner() -> bool {
 
     INITIALIZED.store(1, Ordering::Release);
 
+    // Включаем потоковую передачу данных.
+    if !mouse_command(0xF4) {
+        INITIALIZED.store(0, Ordering::Release);
+        return false;
+    }
+
+    flush_output_buffer();
+
+    // Теперь разрешаем IRQ12, IRQ1 и тактирование порта клавиатуры (bit 4 = 0).
+    config &= !(1 << 4);
+    config &= !(1 << 5);
+    config |= (1 << 1) | (1 << 0);
+
+    if !write_configuration(config) {
+        INITIALIZED.store(0, Ordering::Release);
+        return false;
+    }
+
     true
+}
+
+fn initialize_inner() -> bool {
+    INITIALIZED.store(0, Ordering::Release);
+    PACKET_SIZE.store(4, Ordering::Release);
+
+    // На время инициализации i8042/AUX временно глушим порт клавиатуры (0xAD)
+    // и гарантированно включаем его обратно (0xAE) при любом исходе.
+    let _ = controller_command(0xAD);
+    let ok = initialize_aux_port();
+    let _ = controller_command(0xAE);
+    ok
 }
 
 pub fn initialize() -> bool {
@@ -351,16 +379,22 @@ fn process_aux_byte(byte: u8) {
         return;
     }
 
+    let pkt_len = PACKET_SIZE.load(Ordering::Acquire).clamp(3, 4);
     let index = PACKET_INDEX.load(Ordering::Relaxed);
 
+    if index >= pkt_len {
+        PACKET_INDEX.store(0, Ordering::Relaxed);
+        return;
+    }
+
     // Первый байт пакета должен иметь synchronization bit.
-    if index == 0 && byte & 0x08 == 0 {
+    if index == 0 && (byte & 0x08) == 0 {
         return;
     }
 
     PACKET[index as usize].store(byte, Ordering::Relaxed);
 
-    if index < 3 {
+    if index + 1 < pkt_len {
         PACKET_INDEX.store(index + 1, Ordering::Relaxed);
         return;
     }
@@ -370,10 +404,14 @@ fn process_aux_byte(byte: u8) {
     let flags = PACKET[0].load(Ordering::Relaxed);
     let raw_x = PACKET[1].load(Ordering::Relaxed);
     let raw_y = PACKET[2].load(Ordering::Relaxed);
-    let wheel_byte = PACKET[3].load(Ordering::Relaxed);
-
-    let delta_wheel = ((wheel_byte as i8) << 4) >> 4;
-    push_wheel(delta_wheel);
+    let delta_wheel = if pkt_len == 4 {
+        let wheel_byte = PACKET[3].load(Ordering::Relaxed);
+        let w = ((wheel_byte as i8) << 4) >> 4;
+        push_wheel(w);
+        w
+    } else {
+        0
+    };
 
     // Discard corrupted overflow packets, keep buttons valid.
     let (dx, dy) = if (flags & 0xC0) != 0 {
@@ -399,29 +437,33 @@ fn process_aux_byte(byte: u8) {
     });
 }
 
+#[inline]
+pub(super) fn push_aux_byte_from_irq(byte: u8) {
+    process_aux_byte(byte);
+}
+
 pub fn handle_interrupt() {
     let status = unsafe { inb(STATUS_PORT) };
     if (status & STATUS_OUTPUT_FULL) == 0 {
         return;
     }
+    let byte = unsafe { inb(DATA_PORT) };
     if (status & STATUS_AUX_DATA) == 0 {
+        super::keyboard::push_scancode_from_hw(byte);
         return;
     }
-    let byte = unsafe { inb(DATA_PORT) };
     process_aux_byte(byte);
 }
 
-/// Non-blocking recovery helper: if an AUX byte is sitting unread in i8042 `0x60`
-/// (which also blocks subsequent edge-triggered IRQ12 edges), drain it into the
-/// mouse packet queue safely with interrupts disabled.
+/// Non-blocking recovery helper: if bytes are sitting unread in i8042 `0x60`
+/// (which blocks subsequent edge-triggered IRQ1/IRQ12 edges), drain AUX bytes into
+/// the mouse queue and forward any blocking keyboard bytes to the keyboard ring.
 pub fn poll_aux_if_pending() -> usize {
     if INITIALIZED.load(Ordering::Acquire) == 0 {
         return 0;
     }
     let first_status = unsafe { inb(STATUS_PORT) };
-    if (first_status & (STATUS_OUTPUT_FULL | STATUS_AUX_DATA))
-        != (STATUS_OUTPUT_FULL | STATUS_AUX_DATA)
-    {
+    if (first_status & STATUS_OUTPUT_FULL) == 0 {
         return 0;
     }
 
@@ -429,14 +471,16 @@ pub fn poll_aux_if_pending() -> usize {
     x86_64::instructions::interrupts::without_interrupts(|| {
         for _ in 0..16 {
             let status = unsafe { inb(STATUS_PORT) };
-            if (status & (STATUS_OUTPUT_FULL | STATUS_AUX_DATA))
-                != (STATUS_OUTPUT_FULL | STATUS_AUX_DATA)
-            {
+            if (status & STATUS_OUTPUT_FULL) == 0 {
                 break;
             }
             let byte = unsafe { inb(DATA_PORT) };
-            process_aux_byte(byte);
-            count += 1;
+            if (status & STATUS_AUX_DATA) != 0 {
+                process_aux_byte(byte);
+                count += 1;
+            } else {
+                super::keyboard::push_scancode_from_hw(byte);
+            }
         }
     });
     count
@@ -474,12 +518,13 @@ pub fn drain() {
         PACKET_INDEX.store(0, Ordering::Relaxed);
         for _ in 0..32 {
             let status = unsafe { inb(STATUS_PORT) };
-            if (status & (STATUS_OUTPUT_FULL | STATUS_AUX_DATA))
-                != (STATUS_OUTPUT_FULL | STATUS_AUX_DATA)
-            {
+            if (status & STATUS_OUTPUT_FULL) == 0 {
                 break;
             }
-            let _ = unsafe { inb(DATA_PORT) };
+            let byte = unsafe { inb(DATA_PORT) };
+            if (status & STATUS_AUX_DATA) == 0 {
+                super::keyboard::push_scancode_from_hw(byte);
+            }
         }
     });
     while read_wheel().is_some() {}
@@ -488,4 +533,8 @@ pub fn drain() {
 
 pub fn is_initialized() -> bool {
     INITIALIZED.load(Ordering::Acquire) != 0
+}
+
+pub fn packet_size() -> u8 {
+    PACKET_SIZE.load(Ordering::Acquire)
 }

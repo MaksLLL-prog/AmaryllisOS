@@ -1387,3 +1387,4 @@ fn scale_image_wallpaper_into(
         }
     }
 }
+

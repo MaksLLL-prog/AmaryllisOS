@@ -62,7 +62,7 @@ lazy_static! {
 
         // Local APIC Periodic Timer IRQ (vector 0x40 = 64).
         unsafe {
-            idt[crate::arch::apic::APIC_TIMER_VECTOR as usize].set_handler_addr(
+            idt[crate::arch::apic::APIC_TIMER_VECTOR as u8].set_handler_addr(
                 x86_64::VirtAddr::new(
                     crate::userland::syscall::apic_timer_irq_entry as *const () as u64,
                 ),
@@ -79,27 +79,27 @@ lazy_static! {
         idt[47].set_handler_fn(spurious_irq15_handler);
 
         // IOAPIC PCI / Platform IRQ vectors (0x50..0x57) -> IOKit Top-Half
-        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as usize]
+        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as u8]
             .set_handler_fn(ioapic_irq_50_handler);
-        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as usize + 1]
+        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as u8 + 1]
             .set_handler_fn(ioapic_irq_51_handler);
-        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as usize + 2]
+        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as u8 + 2]
             .set_handler_fn(ioapic_irq_52_handler);
-        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as usize + 3]
+        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as u8 + 3]
             .set_handler_fn(ioapic_irq_53_handler);
-        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as usize + 4]
+        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as u8 + 4]
             .set_handler_fn(ioapic_irq_54_handler);
-        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as usize + 5]
+        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as u8 + 5]
             .set_handler_fn(ioapic_irq_55_handler);
-        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as usize + 6]
+        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as u8 + 6]
             .set_handler_fn(ioapic_irq_56_handler);
-        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as usize + 7]
+        idt[crate::arch::apic::IOAPIC_IRQ_VECTOR_BASE as u8 + 7]
             .set_handler_fn(ioapic_irq_57_handler);
 
         // SMP Inter-Processor Interrupts (IPIs)
-        idt[crate::arch::apic::IPI_TLB_SHOOTDOWN_VECTOR as usize]
+        idt[crate::arch::apic::IPI_TLB_SHOOTDOWN_VECTOR as u8]
             .set_handler_fn(ipi_tlb_shootdown_handler);
-        idt[crate::arch::apic::IPI_RESCHEDULE_VECTOR as usize]
+        idt[crate::arch::apic::IPI_RESCHEDULE_VECTOR as u8]
             .set_handler_fn(ipi_reschedule_handler);
 
         idt
@@ -143,6 +143,30 @@ unsafe fn ensure_kernel_segments() {
     );
 }
 
+fn exception_name(vector: u8) -> &'static str {
+    match vector {
+        0 => "#DE Divide Error",
+        1 => "#DB Debug",
+        2 => "NMI",
+        3 => "#BP Breakpoint",
+        4 => "#OF Overflow",
+        5 => "#BR Bound Range",
+        6 => "#UD Invalid Opcode",
+        7 => "#NM Device Not Avail",
+        8 => "#DF Double Fault",
+        10 => "#TS Invalid TSS",
+        11 => "#NP Segment Not Present",
+        12 => "#SS Stack Fault",
+        13 => "#GP General Protection",
+        14 => "#PF Page Fault",
+        16 => "#MF x87 FP Fault",
+        17 => "#AC Alignment Check",
+        18 => "#MC Machine Check",
+        19 => "#XM SIMD FP Fault",
+        _ => "CPU Exception",
+    }
+}
+
 fn handle_exception_or_halt(
     vector: u8,
     error_code: u64,
@@ -166,6 +190,30 @@ fn handle_exception_or_halt(
             );
         }
     }
+
+    use core::fmt::Write;
+    let cpu = crate::arch::percpu::current_cpu_id();
+    let rip = stack_frame.instruction_pointer.as_u64();
+    let rsp = stack_frame.stack_pointer.as_u64();
+    let cs = stack_frame.code_segment.0;
+    let rflags = stack_frame.cpu_flags.bits();
+
+    let mut l1 = crate::serial::FixedBuf::<96>::new();
+    let mut l2 = crate::serial::FixedBuf::<96>::new();
+    let _ = write!(
+        l1,
+        "vec={} ({}) err=0x{:x} cpu={}",
+        vector,
+        exception_name(vector),
+        error_code,
+        cpu
+    );
+    let _ = write!(
+        l2,
+        "rip=0x{:x} rsp=0x{:x} cr2=0x{:x} cs=0x{:x} rf=0x{:x}",
+        rip, rsp, cr2, cs, rflags
+    );
+    crate::serial::panic_banner("KERNEL CPU EXCEPTION", l1.as_str(), l2.as_str());
 
     loop {
         unsafe {
@@ -222,12 +270,28 @@ extern "x86-interrupt" fn device_not_available_handler(
 }
 
 extern "x86-interrupt" fn double_fault_handler(
-    _stack_frame: InterruptStackFrame,
-    _error_code: u64,
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
 ) -> ! {
     unsafe {
         ensure_kernel_segments();
     }
+    use core::fmt::Write;
+    let cr2 = Cr2::read_raw();
+    let rip = stack_frame.instruction_pointer.as_u64();
+    let rsp = stack_frame.stack_pointer.as_u64();
+    let cs = stack_frame.code_segment.0;
+
+    let mut l1 = crate::serial::FixedBuf::<96>::new();
+    let mut l2 = crate::serial::FixedBuf::<96>::new();
+    let _ = write!(
+        l1,
+        "#DF DOUBLE FAULT err=0x{:x} cs=0x{:x}",
+        error_code, cs
+    );
+    let _ = write!(l2, "rip=0x{:x} rsp=0x{:x} cr2=0x{:x}", rip, rsp, cr2);
+    crate::serial::panic_banner("KERNEL DOUBLE FAULT", l1.as_str(), l2.as_str());
+
     loop {
         unsafe {
             asm!("cli", "hlt", options(nomem, nostack));

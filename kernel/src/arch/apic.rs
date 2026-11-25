@@ -33,6 +33,7 @@ const LAPIC_REG_SVR: usize = 0x0F0;
 const LAPIC_REG_ICR_LO: usize = 0x300;
 const LAPIC_REG_ICR_HI: usize = 0x310;
 const LAPIC_REG_LVT_TIMER: usize = 0x320;
+const LAPIC_REG_LVT_LINT0: usize = 0x350;
 const LAPIC_REG_TIMER_INIT: usize = 0x380;
 const LAPIC_REG_TIMER_CUR: usize = 0x390;
 const LAPIC_REG_TIMER_DIV: usize = 0x3E0;
@@ -209,6 +210,7 @@ fn read_cpu_identity(snap: &mut ApicSmpSnapshot) {
     }
 }
 
+#[inline(never)]
 pub fn init(
     acpi: &AcpiPlatformInfo,
     mapping: &PhysicalMemoryMapping,
@@ -265,10 +267,27 @@ pub fn init(
                 let new_svr = (svr & !0xFF) | 0x1FF;
                 lapic_write(LAPIC_MMIO_VIRT_BASE, LAPIC_REG_SVR, new_svr);
 
+                // Ensure BSP LINT0 Virtual Wire Mode (ExtINT) is unmasked so 8259 PIC IRQs
+                // (PIT IRQ0, PS/2 Keyboard IRQ1, PS/2 Mouse IRQ12) continue reaching the CPU
+                // regardless of whether MADT PCAT_COMPAT is reported.
+                let lvt_lint0 = lapic_read(LAPIC_MMIO_VIRT_BASE, LAPIC_REG_LVT_LINT0);
+                if (lvt_lint0 & 0x700) == 0x700 {
+                    if (lvt_lint0 & LAPIC_LVT_MASK) != 0 {
+                        lapic_write(
+                            LAPIC_MMIO_VIRT_BASE,
+                            LAPIC_REG_LVT_LINT0,
+                            lvt_lint0 & !LAPIC_LVT_MASK,
+                        );
+                    }
+                } else if (lvt_lint0 & 0x700) == 0 && (lvt_lint0 & LAPIC_LVT_MASK) != 0 {
+                    lapic_write(LAPIC_MMIO_VIRT_BASE, LAPIC_REG_LVT_LINT0, 0x0000_0700);
+                }
+
                 // Clear Task Priority to 0 (allow all priorities) and mask LAPIC timer until calibrated.
                 lapic_write(LAPIC_MMIO_VIRT_BASE, LAPIC_REG_TPR, 0);
                 let lvt_timer = lapic_read(LAPIC_MMIO_VIRT_BASE, LAPIC_REG_LVT_TIMER);
                 lapic_write(LAPIC_MMIO_VIRT_BASE, LAPIC_REG_LVT_TIMER, lvt_timer | (1 << 16));
+
                 let _ = lapic_read(LAPIC_MMIO_VIRT_BASE, LAPIC_REG_TIMER_CUR);
                 let _ = lapic_read(LAPIC_MMIO_VIRT_BASE, LAPIC_REG_TIMER_INIT);
                 let _ = lapic_read(LAPIC_MMIO_VIRT_BASE, LAPIC_REG_TIMER_DIV);
@@ -339,6 +358,17 @@ pub fn init(
         format_args!(
             "LAPIC enabled={} bsp_id={} cores={} ioapics={}",
             snap.lapic_enabled, snap.bsp_apic_id, snap.detected_cores, snap.ioapic_count
+        ),
+    );
+    crate::serial::log_fmt(
+        "apic",
+        format_args!(
+            "enabled={} bsp_id={} detected_cores={} ioapics={} lapic_phys=0x{:x}",
+            snap.lapic_enabled,
+            snap.bsp_apic_id,
+            snap.detected_cores,
+            snap.ioapic_count,
+            snap.lapic_phys
         ),
     );
     snap
@@ -422,13 +452,20 @@ pub fn calibrate_and_enable_timer(target_hz: u32) -> bool {
             hz, APIC_TIMER_VECTOR, ticks_per_ms, init_count
         ),
     );
+    crate::serial::log_fmt(
+        "apic",
+        format_args!(
+            "timer armed {}Hz vec=0x{:02x} cal={}t/ms actual_ms={} init={}",
+            hz, APIC_TIMER_VECTOR, ticks_per_ms, actual_ms, init_count
+        ),
+    );
     true
 }
 
 /// Called on each Application Processor right after jumping to long mode:
-/// enables its Local APIC (via IA32_APIC_BASE + SVR) and arms its per-core
-/// periodic LAPIC timer using the BSP-calibrated initial count.
-pub fn enable_ap_lapic_and_timer() -> u32 {
+/// enables its Local APIC (via IA32_APIC_BASE + SVR) and returns its hardware APIC ID
+/// BEFORE arming its periodic timer so `percpu::init_ap` can initialize first.
+pub fn enable_ap_lapic() -> u32 {
     let msr_val = unsafe { Msr::new(IA32_APIC_BASE_MSR).read() };
     if (msr_val & (1 << 11)) == 0 {
         unsafe {
@@ -441,13 +478,25 @@ pub fn enable_ap_lapic_and_timer() -> u32 {
         return 0;
     }
 
-    let apic_id = unsafe {
+    unsafe {
         let svr = lapic_read(lapic_virt, LAPIC_REG_SVR);
         lapic_write(lapic_virt, LAPIC_REG_SVR, (svr & !0xFF) | 0x1FF);
         lapic_write(lapic_virt, LAPIC_REG_TPR, 0);
+        let lvt_timer = lapic_read(lapic_virt, LAPIC_REG_LVT_TIMER);
+        lapic_write(lapic_virt, LAPIC_REG_LVT_TIMER, lvt_timer | LAPIC_LVT_MASK);
+        (lapic_read(lapic_virt, LAPIC_REG_ID) >> 24) & 0xFF
+    }
+}
 
-        let init_count = APIC_INIT_COUNT_FAST.load(Ordering::Acquire);
-        if APIC_TIMER_ACTIVE.load(Ordering::Acquire) && init_count > 0 {
+/// Arms the AP's per-core periodic LAPIC timer using the BSP-calibrated initial count.
+pub fn arm_ap_timer() {
+    let lapic_virt = LAPIC_VIRT_FAST.load(Ordering::Acquire);
+    if lapic_virt == 0 {
+        return;
+    }
+    let init_count = APIC_INIT_COUNT_FAST.load(Ordering::Acquire);
+    if APIC_TIMER_ACTIVE.load(Ordering::Acquire) && init_count > 0 {
+        unsafe {
             lapic_write(lapic_virt, LAPIC_REG_TIMER_DIV, 0x03);
             lapic_write(
                 lapic_virt,
@@ -456,10 +505,12 @@ pub fn enable_ap_lapic_and_timer() -> u32 {
             );
             lapic_write(lapic_virt, LAPIC_REG_TIMER_INIT, init_count);
         }
+    }
+}
 
-        (lapic_read(lapic_virt, LAPIC_REG_ID) >> 24) & 0xFF
-    };
-
+pub fn enable_ap_lapic_and_timer() -> u32 {
+    let apic_id = enable_ap_lapic();
+    arm_ap_timer();
     apic_id
 }
 

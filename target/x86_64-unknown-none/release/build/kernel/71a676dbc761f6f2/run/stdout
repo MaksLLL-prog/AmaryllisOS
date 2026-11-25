@@ -1,0 +1,2 @@
+cargo:rerun-if-changed=assets/ui.ttf
+cargo:rerun-if-changed=assets/mono.ttf

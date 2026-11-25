@@ -20,6 +20,7 @@ mod audio;
 mod arch;
 mod userland;
 mod klog;
+mod serial;
 
 extern crate alloc;
 
@@ -48,6 +49,7 @@ use console::Console;
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.kernel_stack_size = 512 * 1024;
     config
 };
 
@@ -84,6 +86,9 @@ static mut HEAP_MEMORY: HeapMemory =
 // ============================================================
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    serial::init();
+    serial::log("boot", "kernel_main entered");
+
     let memory_stats =
         memory::analyze(&boot_info.memory_regions);
 
@@ -108,13 +113,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let framebuffer =
         match boot_info.framebuffer.as_mut() {
             Some(framebuffer) => framebuffer,
-            None => halt_forever(),
+            None => {
+                serial::log("boot", "ERROR: bootloader provided no framebuffer");
+                halt_forever();
+            }
         };
 
     let info = framebuffer.info();
+    let fb_slice = framebuffer.buffer_mut();
+    serial::register_emergency_fb(
+        fb_slice.as_mut_ptr(),
+        fb_slice.len(),
+        info.width,
+        info.height,
+        info.stride,
+        info.bytes_per_pixel,
+        matches!(info.pixel_format, bootloader_api::info::PixelFormat::Bgr),
+    );
+    serial::log_fmt(
+        "boot",
+        format_args!(
+            "framebuffer {}x{} stride={} bpp={} phys_off={:?}",
+            info.width, info.height, info.stride, info.bytes_per_pixel, physical_memory_offset
+        ),
+    );
 
     let renderer = Renderer::new(
-        framebuffer.buffer_mut(),
+        fb_slice,
         info.width,
         info.height,
         info.stride,
@@ -124,10 +149,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let mut console = Console::new(renderer);
 
-arch::gdt::init();
-interrupts::init();
-userland::init();
-initialize_console(&mut console);
+    arch::gdt::init();
+    userland::init();
+    interrupts::init();
+    serial::log("boot", "gdt/userland/interrupts initialized");
+
+    initialize_console(&mut console);
+    serial::log("boot", "console initialized");
 
 // --------------------------------------------------------
 // Physical Memory Manager tests (before heap initialization)
@@ -167,12 +195,15 @@ display_test_result(
 
 let discovery = pci::scan(&mut console);
 storage::init(&mut console, &discovery.ide_controllers);
+serial::log("boot", "pci & storage initialized");
 
 if input::initialize_mouse() {
     console.write("[ OK ] PS/2 mouse initialized\n", GREEN);
     interrupts::enable_mouse_irq();
+    serial::log("boot", "ps2 mouse initialized");
 } else {
     console.write("[FAIL] PS/2 mouse initialization failed\n", YELLOW);
+    serial::log("boot", "ps2 mouse failed");
 }
 
     display_memory_mapping(
@@ -223,16 +254,13 @@ if input::initialize_mouse() {
                 &mut frame_allocator,
                 &mapping,
             );
+            serial::log("boot", "pre-heap vmm & process tests completed");
         }
     }
 
     // --------------------------------------------------------
     // Heap allocator initialization
     // --------------------------------------------------------
-
-// --------------------------------------------------------
-// Heap allocator initialization
-// --------------------------------------------------------
 
 console.write(
     "\nHeap allocator initialization:\n",
@@ -248,6 +276,7 @@ let heap_initialized = unsafe {
         HEAP_SIZE,
     )
 };
+serial::log_fmt("boot", format_args!("heap initialized={}", heap_initialized));
 
 display_test_result(
     &mut console,
@@ -270,6 +299,7 @@ if heap_initialized {
 
     let migration_success =
         frame_allocator.migrate_to_dynamic();
+    serial::log_fmt("boot", format_args!("dynamic pmm migration={}", migration_success));
 
     display_test_result(
         &mut console,
@@ -371,7 +401,18 @@ if heap_initialized {
     });
 
     if let Some(ref mapping) = shell_mapping {
-        let acpi_info = arch::acpi::init(mapping, rsdp_hint);
+        serial::log("boot", "starting acpi::init");
+        let acpi_info = arch::acpi::init(mapping, &mut frame_allocator, rsdp_hint);
+        serial::log_fmt(
+            "boot",
+            format_args!(
+                "acpi discovered={} tables={} cpus={} ioapics={}",
+                acpi_info.discovered,
+                acpi_info.table_count,
+                acpi_info.cpu_count,
+                acpi_info.ioapic_count
+            ),
+        );
         let apic_snap = arch::apic::init(&acpi_info, mapping, &mut frame_allocator);
         console.write("\nACPI & APIC/SMP Initialization:\n", GREEN);
         if acpi_info.discovered {
@@ -403,6 +444,7 @@ if heap_initialized {
         &mut frame_allocator,
         &info,
     );
+    serial::log("boot", "drivers::init_all completed");
 
     if let Some(ref mapping) = shell_mapping {
         let kthread_guarded = task::kthread::init_guarded_stacks(mapping, &mut frame_allocator);
@@ -412,6 +454,13 @@ if heap_initialized {
         let smp_sum = arch::smp::init_ap_cores(&acpi_info, mapping, &mut frame_allocator);
         drivers::iokit::start_workloops();
         let iokit_st = drivers::iokit::stats();
+        serial::log_fmt(
+            "boot",
+            format_args!(
+                "smp online={} ap_booted={} lapic_timer={} iokit_vecs={}",
+                smp_sum.online_cpus, smp_sum.ap_booted, apic_timer_ok, iokit_st.routed_vectors
+            ),
+        );
 
         console.write("  [ OK ] ", GREEN);
         console.write("KThread Guarded Stacks: ", GRAY);
@@ -452,6 +501,7 @@ if heap_initialized {
     }
 
     graphics::personalization::init_from_vfs();
+    serial::log("boot", "launching desktop");
 
     // Boot directly into Amaryllis Desktop; exiting GUI drops cleanly to the text shell.
     graphics::wm::run_desktop(
@@ -460,6 +510,7 @@ if heap_initialized {
         &mut frame_allocator,
     );
 
+    serial::log("boot", "desktop exited, starting text shell");
     run_shell(
         &mut console,
         shell_mapping.as_ref(),
@@ -472,6 +523,7 @@ if heap_initialized {
 // ============================================================
 
 
+#[inline(never)]
 fn initialize_console(console: &mut Console<'_>) {
     console.clear();
 
@@ -1085,6 +1137,7 @@ fn display_test_result(
 // ============================================================
 
 
+#[inline(never)]
 fn test_virtual_memory_manager(
     console: &mut Console<'_>,
     allocator: &mut memory::PhysicalFrameAllocator<'_>,
@@ -1352,6 +1405,7 @@ fn test_virtual_memory_manager(
 // ============================================================
 
 
+#[inline(never)]
 fn test_address_spaces(
     console: &mut Console<'_>,
     allocator: &mut memory::PhysicalFrameAllocator<'_>,
@@ -4306,6 +4360,7 @@ unsafe {
 // PROCESS MANAGER TESTS
 // ============================================================
 
+#[inline(never)]
 fn test_process_manager(
     console: &mut Console<'_>,
     allocator: &mut memory::PhysicalFrameAllocator<'_>,
@@ -4797,6 +4852,7 @@ fn test_cr3_switch(
 // VMM ALLOCATION ROLLBACK TEST
 // ============================================================
 
+#[inline(never)]
 fn test_vmm_allocation_rollback(
     console: &mut Console<'_>,
     allocator: &mut memory::PhysicalFrameAllocator<'_>,
@@ -4999,6 +5055,7 @@ let cleanup_result =
 // GLOBAL HEAP ALLOCATOR TESTS
 // ============================================================
 
+#[inline(never)]
 fn test_heap_allocator(
     console: &mut Console<'_>,
 ) {
@@ -5138,6 +5195,7 @@ fn test_heap_allocator(
 
 
 
+#[inline(never)]
 fn test_memory_api(
     console: &mut Console<'_>,
 ) {
@@ -5300,6 +5358,7 @@ fn test_memory_api(
 // INTERACTIVE SHELL
 // ============================================================
 
+#[inline(never)]
 fn run_shell(
     console: &mut Console<'_>,
     mapping: Option<&memory::vmm::PhysicalMemoryMapping>,
@@ -5311,7 +5370,7 @@ fn run_shell(
     let mut cursor_position = 0usize;
 
     let mut history =
-        [[0u8; BUFFER_SIZE]; HISTORY_SIZE];
+        alloc::vec![[0u8; BUFFER_SIZE]; HISTORY_SIZE];
 
     let mut history_lengths =
         [0usize; HISTORY_SIZE];
@@ -5367,6 +5426,7 @@ fn run_shell(
         // Keyboard input
         // ----------------------------------------------------
 
+        let _ = input::poll_keyboard_hw();
         if let Some(scancode) =
             input::read_scancode()
         {
@@ -5683,7 +5743,7 @@ fn run_shell(
 fn save_history(
     buffer: &[u8; BUFFER_SIZE],
     length: usize,
-    history: &mut [[u8; BUFFER_SIZE]; HISTORY_SIZE],
+    history: &mut [[u8; BUFFER_SIZE]],
     history_lengths: &mut [usize; HISTORY_SIZE],
     history_count: &mut usize,
 ) {
@@ -5798,7 +5858,17 @@ fn halt_forever() -> ! {
 // ============================================================
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    use core::fmt::Write;
+    let mut l1 = serial::FixedBuf::<96>::new();
+    let mut l2 = serial::FixedBuf::<96>::new();
+    let _ = write!(l1, "{}", info.message());
+    if let Some(loc) = info.location() {
+        let _ = write!(l2, "{}:{}:{}", loc.file(), loc.line(), loc.column());
+    } else {
+        let _ = write!(l2, "unknown location");
+    }
+    serial::panic_banner("KERNEL PANIC", l1.as_str(), l2.as_str());
     halt_forever();
 }
 
@@ -5807,6 +5877,12 @@ fn panic(_info: &PanicInfo) -> ! {
 // ============================================================
 
 #[alloc_error_handler]
-fn alloc_error(_layout: Layout) -> ! {
+fn alloc_error(layout: Layout) -> ! {
+    use core::fmt::Write;
+    let mut l1 = serial::FixedBuf::<96>::new();
+    let mut l2 = serial::FixedBuf::<96>::new();
+    let _ = write!(l1, "size={} align={}", layout.size(), layout.align());
+    let _ = write!(l2, "cpu={}", arch::percpu::current_cpu_id());
+    serial::panic_banner("KERNEL ALLOC ERROR", l1.as_str(), l2.as_str());
     halt_forever();
 }

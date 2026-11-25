@@ -5,7 +5,7 @@ pub mod runner;
 pub mod sched;
 pub mod syscall;
 
-fn init_fpu_sse() {
+pub fn init_fpu_sse() {
     unsafe {
         let mut cr0: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));

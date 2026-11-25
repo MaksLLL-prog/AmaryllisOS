@@ -32,3 +32,7 @@ pub fn drain_mouse() {
 pub fn poll_mouse_hw() -> usize {
     mouse::poll_aux_if_pending()
 }
+
+pub fn poll_keyboard_hw() -> usize {
+    keyboard::poll_if_pending()
+}

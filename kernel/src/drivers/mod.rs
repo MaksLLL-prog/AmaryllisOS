@@ -53,6 +53,7 @@ impl<const N: usize> Write for FixedStr<N> {
     }
 }
 
+#[inline(never)]
 pub fn init_all(
     console: &mut Console<'_>,
     discovery: &HardwareDiscovery,
@@ -96,16 +97,23 @@ pub fn init_all(
     } else {
         DriverStatus::NotPresent
     };
+    let mouse_details = if !input::mouse::is_initialized() {
+        "PS/2 mouse inactive"
+    } else if input::mouse::packet_size() == 4 {
+        "4-byte wheel packet mode"
+    } else {
+        "3-byte standard packet mode"
+    };
     registry::register_device(
         "PS/2 Mouse",
-        "i8042 IntelliMouse",
+        "i8042 PS/2 Mouse",
         DeviceClass::Mouse,
         DeviceBus::Ps2,
         mouse_status,
         Some(12),
         0x60,
         0,
-        "4-byte wheel packet mode",
+        mouse_details,
     );
 
     // 4. Linear Framebuffer Display
@@ -308,7 +316,7 @@ pub fn init_all(
             DriverStatus::NotPresent
         },
         None,
-        acpi_info.fadt_pm1a_cnt_blk as u64,
+        acpi_info.fadt_pm1a_cnt as u64,
         acpi_info.rsdp_phys,
         acpi_details.as_str(),
     );

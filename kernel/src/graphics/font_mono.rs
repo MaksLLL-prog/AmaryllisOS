@@ -3543,3 +3543,4 @@ pub fn with_mono_glyph<R>(
 pub fn rasterize_mono_glyph(ch: char, px_size: u16) -> Option<RasterizedGlyph> {
     with_mono_glyph(ch, px_size, |g| g.clone())
 }
+

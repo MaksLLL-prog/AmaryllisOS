@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use core::arch::asm;
+use core::arch::{asm, global_asm};
 use core::ptr::write_bytes;
 use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
@@ -97,11 +97,39 @@ const TRAMPOLINE_64: &[u8] = &[
 static SMP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static AP_BOOT_ACK: AtomicU32 = AtomicU32::new(0);
 static AP_CORES_BOOTED: AtomicUsize = AtomicUsize::new(0);
+static AP_SYSCALL_TOPS: [AtomicU64; MAX_SMP_CPUS] = [const { AtomicU64::new(0) }; MAX_SMP_CPUS];
 
 static TLB_SHOOTDOWN_ADDR: AtomicU64 = AtomicU64::new(0);
 static TLB_SHOOTDOWN_ACKS: AtomicUsize = AtomicUsize::new(0);
 static TLB_SHOOTDOWN_COUNT: AtomicU64 = AtomicU64::new(0);
 static TLB_SHOOTDOWN_LOCK: Mutex<()> = Mutex::new(());
+
+global_asm!(
+    ".global ap_asm_entry",
+    "ap_asm_entry:",
+    "mov rax, cr0",
+    "and rax, -13",
+    "or rax, 0x22",
+    "mov cr0, rax",
+    "fninit",
+    "mov rax, cr4",
+    "or rax, 0x600",
+    "mov cr4, rax",
+    "and rsp, -16",
+    "sub rsp, 16",
+    "mov dword ptr [rsp], 0x1F80",
+    "ldmxcsr [rsp]",
+    "add rsp, 16",
+    "call ap_rust_entry",
+    "1:",
+    "cli",
+    "hlt",
+    "jmp 1b",
+);
+
+unsafe extern "C" {
+    fn ap_asm_entry() -> !;
+}
 
 #[derive(Clone, Copy)]
 pub struct SmpSummary {
@@ -120,19 +148,25 @@ fn delay_ms_pit_or_spin(ms: u64) {
     }
 }
 
+#[no_mangle]
 extern "C" fn ap_rust_entry(cpu_id: u32) -> ! {
     let cid = cpu_id as usize;
     unsafe {
         gdt::init_ap(cid);
     }
     crate::interrupts::load_idt_for_ap();
-    let apic_id = apic::enable_ap_lapic_and_timer();
-
-    let syscall_stack: &'static [u8] =
-        alloc::boxed::Box::leak(alloc::vec![0u8; AP_SYSCALL_STACK_SIZE].into_boxed_slice());
-    let syscall_top = ((syscall_stack.as_ptr() as u64) + AP_SYSCALL_STACK_SIZE as u64) & !0xF;
+    let apic_id = apic::enable_ap_lapic();
+    let syscall_top = AP_SYSCALL_TOPS
+        .get(cid)
+        .map(|a| a.load(Ordering::Acquire))
+        .unwrap_or(0);
     percpu::init_ap(cid, apic_id, syscall_top);
+    apic::arm_ap_timer();
 
+    crate::serial::log_fmt(
+        "smp",
+        format_args!("AP cpu={} apic={} online", cid, apic_id),
+    );
     AP_BOOT_ACK.store(cpu_id, Ordering::Release);
 
     loop {
@@ -145,6 +179,7 @@ extern "C" fn ap_rust_entry(cpu_id: u32) -> ! {
 
 /// Wakes secondary Application Processors (APs) listed in ACPI MADT using
 /// the x86 INIT-SIPI-SIPI protocol and a real->protected->long-mode trampoline at `0x8000`.
+#[inline(never)]
 pub fn init_ap_cores(
     acpi: &AcpiPlatformInfo,
     mapping: &PhysicalMemoryMapping,
@@ -241,14 +276,22 @@ pub fn init_ap_cores(
 
         (tramp_ptr.add(OFF_PML4_PHYS) as *mut u32).write(pml4_phys as u32);
         (tramp_ptr.add(OFF_EFER_MASK) as *mut u32).write(efer_mask);
-        (tramp_ptr.add(OFF_AP_ENTRY) as *mut u64).write(ap_rust_entry as *const () as u64);
+        (tramp_ptr.add(OFF_AP_ENTRY) as *mut u64).write(ap_asm_entry as *const () as u64);
     }
 
     let mut booted = 0usize;
     for (idx, &apic_id) in target_apics.iter().enumerate() {
         let cpu_id = idx + 1;
+        if cpu_id >= MAX_SMP_CPUS {
+            break;
+        }
         let stack: &'static [u8] =
             alloc::boxed::Box::leak(alloc::vec![0u8; AP_BOOT_STACK_SIZE].into_boxed_slice());
+        let syscall_stack: &'static [u8] =
+            alloc::boxed::Box::leak(alloc::vec![0u8; AP_SYSCALL_STACK_SIZE].into_boxed_slice());
+        let syscall_top = ((syscall_stack.as_ptr() as u64) + AP_SYSCALL_STACK_SIZE as u64) & !0xF;
+        AP_SYSCALL_TOPS[cpu_id].store(syscall_top, Ordering::Release);
+
         // Simulate SysV `call` return-address alignment (`RSP % 16 == 8` at function entry before `jmp rax`).
         let stack_top = (((stack.as_ptr() as u64) + AP_BOOT_STACK_SIZE as u64) & !0xF) - 8;
 

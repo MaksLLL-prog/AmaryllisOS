@@ -39,6 +39,7 @@ fn display_result(
     }
 }
 
+#[inline(never)]
 pub fn run(
     console: &mut Console<'_>,
     allocator: &mut memory::PhysicalFrameAllocator<'_>,

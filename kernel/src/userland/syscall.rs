@@ -563,7 +563,7 @@ extern "C" fn rust_apic_timer_irq_dispatch(ctx: *mut UserCpuContext) -> u64 {
     if ctx.is_null() {
         return 0;
     }
-    let now_ms = timer::uptime_ms();
+    let now_ms = if cpu == 0 { timer::on_lapic_tick() } else { timer::uptime_ms() };
     let cs = unsafe { (*ctx).cs };
     if (cs & 3) == 3 && cpu == 0 && USER_EXECUTION_ACTIVE.load(Ordering::Acquire) {
         return sched::on_timer_irq_preempt(ctx, now_ms);

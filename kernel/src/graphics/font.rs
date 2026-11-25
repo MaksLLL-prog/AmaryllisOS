@@ -548,3 +548,4 @@ pub fn rasterize_ui_glyph(ch: char, px_size: u16, bold: bool) -> Option<Rasteriz
 pub fn ui_glyph_advance(ch: char, px_size: u16, bold: bool) -> Option<i32> {
     with_ui_glyph(ch, px_size, bold, |g| g.advance)
 }
+

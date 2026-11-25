@@ -10,19 +10,27 @@ static QUEUE: [AtomicU8; QUEUE_SIZE] =
 static HEAD: AtomicUsize = AtomicUsize::new(0);
 static TAIL: AtomicUsize = AtomicUsize::new(0);
 
-// Called from the keyboard interrupt handler.
-pub fn handle_interrupt() {
-    let scancode: u8;
+const DATA_PORT: u16 = 0x60;
+const STATUS_PORT: u16 = 0x64;
+const STATUS_OUTPUT_FULL: u8 = 0x01;
+const STATUS_AUX_DATA: u8 = 0x20;
 
+#[inline]
+unsafe fn inb(port: u16) -> u8 {
+    let value: u8;
     unsafe {
         asm!(
             "in al, dx",
-            in("dx") 0x60u16,
-            out("al") scancode,
+            in("dx") port,
+            out("al") value,
             options(nomem, nostack, preserves_flags)
         );
     }
+    value
+}
 
+#[inline]
+pub(super) fn push_scancode_from_hw(scancode: u8) {
     let head = HEAD.load(Ordering::Relaxed);
     let next = (head + 1) % QUEUE_SIZE;
     let tail = TAIL.load(Ordering::Acquire);
@@ -32,6 +40,49 @@ pub fn handle_interrupt() {
         QUEUE[head].store(scancode, Ordering::Relaxed);
         HEAD.store(next, Ordering::Release);
     }
+}
+
+// Called from the keyboard interrupt handler.
+pub fn handle_interrupt() {
+    let status = unsafe { inb(STATUS_PORT) };
+    if (status & STATUS_OUTPUT_FULL) == 0 {
+        return;
+    }
+
+    let byte = unsafe { inb(DATA_PORT) };
+    if (status & STATUS_AUX_DATA) != 0 {
+        super::mouse::push_aux_byte_from_irq(byte);
+        return;
+    }
+
+    push_scancode_from_hw(byte);
+}
+
+/// Non-blocking recovery helper: drains pending i8042 output bytes so an unread
+/// keyboard byte cannot stall edge-triggered IRQ1/IRQ12 delivery.
+pub fn poll_if_pending() -> usize {
+    let first_status = unsafe { inb(STATUS_PORT) };
+    if (first_status & STATUS_OUTPUT_FULL) == 0 {
+        return 0;
+    }
+
+    let mut count = 0usize;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for _ in 0..16 {
+            let status = unsafe { inb(STATUS_PORT) };
+            if (status & STATUS_OUTPUT_FULL) == 0 {
+                break;
+            }
+            let byte = unsafe { inb(DATA_PORT) };
+            if (status & STATUS_AUX_DATA) != 0 {
+                super::mouse::push_aux_byte_from_irq(byte);
+            } else {
+                push_scancode_from_hw(byte);
+                count += 1;
+            }
+        }
+    });
+    count
 }
 
 // Read the next scancode from the queue.

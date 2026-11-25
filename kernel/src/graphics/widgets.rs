@@ -1581,3 +1581,4 @@ pub fn ui_text_width(text: &str, scale_q8: i32, bold: bool, mono_ui: bool) -> i3
         text_width_scaled(text, scale_q8, bold)
     }
 }
+

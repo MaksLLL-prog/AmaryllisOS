@@ -380,6 +380,7 @@ fn control_center_slots(cfg: &DesktopConfig, cr: Rect) -> Vec<(ControlCenterModu
 }
 
 impl DesktopState {
+    #[inline(never)]
     fn new(width: usize, height: usize) -> Self {
         let now_ms = timer::uptime_ms();
         let now_ticks = timer::ticks();
@@ -1590,6 +1591,7 @@ impl DesktopState {
             self.handle_left_click(self.cursor_x, self.cursor_y, allow_shell_spawn);
         }
 
+        let _ = crate::input::poll_keyboard_hw();
         while let Some(sc) = crate::input::read_scancode() {
             let Some(evt) = crate::input::decode_scancode(sc, &mut self.ext_scancode, &mut self.modifiers) else {
                 continue;
@@ -4125,11 +4127,13 @@ pub fn append_user_stdout(text: &str) {
     }
 }
 
+#[inline(never)]
 pub fn run_desktop(
     console: &mut Console<'_>,
     mapping: Option<&PhysicalMemoryMapping>,
     allocator: &mut PhysicalFrameAllocator<'_>,
 ) {
+    crate::serial::log("wm", "run_desktop entered");
     let w = console.width();
     let h = console.height();
     ACTIVE_HHDM_OFFSET.store(mapping.map(|m| m.offset()).unwrap_or(0), Ordering::Release);
@@ -4145,7 +4149,9 @@ pub fn run_desktop(
         let mut guard = ACTIVE_DESKTOP.lock();
         *guard = Some(Box::new(DesktopState::new(w, h)));
     }
+    crate::serial::log("wm", "DesktopState allocated");
 
+    let mut first_frame_logged = false;
     loop {
         let mut pending: Vec<DesktopAction> = Vec::new();
         let mut exit_now = false;
@@ -4160,6 +4166,11 @@ pub fn run_desktop(
                 desk.try_render_frame(console.renderer_mut(), Some(allocator));
                 last_frame_ms = desk.last_frame_ms;
             }
+        }
+
+        if !first_frame_logged {
+            first_frame_logged = true;
+            crate::serial::log("wm", "first desktop frame rendered");
         }
 
         if exit_now {
@@ -4287,7 +4298,7 @@ fn execute_pending_action(
             if let Err(err) = sched::kill_user_process(pid, mapping, allocator) {
                 alerts::report_system_error(
                     AlertSeverity::Warning,
-                    AlertSubsystem::Kernel,
+                    AlertSubsystem::CpuRing3,
                     "PROC KILL",
                     &format!("Cannot kill PID {}", pid),
                     err,

@@ -19,12 +19,12 @@ use crate::net::{dhcp, dns, http, icmp};
 use crate::task::preempt::{self, PreemptMutex};
 use crate::userland::sched::UserCpuContext;
 
-pub const KTHREAD_STACK_SIZE: usize = 64 * 1024;
-pub const KTHREAD_GUARD_SIZE: usize = PAGE_SIZE as usize;
+pub const KTHREAD_STACK_SIZE: usize = 512 * 1024;
+pub const KTHREAD_GUARD_SIZE: usize = 4 * PAGE_SIZE as usize;
 pub const KTHREAD_SLOT_STRIDE: u64 = (KTHREAD_STACK_SIZE + KTHREAD_GUARD_SIZE) as u64;
 /// Virtual address range inside PML4 index 3 (`SHARED_KERNEL_PML4_MASK`),
 /// with a permanently unmapped 4 KiB guard page at the bottom of each 64 KiB stack slot.
-pub const KTHREAD_STACK_VIRT_BASE: u64 = 0x0000_0180_0000_0000;
+pub const KTHREAD_STACK_VIRT_BASE: u64 = 0x0000_0A00_0000_0000;
 pub const MAX_KTHREADS: usize = 12;
 pub const KTHREAD_QUANTUM_MS: u64 = 4;
 
@@ -387,7 +387,6 @@ extern "C" fn kthread_entry_trampoline() -> ! {
         if let Some(idx) = rt.current_idx[cpu] {
             if let Some(ref mut slot) = rt.slots[idx] {
                 slot.state = KThreadState::Finished;
-                slot.running_on_cpu = None;
                 Some((slot.id, slot.name))
             } else {
                 None
@@ -432,14 +431,13 @@ pub fn spawn_kthread(name: &'static str, entry: fn()) -> Option<usize> {
         (top, Some(stack), base)
     };
 
-    let initial_rsp = top - 64;
+    let initial_rsp = top - 56;
     unsafe {
         let frame = initial_rsp as *mut u64;
         for i in 0..6 {
             frame.add(i).write(0);
         }
         frame.add(6).write(kthread_entry_trampoline as *const () as u64);
-        frame.add(7).write(0);
     }
 
     let id = rt.next_id;
@@ -477,11 +475,18 @@ pub fn spawn_kthread(name: &'static str, entry: fn()) -> Option<usize> {
 
 /// Called from APIC periodic timer IRQ (`0x40`, `IF = 0`) when interrupting Ring 0 kthread code
 /// on any online CPU (`BSP` or `AP`).
-pub fn on_apic_irq_preempt(ctx: *mut UserCpuContext, now_ms: u64) -> u64 {
+pub fn on_apic_irq_preempt(ctx: *mut UserCpuContext, _now_ms: u64) -> u64 {
     let cpu = cpu_slot();
     if !IN_KTHREAD[cpu].load(Ordering::Acquire) || ctx.is_null() {
         return 0;
     }
+    preempt::set_need_resched_on_cpu(cpu);
+    0
+}
+
+#[allow(dead_code)]
+fn _unused_preempt_legacy(ctx: *mut UserCpuContext, now_ms: u64) -> u64 {
+    let cpu = cpu_slot();
 
     if !preempt::is_preemptible() {
         preempt::set_need_resched();
@@ -508,7 +513,6 @@ pub fn on_apic_irq_preempt(ctx: *mut UserCpuContext, now_ms: u64) -> u64 {
             slot.preempt_ctx.rflags = (slot.preempt_ctx.rflags & 0x0020_0CD5) | 0x0202;
             slot.was_irq_preempted = true;
             slot.state = KThreadState::Ready;
-            slot.running_on_cpu = None;
             slot.preempts = slot.preempts.saturating_add(1);
             slot.cpu_ms = slot.cpu_ms.saturating_add(now_ms.saturating_sub(start_ms).max(1));
             TOTAL_KTHREAD_PREEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -522,10 +526,16 @@ pub fn on_apic_irq_preempt(ctx: *mut UserCpuContext, now_ms: u64) -> u64 {
 }
 
 /// Cooperatively yields from the running kernel worker back to this CPU's scheduler loop.
+#[inline(never)]
 pub fn yield_to_scheduler() {
     let cpu = cpu_slot();
     if !IN_KTHREAD[cpu].load(Ordering::Acquire) {
         return;
+    }
+
+    let was_if = interrupts_enabled();
+    unsafe {
+        asm!("cli", options(nomem, nostack));
     }
 
     preempt::clear_need_resched();
@@ -534,15 +544,17 @@ pub fn yield_to_scheduler() {
         let mut rt = KTHREADS.lock();
         let Some(idx) = rt.current_idx[cpu] else {
             IN_KTHREAD[cpu].store(false, Ordering::Release);
+            if was_if {
+                unsafe {
+                    asm!("sti", options(nomem, nostack));
+                }
+            }
             return;
         };
         let elapsed = now.saturating_sub(rt.run_start_ms[cpu]);
-        let krsp = rt.kernel_rsp[cpu];
+        let krsp = unsafe { KTHREAD_SAVED_KERNEL_RSP[cpu] };
         let slot = rt.slots[idx].as_mut().expect("active kthread missing");
-        if slot.state == KThreadState::Running {
-            slot.state = KThreadState::Ready;
-        }
-        slot.running_on_cpu = None;
+        // Keep state as Running until kthread_switch finishes saving RSP on this CPU!
         slot.was_irq_preempted = false;
         slot.cpu_ms = slot.cpu_ms.saturating_add(elapsed);
         (&raw mut slot.rsp, krsp)
@@ -553,9 +565,16 @@ pub fn yield_to_scheduler() {
     unsafe {
         kthread_switch(old_rsp_ptr, kernel_rsp, krsp_slot);
     }
+
+    if was_if {
+        unsafe {
+            asm!("sti", options(nomem, nostack));
+        }
+    }
 }
 
 /// Called from `timer::sleep_ms` when running inside a kernel worker thread so the caller CPU never stalls.
+#[inline(never)]
 pub fn sleep_current_ms(ms: u64) {
     let cpu = cpu_slot();
     if !IN_KTHREAD[cpu].load(Ordering::Acquire) {
@@ -567,7 +586,6 @@ pub fn sleep_current_ms(ms: u64) {
         if let Some(idx) = rt.current_idx[cpu] {
             if let Some(ref mut slot) = rt.slots[idx] {
                 slot.state = KThreadState::Sleeping { wake_ms };
-                slot.running_on_cpu = None;
             }
         }
     }
@@ -596,6 +614,7 @@ pub fn step_workers(max_steps: usize, budget_ms: u64) -> usize {
 }
 
 /// SMP work-stealing kthread scheduler loop callable simultaneously by BSP (`cpu_id=0`) and AP cores.
+#[inline(never)]
 pub fn step_workers_on_cpu(cpu_id: usize, max_steps: usize, budget_ms: u64) -> usize {
     if cpu_id == 0 {
         ensure_system_workers();
@@ -614,11 +633,9 @@ pub fn step_workers_on_cpu(cpu_id: usize, max_steps: usize, budget_ms: u64) -> u
 
         enum PickMode {
             Cooperative {
-                krsp_ptr: *mut u64,
                 target_rsp: u64,
             },
             PreemptResume {
-                krsp_ptr: *mut u64,
                 ctx: UserCpuContext,
             },
         }
@@ -628,9 +645,11 @@ pub fn step_workers_on_cpu(cpu_id: usize, max_steps: usize, budget_ms: u64) -> u
             apply_pending_wakes(&mut rt);
 
             for slot in rt.slots.iter_mut().flatten() {
-                if let KThreadState::Sleeping { wake_ms } = slot.state {
-                    if now >= wake_ms {
-                        slot.state = KThreadState::Ready;
+                if slot.running_on_cpu.is_none() {
+                    if let KThreadState::Sleeping { wake_ms } = slot.state {
+                        if now >= wake_ms {
+                            slot.state = KThreadState::Ready;
+                        }
                     }
                 }
             }
@@ -655,15 +674,9 @@ pub fn step_workers_on_cpu(cpu_id: usize, max_steps: usize, budget_ms: u64) -> u
                         rt.run_start_ms[cpu] = now;
                         rt.quantum_deadline_ms[cpu] = now.saturating_add(KTHREAD_QUANTUM_MS);
                         chosen = Some(if resume_irq {
-                            PickMode::PreemptResume {
-                                krsp_ptr: &raw mut rt.kernel_rsp[cpu],
-                                ctx,
-                            }
+                            PickMode::PreemptResume { ctx }
                         } else {
-                            PickMode::Cooperative {
-                                krsp_ptr: &raw mut rt.kernel_rsp[cpu],
-                                target_rsp,
-                            }
+                            PickMode::Cooperative { target_rsp }
                         });
                         break;
                     }
@@ -677,16 +690,28 @@ pub fn step_workers_on_cpu(cpu_id: usize, max_steps: usize, budget_ms: u64) -> u
         };
 
         percpu::record_kthread_slice(cpu);
+        unsafe {
+            asm!("cli", options(nomem, nostack));
+        }
         preempt::clear_need_resched();
         IN_KTHREAD[cpu].store(true, Ordering::Release);
+        let mut local_krsp: u64 = 0;
+        let krsp_ptr = &mut local_krsp as *mut u64;
+        {
+            let mut rt = KTHREADS.lock();
+            rt.kernel_rsp[cpu] = (&local_krsp as *const u64) as u64;
+        }
         let krsp_slot = unsafe { (&raw mut KTHREAD_SAVED_KERNEL_RSP[cpu]) as *mut u64 };
         match mode {
-            PickMode::Cooperative { krsp_ptr, target_rsp } => unsafe {
+            PickMode::Cooperative { target_rsp } => unsafe {
                 kthread_switch(krsp_ptr, target_rsp, krsp_slot);
             },
-            PickMode::PreemptResume { krsp_ptr, ctx } => unsafe {
+            PickMode::PreemptResume { ctx } => unsafe {
                 kthread_resume_irq_asm(krsp_ptr, &ctx as *const UserCpuContext, krsp_slot);
             },
+        }
+        unsafe {
+            asm!("cli", options(nomem, nostack));
         }
         IN_KTHREAD[cpu].store(false, Ordering::Release);
         preempt::clear_need_resched();
@@ -702,7 +727,9 @@ pub fn step_workers_on_cpu(cpu_id: usize, max_steps: usize, budget_ms: u64) -> u
             if let Some(done_idx) = rt.current_idx[cpu].take() {
                 if let Some(ref mut slot) = rt.slots[done_idx] {
                     slot.running_on_cpu = None;
-                    if slot.state == KThreadState::Finished {
+                    if slot.state == KThreadState::Running {
+                        slot.state = KThreadState::Ready;
+                    } else if slot.state == KThreadState::Finished {
                         rt.slots[done_idx] = None;
                     }
                 }

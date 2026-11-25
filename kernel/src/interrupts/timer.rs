@@ -112,6 +112,13 @@ pub fn sleep_ms(ms: u64) {
 }
 
 #[inline]
+pub fn on_lapic_tick() -> u64 {
+    let ms = UPTIME_MS.fetch_add(1, Ordering::Relaxed) + 1;
+    if ms % TICKS_DIVISOR == 0 { TICKS.fetch_add(1, Ordering::Relaxed); }
+    ms
+}
+
+#[inline]
 pub fn on_irq0_tick() -> u64 {
     let ms = UPTIME_MS.fetch_add(1, Ordering::Relaxed) + 1;
     if ms % TICKS_DIVISOR == 0 {

@@ -1,0 +1,1 @@
+cargo:rustc-env=BIOS_PATH=/home/kensei/AmaryllisOS/target/release/build/amaryllis_os/5b4be9badc28b229/out/bios.img

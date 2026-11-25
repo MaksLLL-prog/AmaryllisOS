@@ -70,8 +70,8 @@ pub fn initialize() {
 
 pub fn enable_timer_and_keyboard() {
     unsafe {
-        outb(PIC1_DATA, 0xFC);
-        outb(PIC2_DATA, 0xFF);
+        let mask1 = inb(PIC1_DATA) & !0x03;
+        outb(PIC1_DATA, mask1);
     }
 }
 
@@ -79,8 +79,11 @@ pub fn enable_mouse() {
     unsafe {
         // IRQ2: cascade from slave PIC.
         // IRQ12: PS/2 mouse.
-        outb(PIC1_DATA, 0xF8);
-        outb(PIC2_DATA, 0xEF);
+        let mask1 = inb(PIC1_DATA) & !0x04;
+        outb(PIC1_DATA, mask1);
+
+        let mask2 = inb(PIC2_DATA) & !0x10;
+        outb(PIC2_DATA, mask2);
     }
 }
 

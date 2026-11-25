@@ -346,3 +346,4 @@ fn build_sample_grid_bmp() -> Vec<u8> {
     }
     out
 }
+

@@ -1,92 +1,62 @@
-# Amaryllis OS — Project Status
+# Amaryllis OS
 
-**Version:** v0.11
-**Kernel:** ANU — Amaryllis is Not Unix
-**Last updated:** November 24, 2026
-**Development status:** Active development
-**Target architecture:** x86_64
-**Primary language:** Rust (`#![no_std]` + `alloc`)
-**License:** Apache License 2.0
+**Amaryllis OS** is an independent bare-metal operating system developed from scratch in Rust.
+
+It is powered by **ANU (Amaryllis is Not Unix)** — an independently designed x86_64 hybrid kernel inspired by architectural concepts from Mach, BSD, IOKit, and Libkern.
+
+The project focuses on building a complete operating system environment, including its own memory management, SMP infrastructure, preemptive scheduler, userland execution environment, storage subsystem, networking stack, device infrastructure, and graphical desktop.
+
+> **Amaryllis OS is an experimental operating system under active development.**
 
 ---
 
-## 1. Project Overview
+## Project Overview
 
-Amaryllis OS is an independent bare-metal operating system developed from scratch in Rust.
-
-Its hybrid kernel, ANU (Amaryllis is Not Unix), combines architectural ideas inspired by Mach, BSD, IOKit, and Libkern into an independently designed x86_64 kernel.
-
-The project includes its own memory management, SMP infrastructure, preemptive scheduler, kernel threads, userland execution environment, storage subsystem, networking stack, device infrastructure, and graphical desktop environment.
+| Property | Value |
+|---|---|
+| Version | v0.11 |
+| Kernel | ANU — Amaryllis is Not Unix |
+| Architecture | x86_64 |
+| Language | Rust |
+| Kernel environment | `#![no_std]` + `alloc` |
+| Development status | Active development |
+| Desktop | Amaryllis Desktop |
+| License | Apache License 2.0 |
 
 ### Project Statistics
 
 | Metric | Value |
 |---|---:|
-| Version | v0.11 |
 | Total codebase | 73,150 lines |
 | Source and configuration files | 143 |
-| Architecture | x86_64 |
-| Kernel language | Rust |
-| Kernel environment | `no_std` + `alloc` |
-| License | Apache 2.0 |
+| Version | v0.11 |
 
-*Statistics represent the current reported project snapshot.*
+*Statistics represent the reported project snapshot as of November 24, 2026.*
 
 ---
 
-## 2. Overall Development Status
+## Architecture
 
-| Subsystem | Status |
+ANU is a custom hybrid kernel that combines architectural ideas from several established operating system designs.
+
+| Inspiration | Architectural concepts |
 |---|---|
-| ANU kernel architecture | Implemented |
-| x86_64 architecture | Implemented |
-| ACPI | Implemented |
-| SMP | Implemented |
-| Local APIC / IOAPIC | Implemented |
-| Inter-Processor Interrupts | Implemented |
-| Physical Memory Manager | Implemented |
-| Virtual Memory Manager | Implemented |
-| Demand Paging | Implemented |
-| Guard Pages | Implemented |
-| Preemptive scheduler | Implemented |
-| Kernel threads | Implemented |
-| Ring 3 execution | Implemented |
-| ELF64 loader | Implemented |
-| System calls | Implemented |
-| Amaryllis SDK | Implemented |
-| VFS | Implemented |
-| RAMFS | Implemented |
-| FAT32 | Implemented |
-| Unified Page / Block Cache | Implemented |
-| VirtIO-Blk | Implemented |
-| AHCI SATA | Implemented |
-| IORegistry / IOWorkLoop | Implemented |
-| Intel e1000 | Implemented |
-| TCP/IP stack | Implemented |
-| Intel AC'97 audio | Implemented |
-| Kernel diagnostics | Implemented |
-| Amaryllis Desktop | Implemented |
-| Built-in applications | Implemented |
-| Copy-on-Write memory | Planned |
-| Mach-inspired IPC Ports | Planned |
-| Native FmFS filesystem | Planned |
+| Mach | Virtual memory, task and thread concepts, IPC direction |
+| BSD | Process interfaces, file descriptors, networking concepts |
+| IOKit | Device registry, driver infrastructure, work-loop architecture |
+| Libkern | Kernel-level utilities and infrastructure |
 
-*Implemented indicates that the corresponding functionality has been developed. It does not imply complete hardware compatibility, production-level validation, or feature parity with mature operating systems.*
+These are architectural influences, not imported implementations. ANU is independently developed in Rust.
+
+The kernel is organized into separate subsystems for architecture, memory, scheduling, userland, storage, drivers, networking, and graphics.
 
 ---
 
-## 3. Completed Development
+## Implemented Features
 
-### 3.1. ANU Kernel Architecture
+### 1. x86_64 Architecture and SMP
 
-- Established ANU as the independent kernel architecture of Amaryllis OS.
-- Adopted a hybrid architecture inspired by XNU.
-- Developed a modular Rust kernel using `no_std` and `alloc`.
-- Established separate architecture, memory, task, userland, storage, driver, networking, and graphics subsystems.
-
-### 3.2. x86_64 Architecture and SMP
-
-**Implemented:**
+**Architecture support:**
 
 - GDT and TSS.
 - Dedicated IST stacks and RSP0.
@@ -94,7 +64,13 @@ The project includes its own memory management, SMP infrastructure, preemptive s
 - Ring 3 exception recovery.
 - `SWAPGS` and per-CPU context management.
 - `syscall` / `sysret`.
-- ACPI parsing: RSDP, RSDT/XSDT, FADT, MADT, MCFG, HPET.
+- ACPI parsing:
+  - RSDP
+  - RSDT / XSDT
+  - FADT
+  - MADT
+  - MCFG
+  - HPET
 - Hardware reboot and shutdown through FADT.
 - Local APIC periodic timer at 1000 Hz.
 - IOAPIC GSI routing.
@@ -115,7 +91,7 @@ The project includes its own memory management, SMP infrastructure, preemptive s
 - TLB Shootdown IPI (`0xF0`).
 - Reschedule IPI (`0xF1`).
 
-### 3.3. Memory Management
+### 2. Memory Management
 
 **Implemented:**
 
@@ -132,10 +108,12 @@ The project includes its own memory management, SMP infrastructure, preemptive s
 - Lazy allocation through `sys_mmap`.
 - Automatic user stack growth.
 - User stack growth from 16 to 64 pages.
-- 4 KiB Guard Pages for user and kernel thread stacks.
+- 4 KiB guard pages for user and kernel thread stacks.
 - Hardened `copy_from_user` and `copy_to_user`.
 
-### 3.4. Scheduling and Kernel Threads
+**Planned:** Physical frame reference counting and Copy-on-Write (CoW).
+
+### 3. Scheduling and Kernel Threads
 
 **Implemented:**
 
@@ -151,7 +129,7 @@ The project includes its own memory management, SMP infrastructure, preemptive s
 - Kernel thread execution on AP processors.
 - Background workers for networking, storage, and audio.
 
-### 3.5. Userland and System Interfaces
+### 4. Userland and System Interfaces
 
 **Implemented:**
 
@@ -170,19 +148,24 @@ The project includes its own memory management, SMP infrastructure, preemptive s
 - POSIX-style pipes with 16 KiB buffers.
 - Shared Memory for Zero-Copy graphical surfaces.
 
-### 3.6. Amaryllis SDK
+### 5. Amaryllis SDK
 
-A standalone `amaryllis-sdk` crate provides interfaces for external ELF applications.
+The standalone `amaryllis-sdk` crate provides interfaces for external ELF applications.
 
 **Implemented modules:**
 
-- `fs`
-- `env`
-- `net`
-- `ipc`
-- `time`
-- `gui`
-- `gui::ShmWindow`
+| Module | Purpose |
+|---|---|
+| `alloc_heap` | Application heap allocator |
+| `env` | Environment and application arguments |
+| `fs` | Filesystem interfaces |
+| `io` | Input/output abstractions |
+| `proc` | Process interfaces |
+| `time` | Time-related functionality |
+| `net` | Networking |
+| `ipc` | Inter-process communication |
+| `gui` | Graphical interfaces |
+| `gui::ShmWindow` | Shared-memory graphical windows |
 
 Additional functionality:
 
@@ -196,7 +179,9 @@ Additional functionality:
 - Linker configuration.
 - Runnable example applications.
 
-### 3.7. Storage and Filesystems
+See [`amaryllis-sdk/README.md`](amaryllis-sdk/README.md) for SDK usage and examples.
+
+### 6. Storage and Filesystems
 
 **Implemented:**
 
@@ -222,7 +207,11 @@ Additional functionality:
 - Multi-block DMA transfers up to 128 sectors (64 KiB).
 - Reported cache hit rate of approximately 98%.
 
-### 3.8. Device Infrastructure
+**Planned:** FmFS — the native Amaryllis filesystem.
+
+### 7. Device Infrastructure
+
+The device infrastructure is inspired by Apple's IOKit architecture but is independently implemented.
 
 **Implemented:**
 
@@ -233,8 +222,6 @@ Additional functionality:
 - Background processing through kernel threads.
 - Asynchronous device operations.
 
-The driver infrastructure is inspired by Apple's IOKit architecture but is independently implemented.
-
 **Available drivers:**
 
 - VirtIO-Blk.
@@ -243,7 +230,7 @@ The driver infrastructure is inspired by Apple's IOKit architecture but is indep
 - Intel AC'97.
 - PS/2 keyboard and mouse.
 
-### 3.9. Networking
+### 8. Networking
 
 **Implemented network stack:**
 
@@ -268,7 +255,7 @@ Additional functionality:
 - Socket interfaces for Ring 3 applications.
 - Background networking worker.
 
-### 3.10. Audio
+### 9. Audio
 
 **Implemented:**
 
@@ -280,7 +267,7 @@ Additional functionality:
 - WAV streaming from FAT32/VFS.
 - Background audio processing.
 
-### 3.11. Kernel Diagnostics
+### 10. Kernel Diagnostics
 
 **Implemented:**
 
@@ -296,9 +283,11 @@ Available diagnostic commands include:
 
 `sm​p`, `apic`, `ioreg`, `kthread`, `diskinfo`, `virtio`, `netinfo`.
 
-### 3.12. Amaryllis Desktop
+### 11. Amaryllis Desktop
 
-**Implemented graphical infrastructure:**
+Amaryllis includes an independently developed graphical desktop environment.
+
+**Graphical infrastructure:**
 
 - Custom window manager.
 - Double-buffered compositor.
@@ -309,7 +298,7 @@ Available diagnostic commands include:
 - Floating Amaryllis Capsule.
 - Application launcher.
 - Universal search.
-- System island.
+- System Island.
 - Control Center.
 - Calendar.
 - Power menu.
@@ -320,7 +309,7 @@ Available diagnostic commands include:
 - Cyrillic support.
 - TOML-based personalization.
 
-**Performance target:** 120 FPS.
+**Performance target:** 120 FPS, with approximately 8 ms frame pacing.
 
 **Built-in applications:**
 
@@ -334,11 +323,11 @@ Available diagnostic commands include:
 
 ---
 
-## 4. Current Roadmap
+## Development Roadmap
 
 The next development phase focuses on expanding the memory model, process interfaces, IPC architecture, and native filesystem.
 
-### 4.1. Mach-Inspired Virtual Memory
+### 1. Mach-Inspired Virtual Memory
 
 - [ ] Physical frame reference counting in PMM.
 - [ ] Copy-on-Write (CoW).
@@ -347,7 +336,7 @@ The next development phase focuses on expanding the memory model, process interf
 - [ ] `waitpid()`.
 - [ ] POSIX signals.
 
-### 4.2. Mach-Inspired IPC
+### 2. Mach-Inspired IPC
 
 - [ ] Typed IPC message ports.
 - [ ] Send / Receive permissions.
@@ -356,7 +345,7 @@ The next development phase focuses on expanding the memory model, process interf
 - [ ] Service discovery infrastructure inspired by `launchd`.
 - [ ] Mach Exception Ports.
 
-### 4.3. FmFS — Native Amaryllis Filesystem
+### 3. FmFS — Native Amaryllis Filesystem
 
 - [ ] Extent-based storage architecture.
 - [ ] Filesystem access permissions.
@@ -370,7 +359,74 @@ FmFS is planned as the native filesystem direction for Amaryllis OS, eventually 
 
 ---
 
-## 5. Development Priorities
+## Building and Running
+
+### Requirements
+
+- Rust Nightly.
+- Cargo.
+- QEMU (`qemu-system-x86_64`).
+- `x86_64-unknown-none` Rust target.
+
+Install the required Rust target:
+
+```bash
+rustup target add x86_64-unknown-none --toolchain nightly
+```
+
+### Build
+
+Run from the repository root:
+
+```bash
+cargo +nightly build
+```
+
+The root package uses Cargo artifact dependencies to compile the kernel as an `x86_64-unknown-none` binary.
+
+During the build, `build.rs` automatically:
+
+1. Retrieves the compiled kernel ELF artifact.
+2. Configures the bootloader framebuffer with a minimum resolution of 1600×900.
+3. Creates a BIOS-bootable disk image using `bootloader 0.11.17`.
+4. Exposes the generated image path through the `BIOS_PATH` environment variable.
+
+The BIOS image is generated inside Cargo's build output directory.
+
+### Run on Linux
+
+After building, locate the generated BIOS image:
+
+```bash
+BIOS_IMAGE=$(find target -type f -name bios.img -print -quit)
+```
+
+Launch it with QEMU:
+
+```bash
+qemu-system-x86_64 \
+  -drive format=raw,file="$BIOS_IMAGE" \
+  -m 512M
+```
+
+The current launcher in `src/main.rs` uses a Windows-specific QEMU executable path. On Linux, use the direct QEMU command above or update the launcher to use `qemu-system-x86_64` from `PATH`.
+
+### Build Configuration
+
+The root `.cargo/config.toml` enables Cargo's unstable binary dependency support:
+
+```toml
+[unstable]
+bindeps = true
+```
+
+This is required for the kernel artifact dependency used by the root package.
+
+**Boot configuration:** The current build creates a BIOS boot image. UEFI boot support is not established by this configuration.
+
+---
+
+## Development Priorities
 
 The project follows four core principles:
 
@@ -391,7 +447,7 @@ Current development priorities:
 
 ---
 
-## 6. Important Development Notes
+## Development Notes
 
 - A successful compilation does not automatically prove runtime correctness.
 - Implemented functionality should be distinguished from fully validated functionality.
@@ -400,11 +456,13 @@ Current development priorities:
 - Preserve memory-management validation results.
 - Maintain clear subsystem boundaries and avoid circular dependencies.
 - Test changes in QEMU and on physical hardware where applicable.
-- Update this document after major milestones.
+- Update project documentation after major milestones.
+
+*Implemented indicates that the corresponding functionality has been developed. It does not imply complete hardware compatibility, production-level validation, or feature parity with mature operating systems.*
 
 ---
 
-## 7. Current Project State
+## Current Project State
 
 Amaryllis OS v0.11 has progressed beyond its initial kernel and graphical prototype stages.
 
@@ -418,9 +476,16 @@ The next major milestones are:
 2. Mach-inspired IPC ports and service discovery.
 3. Native FmFS filesystem.
 
-**Amaryllis OS is an actively developed experimental operating system.**
+---
+
+## License
+
+Amaryllis OS is licensed under the **Apache License 2.0**.
+
+See [`LICENSE`](LICENSE) for the full license text.
 
 ---
 
 **Amaryllis OS — Built from the ground up.**
+
 **ANU — Amaryllis is Not Unix.**

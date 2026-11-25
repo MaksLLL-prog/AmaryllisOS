@@ -1,0 +1,14 @@
+/home/kensei/Downloads/AmaryllisOS-stage4(3)/AmaryllisOS/target/release/build/serde/15a8932050ae7ac1/out/serde-15a8932050ae7ac1.d: /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/kensei/Downloads/AmaryllisOS-stage4(3)/AmaryllisOS/target/release/build/serde/112c11bd00210189/out/private.rs
+
+/home/kensei/Downloads/AmaryllisOS-stage4(3)/AmaryllisOS/target/release/build/serde/15a8932050ae7ac1/out/libserde-15a8932050ae7ac1.rlib: /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/kensei/Downloads/AmaryllisOS-stage4(3)/AmaryllisOS/target/release/build/serde/112c11bd00210189/out/private.rs
+
+/home/kensei/Downloads/AmaryllisOS-stage4(3)/AmaryllisOS/target/release/build/serde/15a8932050ae7ac1/out/libserde-15a8932050ae7ac1.rmeta: /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/kensei/Downloads/AmaryllisOS-stage4(3)/AmaryllisOS/target/release/build/serde/112c11bd00210189/out/private.rs
+
+/home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/home/kensei/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/home/kensei/Downloads/AmaryllisOS-stage4(3)/AmaryllisOS/target/release/build/serde/112c11bd00210189/out/private.rs:
+
+# env-dep:OUT_DIR=/home/kensei/Downloads/AmaryllisOS-stage4(3)/AmaryllisOS/target/release/build/serde/112c11bd00210189/out

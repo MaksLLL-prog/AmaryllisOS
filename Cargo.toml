@@ -1,15 +1,11 @@
 [package]
 name = "amaryllis_os"
-version = "0.11.0"
+version = "0.1.0"
 edition = "2021"
-authors = ["kensei"]
-license = "Apache-2.0"
-license-file = "LICENSE"
-description = "Amaryllis OS — 64-bit hybrid operating system powered by the ANU kernel"
 
 [workspace]
 resolver = "3"
-members = ["kernel", "amaryllis-sdk"]
+members = ["kernel"]
 
 [build-dependencies]
 bootloader = "0.11.17"

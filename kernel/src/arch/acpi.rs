@@ -1,7 +1,12 @@
 use core::ptr::read_unaligned;
 use spin::Mutex;
+use x86_64::structures::paging::PageTableFlags;
+use x86_64::VirtAddr;
 
-use crate::memory::vmm::PhysicalMemoryMapping;
+use crate::memory::vmm::{PhysicalMemoryMapping, PAGE_SIZE};
+use crate::memory::PhysicalFrameAllocator;
+
+const ACPI_SCRATCH_VIRT_BASE: u64 = 0x0000_5320_0000_0000;
 
 pub const MAX_ACPI_TABLES: usize = 32;
 pub const MAX_MADT_CPUS: usize = 64;
@@ -181,89 +186,202 @@ impl AcpiPlatformInfo {
 
 static ACPI_INFO: Mutex<AcpiPlatformInfo> = Mutex::new(AcpiPlatformInfo::EMPTY);
 
-unsafe fn phys_read_unaligned<T: Copy>(mapping: &PhysicalMemoryMapping, phys: u64) -> Option<T> {
-    let v = mapping.translate(phys)?;
-    Some(unsafe { read_unaligned(v.as_u64() as *const T) })
+struct AcpiReader<'m, 'a, 'r> {
+    mapping: &'m PhysicalMemoryMapping,
+    allocator: &'a mut PhysicalFrameAllocator<'r>,
+    scratch_phys_page: Option<u64>,
 }
 
-fn verify_checksum(mapping: &PhysicalMemoryMapping, phys: u64, len: usize) -> bool {
-    if len == 0 || len > 1024 * 1024 {
-        return false;
+impl<'m, 'a, 'r> AcpiReader<'m, 'a, 'r> {
+    fn new(
+        mapping: &'m PhysicalMemoryMapping,
+        allocator: &'a mut PhysicalFrameAllocator<'r>,
+    ) -> Self {
+        Self {
+            mapping,
+            allocator,
+            scratch_phys_page: None,
+        }
     }
-    let Some(base) = mapping.translate(phys) else {
-        return false;
-    };
-    let ptr = base.as_u64() as *const u8;
-    let mut sum: u8 = 0;
-    for i in 0..len {
-        let b = unsafe { core::ptr::read_volatile(ptr.add(i)) };
-        sum = sum.wrapping_add(b);
+
+    fn map_or_get_page(&mut self, page_phys: u64) -> Option<u64> {
+        if let Some(hhdm_va) = self.mapping.translate(page_phys) {
+            if self.mapping.translate_virtual_address(hhdm_va).is_some() {
+                return Some(hhdm_va.as_u64());
+            }
+        }
+
+        let scratch_va = VirtAddr::new(ACPI_SCRATCH_VIRT_BASE);
+        if self.scratch_phys_page == Some(page_phys) {
+            return Some(ACPI_SCRATCH_VIRT_BASE);
+        }
+
+        if self.scratch_phys_page.is_some() {
+            let _ = self.mapping.unmap_page(scratch_va);
+            self.scratch_phys_page = None;
+        } else if self.mapping.translate_virtual_address(scratch_va).is_some() {
+            let _ = self.mapping.unmap_page(scratch_va);
+        }
+
+        let flags = PageTableFlags::PRESENT;
+        if self
+            .mapping
+            .map_page(self.allocator, scratch_va, page_phys, flags)
+            .is_ok()
+        {
+            self.scratch_phys_page = Some(page_phys);
+            Some(ACPI_SCRATCH_VIRT_BASE)
+        } else {
+            None
+        }
     }
-    sum == 0
+
+    fn read_bytes(&mut self, phys: u64, out: &mut [u8]) -> bool {
+        if out.is_empty() {
+            return true;
+        }
+        let mut copied = 0usize;
+        while copied < out.len() {
+            let Some(cur_phys) = phys.checked_add(copied as u64) else {
+                return false;
+            };
+            let page_phys = cur_phys & !(PAGE_SIZE - 1);
+            let page_off = (cur_phys & (PAGE_SIZE - 1)) as usize;
+            let chunk = (out.len() - copied).min(PAGE_SIZE as usize - page_off);
+
+            let Some(page_virt) = self.map_or_get_page(page_phys) else {
+                return false;
+            };
+
+            unsafe {
+                let src = (page_virt + page_off as u64) as *const u8;
+                core::ptr::copy_nonoverlapping(src, out.as_mut_ptr().add(copied), chunk);
+            }
+            copied += chunk;
+        }
+        true
+    }
+
+    fn read_unaligned<T: Copy>(&mut self, phys: u64) -> Option<T> {
+        let sz = core::mem::size_of::<T>();
+        if sz == 0 {
+            return None;
+        }
+        if sz <= 64 {
+            let mut buf = [0u8; 64];
+            if !self.read_bytes(phys, &mut buf[..sz]) {
+                return None;
+            }
+            Some(unsafe { read_unaligned(buf.as_ptr() as *const T) })
+        } else {
+            let mut val = core::mem::MaybeUninit::<T>::uninit();
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(val.as_mut_ptr() as *mut u8, sz)
+            };
+            if !self.read_bytes(phys, dst) {
+                return None;
+            }
+            Some(unsafe { val.assume_init() })
+        }
+    }
+
+    fn verify_checksum(&mut self, phys: u64, len: usize) -> bool {
+        if len == 0 || len > 1024 * 1024 {
+            return false;
+        }
+        let mut buf = [0u8; 256];
+        let mut off = 0usize;
+        let mut sum: u8 = 0;
+        while off < len {
+            let chunk = (len - off).min(buf.len());
+            if !self.read_bytes(phys + off as u64, &mut buf[..chunk]) {
+                return false;
+            }
+            for &b in &buf[..chunk] {
+                sum = sum.wrapping_add(b);
+            }
+            off += chunk;
+        }
+        sum == 0
+    }
 }
 
-fn scan_rsdp_region(mapping: &PhysicalMemoryMapping, start: u64, end: u64) -> Option<u64> {
+impl Drop for AcpiReader<'_, '_, '_> {
+    fn drop(&mut self) {
+        if self.scratch_phys_page.take().is_some() {
+            let scratch_va = VirtAddr::new(ACPI_SCRATCH_VIRT_BASE);
+            let _ = self.mapping.unmap_page_with_allocator(self.allocator, scratch_va);
+        }
+    }
+}
+
+fn scan_rsdp_region(reader: &mut AcpiReader<'_, '_, '_>, start: u64, end: u64) -> Option<u64> {
     let mut addr = start & !0xFu64;
     while addr + 20 <= end {
-        let sig = phys_read_unaligned::<[u8; 8]>(mapping, addr)?;
-        if &sig == b"RSD PTR " && verify_checksum(mapping, addr, 20) {
-            let v1 = phys_read_unaligned::<RsdpV1>(mapping, addr)?;
-            if v1.revision >= 2 {
-                if let Some(v2) = phys_read_unaligned::<RsdpV2>(mapping, addr) {
-                    let v2_len = (v2.length as usize).clamp(36, 128);
-                    if verify_checksum(mapping, addr, v2_len) {
-                        return Some(addr);
+        let Some(sig) = reader.read_unaligned::<[u8; 8]>(addr) else {
+            // Advance past unmapped 4 KiB page instead of aborting the whole region.
+            addr = (addr & !(PAGE_SIZE - 1)).saturating_add(PAGE_SIZE);
+            continue;
+        };
+        if &sig == b"RSD PTR " && reader.verify_checksum(addr, 20) {
+            if let Some(v1) = reader.read_unaligned::<RsdpV1>(addr) {
+                if v1.revision >= 2 {
+                    if let Some(v2) = reader.read_unaligned::<RsdpV2>(addr) {
+                        let v2_len = (v2.length as usize).clamp(36, 128);
+                        if reader.verify_checksum(addr, v2_len) {
+                            return Some(addr);
+                        }
                     }
                 }
+                return Some(addr);
             }
-            return Some(addr);
         }
         addr += 16;
     }
     None
 }
 
-fn find_rsdp(mapping: &PhysicalMemoryMapping, rsdp_hint: Option<u64>) -> Option<u64> {
+fn find_rsdp(reader: &mut AcpiReader<'_, '_, '_>, rsdp_hint: Option<u64>) -> Option<u64> {
     if let Some(hint) = rsdp_hint {
-        if let Some(sig) = unsafe { phys_read_unaligned::<[u8; 8]>(mapping, hint) } {
-            if &sig == b"RSD PTR " && verify_checksum(mapping, hint, 20) {
+        if let Some(sig) = reader.read_unaligned::<[u8; 8]>(hint) {
+            if &sig == b"RSD PTR " && reader.verify_checksum(hint, 20) {
                 return Some(hint);
             }
         }
     }
 
     // Legacy BIOS EBDA segment (stored at physical 0x040E << 4)
-    if let Some(ebda_seg) = unsafe { phys_read_unaligned::<u16>(mapping, 0x040E) } {
+    if let Some(ebda_seg) = reader.read_unaligned::<u16>(0x040E) {
         let ebda_phys = (ebda_seg as u64) << 4;
         if ebda_phys >= 0x8_0000 && ebda_phys < 0xA_0000 {
-            if let Some(found) = scan_rsdp_region(mapping, ebda_phys, ebda_phys + 1024) {
+            if let Some(found) = scan_rsdp_region(reader, ebda_phys, ebda_phys + 1024) {
                 return Some(found);
             }
         }
     }
 
     // Main BIOS ROM area 0xE0000..0xFFFFF
-    scan_rsdp_region(mapping, 0x000E_0000, 0x0010_0000)
+    scan_rsdp_region(reader, 0x000E_0000, 0x0010_0000)
 }
 
-fn parse_madt(mapping: &PhysicalMemoryMapping, phys: u64, len: usize, info: &mut AcpiPlatformInfo) {
+fn parse_madt(reader: &mut AcpiReader<'_, '_, '_>, phys: u64, len: usize, info: &mut AcpiPlatformInfo) {
     if len < core::mem::size_of::<SdtHeader>() + 8 {
         return;
     }
     let header_sz = core::mem::size_of::<SdtHeader>();
-    if let Some(lapic32) = unsafe { phys_read_unaligned::<u32>(mapping, phys + header_sz as u64) } {
+    if let Some(lapic32) = reader.read_unaligned::<u32>(phys + header_sz as u64) {
         info.lapic_phys = lapic32 as u64;
     }
-    if let Some(flags) = unsafe { phys_read_unaligned::<u32>(mapping, phys + header_sz as u64 + 4) } {
+    if let Some(flags) = reader.read_unaligned::<u32>(phys + header_sz as u64 + 4) {
         info.pcat_compat = (flags & 1) != 0;
     }
 
     let mut off = header_sz + 8;
     while off + 2 <= len {
-        let Some(rec_type) = unsafe { phys_read_unaligned::<u8>(mapping, phys + off as u64) } else {
+        let Some(rec_type) = reader.read_unaligned::<u8>(phys + off as u64) else {
             break;
         };
-        let Some(rec_len) = unsafe { phys_read_unaligned::<u8>(mapping, phys + off as u64 + 1) } else {
+        let Some(rec_len) = reader.read_unaligned::<u8>(phys + off as u64 + 1) else {
             break;
         };
         let rlen = rec_len as usize;
@@ -274,9 +392,9 @@ fn parse_madt(mapping: &PhysicalMemoryMapping, phys: u64, len: usize, info: &mut
         match rec_type {
             // Type 0: Processor Local APIC
             0 if rlen >= 8 => {
-                let acpi_id = unsafe { phys_read_unaligned::<u8>(mapping, phys + off as u64 + 2) }.unwrap_or(0);
-                let apic_id = unsafe { phys_read_unaligned::<u8>(mapping, phys + off as u64 + 3) }.unwrap_or(0);
-                let flags = unsafe { phys_read_unaligned::<u32>(mapping, phys + off as u64 + 4) }.unwrap_or(0);
+                let acpi_id = reader.read_unaligned::<u8>(phys + off as u64 + 2).unwrap_or(0);
+                let apic_id = reader.read_unaligned::<u8>(phys + off as u64 + 3).unwrap_or(0);
+                let flags = reader.read_unaligned::<u32>(phys + off as u64 + 4).unwrap_or(0);
                 let enabled = (flags & 1) != 0;
                 let online_capable = (flags & 2) != 0;
                 if enabled || online_capable {
@@ -294,9 +412,9 @@ fn parse_madt(mapping: &PhysicalMemoryMapping, phys: u64, len: usize, info: &mut
             }
             // Type 1: I/O APIC
             1 if rlen >= 12 => {
-                let ioapic_id = unsafe { phys_read_unaligned::<u8>(mapping, phys + off as u64 + 2) }.unwrap_or(0);
-                let ioapic_phys = unsafe { phys_read_unaligned::<u32>(mapping, phys + off as u64 + 4) }.unwrap_or(0);
-                let gsi_base = unsafe { phys_read_unaligned::<u32>(mapping, phys + off as u64 + 8) }.unwrap_or(0);
+                let ioapic_id = reader.read_unaligned::<u8>(phys + off as u64 + 2).unwrap_or(0);
+                let ioapic_phys = reader.read_unaligned::<u32>(phys + off as u64 + 4).unwrap_or(0);
+                let gsi_base = reader.read_unaligned::<u32>(phys + off as u64 + 8).unwrap_or(0);
                 if info.ioapic_count < MAX_MADT_IOAPICS {
                     info.ioapics[info.ioapic_count] = MadtIoApicEntry {
                         ioapic_id,
@@ -308,10 +426,10 @@ fn parse_madt(mapping: &PhysicalMemoryMapping, phys: u64, len: usize, info: &mut
             }
             // Type 2: Interrupt Source Override
             2 if rlen >= 10 => {
-                let bus_source = unsafe { phys_read_unaligned::<u8>(mapping, phys + off as u64 + 2) }.unwrap_or(0);
-                let irq_source = unsafe { phys_read_unaligned::<u8>(mapping, phys + off as u64 + 3) }.unwrap_or(0);
-                let gsi = unsafe { phys_read_unaligned::<u32>(mapping, phys + off as u64 + 4) }.unwrap_or(0);
-                let flags = unsafe { phys_read_unaligned::<u16>(mapping, phys + off as u64 + 8) }.unwrap_or(0);
+                let bus_source = reader.read_unaligned::<u8>(phys + off as u64 + 2).unwrap_or(0);
+                let irq_source = reader.read_unaligned::<u8>(phys + off as u64 + 3).unwrap_or(0);
+                let gsi = reader.read_unaligned::<u32>(phys + off as u64 + 4).unwrap_or(0);
+                let flags = reader.read_unaligned::<u16>(phys + off as u64 + 8).unwrap_or(0);
                 if info.iso_count < MAX_MADT_ISOS {
                     info.isos[info.iso_count] = MadtIsoEntry {
                         bus_source,
@@ -324,7 +442,7 @@ fn parse_madt(mapping: &PhysicalMemoryMapping, phys: u64, len: usize, info: &mut
             }
             // Type 5: Local APIC Address Override (64-bit)
             5 if rlen >= 12 => {
-                if let Some(addr64) = unsafe { phys_read_unaligned::<u64>(mapping, phys + off as u64 + 4) } {
+                if let Some(addr64) = reader.read_unaligned::<u64>(phys + off as u64 + 4) {
                     if addr64 != 0 {
                         info.lapic_phys = addr64;
                     }
@@ -337,46 +455,52 @@ fn parse_madt(mapping: &PhysicalMemoryMapping, phys: u64, len: usize, info: &mut
     }
 }
 
-fn parse_fadt(mapping: &PhysicalMemoryMapping, phys: u64, len: usize, info: &mut AcpiPlatformInfo) {
+fn parse_fadt(reader: &mut AcpiReader<'_, '_, '_>, phys: u64, len: usize, info: &mut AcpiPlatformInfo) {
     // ACPI Fixed ACPI Description Table offsets from start of table:
     // 46: SCI_INT (u16), 64: PM1a_CNT_BLK (u32), 68: PM1b_CNT_BLK (u32), 76: PM_TMR_BLK (u32), 108: CENTURY (u8)
     if len >= 80 {
-        info.fadt_sci_irq = unsafe { phys_read_unaligned::<u16>(mapping, phys + 46) }.unwrap_or(0);
-        info.fadt_pm1a_cnt = unsafe { phys_read_unaligned::<u32>(mapping, phys + 64) }.unwrap_or(0);
-        info.fadt_pm1b_cnt = unsafe { phys_read_unaligned::<u32>(mapping, phys + 68) }.unwrap_or(0);
-        info.fadt_pm_tmr = unsafe { phys_read_unaligned::<u32>(mapping, phys + 76) }.unwrap_or(0);
+        info.fadt_sci_irq = reader.read_unaligned::<u16>(phys + 46).unwrap_or(0);
+        info.fadt_pm1a_cnt = reader.read_unaligned::<u32>(phys + 64).unwrap_or(0);
+        info.fadt_pm1b_cnt = reader.read_unaligned::<u32>(phys + 68).unwrap_or(0);
+        info.fadt_pm_tmr = reader.read_unaligned::<u32>(phys + 76).unwrap_or(0);
     }
     if len >= 109 {
-        info.fadt_century_reg = unsafe { phys_read_unaligned::<u8>(mapping, phys + 108) }.unwrap_or(0);
+        info.fadt_century_reg = reader.read_unaligned::<u8>(phys + 108).unwrap_or(0);
     }
 }
 
-fn parse_mcfg(mapping: &PhysicalMemoryMapping, phys: u64, len: usize, info: &mut AcpiPlatformInfo) {
+fn parse_mcfg(reader: &mut AcpiReader<'_, '_, '_>, phys: u64, len: usize, info: &mut AcpiPlatformInfo) {
     // SdtHeader (36) + 8 bytes reserved -> 16-byte allocation records
     if len >= 36 + 8 + 16 {
         let base_rec = phys + 44;
-        info.mcfg_ecam_base = unsafe { phys_read_unaligned::<u64>(mapping, base_rec) }.unwrap_or(0);
-        info.mcfg_start_bus = unsafe { phys_read_unaligned::<u8>(mapping, base_rec + 10) }.unwrap_or(0);
-        info.mcfg_end_bus = unsafe { phys_read_unaligned::<u8>(mapping, base_rec + 11) }.unwrap_or(0);
+        info.mcfg_ecam_base = reader.read_unaligned::<u64>(base_rec).unwrap_or(0);
+        info.mcfg_start_bus = reader.read_unaligned::<u8>(base_rec + 10).unwrap_or(0);
+        info.mcfg_end_bus = reader.read_unaligned::<u8>(base_rec + 11).unwrap_or(0);
     }
 }
 
-fn parse_hpet(mapping: &PhysicalMemoryMapping, phys: u64, len: usize, info: &mut AcpiPlatformInfo) {
+fn parse_hpet(reader: &mut AcpiReader<'_, '_, '_>, phys: u64, len: usize, info: &mut AcpiPlatformInfo) {
     // Offset 40 = Generic Address Structure (12 bytes), base address at +44
     if len >= 52 {
-        info.hpet_phys = unsafe { phys_read_unaligned::<u64>(mapping, phys + 44) }.unwrap_or(0);
+        info.hpet_phys = reader.read_unaligned::<u64>(phys + 44).unwrap_or(0);
     }
 }
 
-pub fn init(mapping: &PhysicalMemoryMapping, rsdp_hint: Option<u64>) -> AcpiPlatformInfo {
+#[inline(never)]
+pub fn init(
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+    rsdp_hint: Option<u64>,
+) -> AcpiPlatformInfo {
     let mut info = AcpiPlatformInfo::EMPTY;
+    let mut reader = AcpiReader::new(mapping, allocator);
 
-    let Some(rsdp_phys) = find_rsdp(mapping, rsdp_hint) else {
+    let Some(rsdp_phys) = find_rsdp(&mut reader, rsdp_hint) else {
         *ACPI_INFO.lock() = info;
         return info;
     };
 
-    let Some(v1) = (unsafe { phys_read_unaligned::<RsdpV1>(mapping, rsdp_phys) }) else {
+    let Some(v1) = reader.read_unaligned::<RsdpV1>(rsdp_phys) else {
         *ACPI_INFO.lock() = info;
         return info;
     };
@@ -387,7 +511,7 @@ pub fn init(mapping: &PhysicalMemoryMapping, rsdp_hint: Option<u64>) -> AcpiPlat
     info.rsdp_phys = rsdp_phys;
 
     let (root_sdt_phys, using_xsdt) = if v1.revision >= 2 {
-        if let Some(v2) = unsafe { phys_read_unaligned::<RsdpV2>(mapping, rsdp_phys) } {
+        if let Some(v2) = reader.read_unaligned::<RsdpV2>(rsdp_phys) {
             if v2.xsdt_address != 0 {
                 (v2.xsdt_address, true)
             } else {
@@ -403,29 +527,29 @@ pub fn init(mapping: &PhysicalMemoryMapping, rsdp_hint: Option<u64>) -> AcpiPlat
     info.root_sdt_phys = root_sdt_phys;
     info.using_xsdt = using_xsdt;
 
-    if let Some(root_hdr) = unsafe { phys_read_unaligned::<SdtHeader>(mapping, root_sdt_phys) } {
+    if let Some(root_hdr) = reader.read_unaligned::<SdtHeader>(root_sdt_phys) {
         let hdr_sz = core::mem::size_of::<SdtHeader>();
         let root_len = root_hdr.length as usize;
-        if root_len >= hdr_sz && root_len <= 256 * 1024 && verify_checksum(mapping, root_sdt_phys, root_len) {
+        if root_len >= hdr_sz && root_len <= 256 * 1024 && reader.verify_checksum(root_sdt_phys, root_len) {
             let entry_sz = if using_xsdt { 8usize } else { 4usize };
             let entry_count = (root_len - hdr_sz) / entry_sz;
 
             for idx in 0..entry_count.min(MAX_ACPI_TABLES) {
                 let entry_off = root_sdt_phys + hdr_sz as u64 + (idx * entry_sz) as u64;
                 let table_phys = if using_xsdt {
-                    unsafe { phys_read_unaligned::<u64>(mapping, entry_off) }.unwrap_or(0)
+                    reader.read_unaligned::<u64>(entry_off).unwrap_or(0)
                 } else {
-                    unsafe { phys_read_unaligned::<u32>(mapping, entry_off) }.unwrap_or(0) as u64
+                    reader.read_unaligned::<u32>(entry_off).unwrap_or(0) as u64
                 };
 
                 if table_phys == 0 {
                     continue;
                 }
-                let Some(hdr) = (unsafe { phys_read_unaligned::<SdtHeader>(mapping, table_phys) }) else {
+                let Some(hdr) = reader.read_unaligned::<SdtHeader>(table_phys) else {
                     continue;
                 };
                 let tlen = hdr.length as usize;
-                let checksum_ok = tlen >= hdr_sz && verify_checksum(mapping, table_phys, tlen);
+                let checksum_ok = tlen >= hdr_sz && reader.verify_checksum(table_phys, tlen);
 
                 if info.table_count < MAX_ACPI_TABLES {
                     info.tables[info.table_count] = AcpiTableSummary {
@@ -440,10 +564,10 @@ pub fn init(mapping: &PhysicalMemoryMapping, rsdp_hint: Option<u64>) -> AcpiPlat
 
                 if checksum_ok {
                     match &hdr.signature {
-                        b"APIC" => parse_madt(mapping, table_phys, tlen, &mut info),
-                        b"FACP" => parse_fadt(mapping, table_phys, tlen, &mut info),
-                        b"MCFG" => parse_mcfg(mapping, table_phys, tlen, &mut info),
-                        b"HPET" => parse_hpet(mapping, table_phys, tlen, &mut info),
+                        b"APIC" => parse_madt(&mut reader, table_phys, tlen, &mut info),
+                        b"FACP" => parse_fadt(&mut reader, table_phys, tlen, &mut info),
+                        b"MCFG" => parse_mcfg(&mut reader, table_phys, tlen, &mut info),
+                        b"HPET" => parse_hpet(&mut reader, table_phys, tlen, &mut info),
                         _ => {}
                     }
                 }
@@ -451,6 +575,7 @@ pub fn init(mapping: &PhysicalMemoryMapping, rsdp_hint: Option<u64>) -> AcpiPlat
         }
     }
 
+    drop(reader);
     *ACPI_INFO.lock() = info;
     info
 }
@@ -519,3 +644,4 @@ pub fn system_shutdown() -> ! {
         x86_64::instructions::hlt();
     }
 }
+
