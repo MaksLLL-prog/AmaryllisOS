@@ -14,98 +14,6 @@ use pmm::region::PmmRegion;
 
 pub const FRAME_SIZE: u64 = 4096;
 
-use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
-
-static FRAME_REFCOUNTS_PTR: AtomicUsize = AtomicUsize::new(0);
-static FRAME_REFCOUNTS_LEN: AtomicUsize = AtomicUsize::new(0);
-
-fn init_frame_refcounts(max_phys_addr: u64, active_frames: &[u64]) {
-    if FRAME_REFCOUNTS_PTR.load(Ordering::Acquire) != 0 {
-        return;
-    }
-    let page_count = ((max_phys_addr.saturating_add(FRAME_SIZE - 1)) / FRAME_SIZE) as usize;
-    if page_count == 0 {
-        return;
-    }
-    let mut vec = Vec::<AtomicU16>::new();
-    if vec.try_reserve_exact(page_count).is_err() {
-        return;
-    }
-    for _ in 0..page_count {
-        vec.push(AtomicU16::new(0));
-    }
-    for &f in active_frames {
-        let idx = (f / FRAME_SIZE) as usize;
-        if idx < page_count {
-            vec[idx].store(1, Ordering::Relaxed);
-        }
-    }
-    let boxed = vec.into_boxed_slice();
-    let len = boxed.len();
-    let ptr = alloc::boxed::Box::into_raw(boxed) as *mut AtomicU16 as usize;
-    FRAME_REFCOUNTS_LEN.store(len, Ordering::Release);
-    FRAME_REFCOUNTS_PTR.store(ptr, Ordering::Release);
-}
-
-#[inline]
-fn refcount_slot(frame: u64) -> Option<&'static AtomicU16> {
-    let ptr = FRAME_REFCOUNTS_PTR.load(Ordering::Acquire) as *const AtomicU16;
-    let len = FRAME_REFCOUNTS_LEN.load(Ordering::Acquire);
-    if ptr.is_null() {
-        return None;
-    }
-    let idx = (frame / FRAME_SIZE) as usize;
-    if idx >= len {
-        return None;
-    }
-    Some(unsafe { &*ptr.add(idx) })
-}
-
-/// Increments the physical frame reference count (used when sharing a frame via CoW/SHM).
-#[inline]
-pub fn inc_frame_ref(frame: u64) -> u16 {
-    if let Some(slot) = refcount_slot(frame) {
-        let prev = slot.try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-            if v == 0 { Some(2) } else { v.checked_add(1) }
-        }).unwrap_or(1);
-        prev.saturating_add(1)
-    } else {
-        1
-    }
-}
-
-/// Decrements the physical frame reference count and returns the new count.
-#[inline]
-pub fn dec_frame_ref(frame: u64) -> u16 {
-    if let Some(slot) = refcount_slot(frame) {
-        let prev = slot.try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-            if v > 0 { Some(v - 1) } else { Some(0) }
-        }).unwrap_or(0);
-        prev.saturating_sub(1)
-    } else {
-        0
-    }
-}
-
-/// Returns the current reference count of a physical frame (`1` if unshared or pre-migration).
-#[inline]
-pub fn frame_ref_count(frame: u64) -> u16 {
-    if let Some(slot) = refcount_slot(frame) {
-        let v = slot.load(Ordering::Acquire);
-        if v == 0 { 1 } else { v }
-    } else {
-        1
-    }
-}
-
-#[inline]
-fn set_frame_ref_one(frame: u64) {
-    if let Some(slot) = refcount_slot(frame) {
-        slot.store(1, Ordering::Release);
-    }
-}
-
-
 pub mod vmm;
 pub mod heap;
 pub mod address_space;
@@ -220,7 +128,7 @@ pub fn check_heap_integrity() -> bool {
 
 enum AllocatorBackend<'a> {
     Bootstrap(BootstrapPmm<'a>),
-    Dynamic(DynamicPmm<Vec<PmmRegion>, Vec<u8>>),
+    Dynamic(DynamicPmm<Vec<PmmRegion>, Vec<u8>, Vec<u16>>),
 }
 
 // ============================================================
@@ -250,23 +158,26 @@ impl<'a> PhysicalFrameAllocator<'a> {
     // --------------------------------------------------------
 
     pub fn allocate_frame(&mut self) -> Option<u64> {
-        let res = match &mut self.backend {
-            AllocatorBackend::Bootstrap(allocator) => allocator.allocate_frame(),
-            AllocatorBackend::Dynamic(allocator) => allocator.allocate_frame(),
-        };
-        if let Some(frame) = res {
-            set_frame_ref_one(frame);
+        match &mut self.backend {
+            AllocatorBackend::Bootstrap(allocator) => {
+                allocator.allocate_frame()
+            }
+
+            AllocatorBackend::Dynamic(allocator) => {
+                allocator.allocate_frame()
+            }
         }
-        res
     }
 
     pub fn deallocate_frame(&mut self, frame: u64) -> bool {
-        if dec_frame_ref(frame) > 0 {
-            return true;
-        }
         match &mut self.backend {
-            AllocatorBackend::Bootstrap(allocator) => allocator.deallocate_frame(frame),
-            AllocatorBackend::Dynamic(allocator) => allocator.deallocate_frame(frame),
+            AllocatorBackend::Bootstrap(allocator) => {
+                allocator.deallocate_frame(frame)
+            }
+
+            AllocatorBackend::Dynamic(allocator) => {
+                allocator.deallocate_frame(frame)
+            }
         }
     }
 
@@ -279,6 +190,20 @@ impl<'a> PhysicalFrameAllocator<'a> {
             AllocatorBackend::Dynamic(allocator) => {
                 allocator.owns_frame(frame)
             }
+        }
+    }
+
+    pub fn retain_frame(&mut self, frame: u64) -> bool {
+        match &mut self.backend {
+            AllocatorBackend::Bootstrap(_) => false,
+            AllocatorBackend::Dynamic(allocator) => allocator.retain_frame(frame),
+        }
+    }
+
+    pub fn frame_refcount(&self, frame: u64) -> usize {
+        match &self.backend {
+            AllocatorBackend::Bootstrap(allocator) => usize::from(allocator.owns_frame(frame)),
+            AllocatorBackend::Dynamic(allocator) => allocator.frame_refcount(frame),
         }
     }
 
@@ -454,11 +379,18 @@ impl<'a> PhysicalFrameAllocator<'a> {
             None => return false,
         };
 
+        let mut refcounts = Vec::<u16>::new();
+        if refcounts.try_reserve_exact(metadata.total_frames).is_err() {
+            return false;
+        }
+        refcounts.resize(metadata.total_frames, 0);
+
         // Construct the new backend locally.
         // The current Bootstrap backend is still untouched.
         let dynamic = match DynamicPmm::new_with_stats(
             regions,
             bitmap,
+            refcounts,
             &active_frames[..active_count],
             total_allocations,
             total_deallocations,
@@ -483,9 +415,6 @@ impl<'a> PhysicalFrameAllocator<'a> {
             }
         }
 
-        let max_phys = self.memory_regions.iter().map(|r| r.end).max().unwrap_or(0);
-        init_frame_refcounts(max_phys, &active_frames[..active_count]);
-
         // Commit: replace Bootstrap only after all checks pass.
         self.backend = AllocatorBackend::Dynamic(dynamic);
 
@@ -507,4 +436,14 @@ impl<'a> PhysicalFrameAllocator<'a> {
             }
         }
     }
+}
+
+#[inline]
+pub fn inc_frame_ref(allocator: &mut PhysicalFrameAllocator<'_>, frame: u64) -> bool {
+    allocator.retain_frame(frame)
+}
+
+#[inline]
+pub fn frame_refcount(allocator: &PhysicalFrameAllocator<'_>, frame: u64) -> usize {
+    allocator.frame_refcount(frame)
 }

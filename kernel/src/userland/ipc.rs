@@ -1,3 +1,4 @@
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::{copy_nonoverlapping, write_bytes};
@@ -6,12 +7,113 @@ use x86_64::instructions::interrupts::without_interrupts;
 
 use crate::memory::vmm::{PhysicalMemoryMapping, PAGE_SIZE};
 use crate::memory::PhysicalFrameAllocator;
+use crate::task::preempt::PreemptMutex;
 
 pub const MAX_PIPES: usize = 64;
 pub const PIPE_BUF_SIZE: usize = 16384;
 
 pub const MAX_SHM_REGIONS: usize = 64;
 pub const MAX_SHM_FRAMES: usize = 2048; // 8 MiB max per SHM region (fits 1280x800x4 RGBA frames)
+
+pub const MAX_MACH_PORTS: usize = 256;
+pub const MAX_MACH_PORT_QUEUE: usize = 32;
+pub const MAX_MACH_INLINE_BYTES: usize = 4096;
+pub const MAX_MACH_OOL_FRAMES: usize = 1024; // up to 4 MiB per OOL page transfer
+
+pub type MachPortName = u32;
+pub const MACH_PORT_NULL: MachPortName = 0;
+pub const MACH_PORT_DEAD: MachPortName = u32::MAX;
+
+pub const MACH_SEND_MSG: u32 = 1 << 0;
+pub const MACH_RCV_MSG: u32 = 1 << 1;
+pub const MACH_RCV_TIMEOUT: u32 = 1 << 8;
+
+pub const MACH_MSGH_BITS_COMPLEX: u32 = 1 << 31;
+pub const MACH_MSGH_BITS_REMOTE_MASK: u32 = 0xFF;
+pub const MACH_MSGH_BITS_LOCAL_MASK: u32 = 0xFF00;
+
+pub const MACH_MSG_TYPE_MOVE_RECEIVE: u32 = 16;
+pub const MACH_MSG_TYPE_MOVE_SEND: u32 = 17;
+pub const MACH_MSG_TYPE_MOVE_SEND_ONCE: u32 = 18;
+pub const MACH_MSG_TYPE_COPY_SEND: u32 = 19;
+pub const MACH_MSG_TYPE_MAKE_SEND: u32 = 20;
+pub const MACH_MSG_TYPE_MAKE_SEND_ONCE: u32 = 21;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MachMsgHeader {
+    pub bits: u32,
+    pub size: u32,
+    pub remote_port: u32,
+    pub local_port: u32,
+    pub id: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MachMsgOolDesc {
+    pub addr: u64,
+    pub size: u64,
+    pub deallocate: bool,
+    pub reserved: [u8; 7],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PortRightKind {
+    Receive,
+    Send,
+    SendOnce,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PortRightEntry {
+    pub name: MachPortName,
+    pub port_id: u64,
+    pub right: PortRightKind,
+    pub also_send: bool,
+}
+
+pub struct MachOolPayload {
+    pub frames: Vec<u64>,
+    pub size_bytes: u64,
+}
+
+pub struct MachKernelMsg {
+    pub bits: u32,
+    pub id: u32,
+    pub reply_port_id: u64,
+    pub reply_right: Option<PortRightKind>,
+    pub inline_data: Vec<u8>,
+    pub ool: Option<MachOolPayload>,
+}
+
+struct MachPort {
+    id: u64,
+    queue: VecDeque<MachKernelMsg>,
+    send_rights: usize,
+    send_once_rights: usize,
+    receive_rights: usize,
+    dead: bool,
+}
+
+struct MachPortTable {
+    next_id: u64,
+    ports: BTreeMap<u64, MachPort>,
+}
+
+impl MachPortTable {
+    const fn new() -> Self {
+        Self {
+            next_id: 1,
+            ports: BTreeMap::new(),
+        }
+    }
+}
+
+static MACH_PORTS: PreemptMutex<MachPortTable> = PreemptMutex::new(MachPortTable::new());
+static BOOTSTRAP_SERVICES: PreemptMutex<BTreeMap<String, u64>> =
+    PreemptMutex::new(BTreeMap::new());
 
 #[derive(Clone)]
 struct PipeSlot {
@@ -89,6 +191,9 @@ pub struct IpcSnapshot {
     pub buffered_pipe_bytes: usize,
     pub shm_regions: Vec<ShmInfoItem>,
     pub total_shm_bytes: usize,
+    pub mach_ports: usize,
+    pub mach_queued_msgs: usize,
+    pub bootstrap_services: usize,
 }
 
 pub fn create_pipe() -> Result<usize, i64> {
@@ -478,12 +583,305 @@ pub fn snapshot_ipc() -> IpcSnapshot {
                 ref_count: reg.ref_count,
             });
         }
+        drop(shms);
+
+        let mach = MACH_PORTS.lock();
+        let mach_ports = mach.ports.len();
+        let mach_queued_msgs = mach.ports.values().map(|p| p.queue.len()).sum();
+        drop(mach);
+
+        let bootstrap_services = BOOTSTRAP_SERVICES.lock().len();
 
         IpcSnapshot {
             active_pipes,
             buffered_pipe_bytes,
             shm_regions,
             total_shm_bytes,
+            mach_ports,
+            mach_queued_msgs,
+            bootstrap_services,
         }
     })
+}
+
+pub fn mach_port_allocate() -> Result<u64, i64> {
+    without_interrupts(|| {
+        let mut table = MACH_PORTS.lock();
+        if table.ports.len() >= MAX_MACH_PORTS {
+            return Err(-12); // ENOMEM
+        }
+        let id = table.next_id.max(1);
+        table.next_id = id.saturating_add(1);
+        table.ports.insert(
+            id,
+            MachPort {
+                id,
+                queue: VecDeque::new(),
+                send_rights: 1,
+                send_once_rights: 0,
+                receive_rights: 1,
+                dead: false,
+            },
+        );
+        Ok(id)
+    })
+}
+
+pub fn mach_retain_right(port_id: u64, right: PortRightKind, also_send: bool) -> bool {
+    without_interrupts(|| {
+        let mut table = MACH_PORTS.lock();
+        let Some(port) = table.ports.get_mut(&port_id) else {
+            return false;
+        };
+        match right {
+            PortRightKind::Receive => {
+                if port.dead {
+                    return false;
+                }
+                port.receive_rights = port.receive_rights.saturating_add(1);
+                if also_send {
+                    port.send_rights = port.send_rights.saturating_add(1);
+                }
+            }
+            PortRightKind::Send => {
+                port.send_rights = port.send_rights.saturating_add(1);
+            }
+            PortRightKind::SendOnce => {
+                port.send_once_rights = port.send_once_rights.saturating_add(1);
+            }
+        }
+        true
+    })
+}
+
+pub fn mach_port_is_dead(port_id: u64) -> bool {
+    without_interrupts(|| {
+        let table = MACH_PORTS.lock();
+        table.ports.get(&port_id).map(|p| p.dead).unwrap_or(true)
+    })
+}
+
+pub fn mach_port_has_queued_msg(port_id: u64) -> bool {
+    without_interrupts(|| {
+        let table = MACH_PORTS.lock();
+        table
+            .ports
+            .get(&port_id)
+            .map(|p| !p.queue.is_empty())
+            .unwrap_or(false)
+    })
+}
+
+pub fn mach_send_msg(
+    port_id: u64,
+    consume_send_once: bool,
+    msg: MachKernelMsg,
+) -> Result<(), (i64, MachKernelMsg)> {
+    without_interrupts(|| {
+        let mut table = MACH_PORTS.lock();
+        let Some(port) = table.ports.get_mut(&port_id) else {
+            return Err((-32, msg)); // EPIPE (dead/invalid port)
+        };
+        if consume_send_once {
+            port.send_once_rights = port.send_once_rights.saturating_sub(1);
+        }
+        if port.dead {
+            return Err((-32, msg)); // EPIPE / MACH_SEND_INVALID_DEST
+        }
+        if port.queue.len() >= MAX_MACH_PORT_QUEUE {
+            return Err((-11, msg)); // EAGAIN
+        }
+        port.queue.push_back(msg);
+        Ok(())
+    })
+}
+
+pub fn mach_try_recv_msg(port_id: u64) -> Result<MachKernelMsg, i64> {
+    without_interrupts(|| {
+        let mut table = MACH_PORTS.lock();
+        let Some(port) = table.ports.get_mut(&port_id) else {
+            return Err(-32); // EPIPE
+        };
+        if let Some(msg) = port.queue.pop_front() {
+            return Ok(msg);
+        }
+        if port.dead {
+            return Err(-32);
+        }
+        Err(-11) // EAGAIN
+    })
+}
+
+pub fn mach_requeue_front_msg(port_id: u64, msg: MachKernelMsg) -> Result<(), MachKernelMsg> {
+    without_interrupts(|| {
+        let mut table = MACH_PORTS.lock();
+        let Some(port) = table.ports.get_mut(&port_id) else {
+            return Err(msg);
+        };
+        if port.dead || port.queue.len() >= MAX_MACH_PORT_QUEUE {
+            return Err(msg);
+        }
+        port.queue.push_front(msg);
+        Ok(())
+    })
+}
+
+fn release_right_inner(
+    port_id: u64,
+    right: PortRightKind,
+    also_send: bool,
+    drained_out: &mut Vec<MachKernelMsg>,
+) -> bool {
+    let became_dead = without_interrupts(|| {
+        let mut table = MACH_PORTS.lock();
+        let Some(port) = table.ports.get_mut(&port_id) else {
+            return false;
+        };
+        match right {
+            PortRightKind::Receive => {
+                port.receive_rights = port.receive_rights.saturating_sub(1);
+                if also_send {
+                    port.send_rights = port.send_rights.saturating_sub(1);
+                }
+            }
+            PortRightKind::Send => {
+                port.send_rights = port.send_rights.saturating_sub(1);
+            }
+            PortRightKind::SendOnce => {
+                port.send_once_rights = port.send_once_rights.saturating_sub(1);
+            }
+        }
+
+        let mut died = false;
+        if port.receive_rights == 0 && !port.dead {
+            port.dead = true;
+            died = true;
+            while let Some(m) = port.queue.pop_front() {
+                drained_out.push(m);
+            }
+        }
+
+        if port.receive_rights == 0 && port.send_rights == 0 && port.send_once_rights == 0 {
+            table.ports.remove(&port_id);
+        }
+        died
+    });
+
+    if became_dead {
+        let mut evicted_send_rights = 0usize;
+        without_interrupts(|| {
+            let mut bs = BOOTSTRAP_SERVICES.lock();
+            bs.retain(|_, &mut pid| {
+                if pid == port_id {
+                    evicted_send_rights += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        });
+        for _ in 0..evicted_send_rights {
+            let _ = release_right_inner(port_id, PortRightKind::Send, false, drained_out);
+        }
+    }
+
+    became_dead
+}
+
+pub fn mach_release_port_id_right(
+    port_id: u64,
+    right: PortRightKind,
+    also_send: bool,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) {
+    let mut pending_msgs: Vec<MachKernelMsg> = Vec::new();
+    let _ = release_right_inner(port_id, right, also_send, &mut pending_msgs);
+
+    while let Some(msg) = pending_msgs.pop() {
+        if let Some(ool) = msg.ool {
+            for frame in ool.frames {
+                let _ = allocator.deallocate_frame(frame);
+            }
+        }
+        if msg.reply_port_id != 0 {
+            if let Some(rr) = msg.reply_right {
+                let _ = release_right_inner(msg.reply_port_id, rr, false, &mut pending_msgs);
+            }
+        }
+    }
+}
+
+pub fn mach_drop_msg_resources(
+    msg: MachKernelMsg,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) {
+    if let Some(ool) = msg.ool {
+        for frame in ool.frames {
+            let _ = allocator.deallocate_frame(frame);
+        }
+    }
+    if msg.reply_port_id != 0 {
+        if let Some(rr) = msg.reply_right {
+            mach_release_port_id_right(msg.reply_port_id, rr, false, allocator);
+        }
+    }
+}
+
+pub fn bootstrap_register_port(
+    name: &str,
+    port_id: u64,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> Result<(), i64> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return Err(-22); // EINVAL
+    }
+
+    let ok = without_interrupts(|| {
+        let mut table = MACH_PORTS.lock();
+        let Some(port) = table.ports.get_mut(&port_id) else {
+            return Err(-32);
+        };
+        if port.dead {
+            return Err(-32);
+        }
+        port.send_rights = port.send_rights.saturating_add(1);
+        Ok(())
+    });
+    ok?;
+
+    let prev = without_interrupts(|| {
+        let mut bs = BOOTSTRAP_SERVICES.lock();
+        bs.insert(String::from(trimmed), port_id)
+    });
+    if let Some(old_port_id) = prev {
+        mach_release_port_id_right(old_port_id, PortRightKind::Send, false, allocator);
+    }
+    Ok(())
+}
+
+pub fn bootstrap_lookup_port(name: &str) -> Result<u64, i64> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return Err(-22);
+    }
+    let port_id = without_interrupts(|| BOOTSTRAP_SERVICES.lock().get(trimmed).copied())
+        .ok_or(-2)?; // ENOENT
+
+    let retained = without_interrupts(|| {
+        let mut table = MACH_PORTS.lock();
+        let Some(port) = table.ports.get_mut(&port_id) else {
+            return Err(-32);
+        };
+        if port.dead {
+            return Err(-32);
+        }
+        port.send_rights = port.send_rights.saturating_add(1);
+        Ok(port.id)
+    });
+
+    if retained.is_err() {
+        let _ = without_interrupts(|| BOOTSTRAP_SERVICES.lock().remove(trimmed));
+    }
+    retained
 }

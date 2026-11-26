@@ -17,7 +17,7 @@ pub fn cmd_mkelf(console: &mut Console<'_>, arguments: &str) {
     let arg = arguments.trim();
 
     if arg.is_empty() || arg == "all" {
-        let demos: [(&str, fn() -> alloc::vec::Vec<u8>); 9] = [
+        let demos: [(&str, fn() -> alloc::vec::Vec<u8>); 10] = [
             ("/hello.elf", demo::build_hello_elf),
             ("/echo.elf", demo::build_echo_elf),
             ("/fault.elf", demo::build_fault_elf),
@@ -27,6 +27,7 @@ pub fn cmd_mkelf(console: &mut Console<'_>, arguments: &str) {
             ("/lazy_demo.elf", demo::build_lazy_demo_elf),
             ("/guard_fault.elf", demo::build_guard_fault_elf),
             ("/fork_demo.elf", demo::build_fork_demo_elf),
+            ("/mach_ipc_demo.elf", demo::build_mach_ipc_demo_elf),
         ];
 
         for (path, builder) in demos {
@@ -51,7 +52,7 @@ pub fn cmd_mkelf(console: &mut Console<'_>, arguments: &str) {
         }
 
         console.write(
-            "Run 'exec /counter.elf', 'exec /lazy_demo.elf', 'exec /guard_fault.elf', or 'execbg /counter.elf'.\n",
+            "Run 'exec /fork_demo.elf', 'exec /mach_ipc_demo.elf', 'exec /counter.elf', or 'execbg /counter.elf'.\n",
             YELLOW,
         );
         return;
@@ -73,6 +74,8 @@ pub fn cmd_mkelf(console: &mut Console<'_>, arguments: &str) {
         ("/guard_fault.elf", demo::build_guard_fault_elf)
     } else if arg == "fork" {
         ("/fork_demo.elf", demo::build_fork_demo_elf)
+    } else if arg == "mach" {
+        ("/mach_ipc_demo.elf", demo::build_mach_ipc_demo_elf)
     } else if arg == "hello" {
         ("/hello.elf", demo::build_hello_elf)
     } else {

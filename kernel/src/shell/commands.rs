@@ -115,7 +115,7 @@ pub fn execute(
             console.write("  kthread [demo]     - Inspect preemptive kernel threads & guard stacks\n", WHITE);
             console.write("  ahci [read <LBA>]  - Inspect AHCI SATA DMA HBA & read sectors\n", WHITE);
             console.write("  virtio [read LBA]  - Inspect VirtIO-Blk split-ring DMA driver\n", WHITE);
-            console.write("  ipc                - Inspect POSIX pipes, SHM regions & SWAPGS state\n", WHITE);
+            console.write("  ipc                - Inspect POSIX pipes, SHM, Mach ports & Bootstrap services\n", WHITE);
             console.write("  netinfo            - Show Intel e1000 & IPv4 status\n", WHITE);
             console.write("  dhcp               - Acquire IPv4 config via DHCP\n", WHITE);
             console.write("  ping <host_or_ip>  - Send 4 ICMP echo packets\n", WHITE);
@@ -125,7 +125,7 @@ pub fn execute(
             console.write("  play <file.wav>    - Stream WAV file from FAT32\n", WHITE);
 
             console.write("\nUserland & ELF (Ring 3) commands:\n", YELLOW);
-            console.write("  mkelf [all|path]   - Write /hello,/echo,/fault,/gui_demo,/counter,/net_demo,/lazy_demo,/guard_fault ELFs\n", WHITE);
+            console.write("  mkelf [all|path]   - Write /hello,/echo,/fault,/gui_demo,/counter,/net_demo,/lazy,/guard,/fork,/mach ELFs\n", WHITE);
             console.write("  elfinfo <path.elf> - Inspect ELF64 headers and PT_LOAD segments\n", WHITE);
             console.write("  exec <path.elf>    - Execute ELF64 in Ring 3 (non-blocking in Desktop GUI)\n", WHITE);
             console.write("  execbg <path.elf>  - Spawn ELF64 asynchronously in preemptive scheduler\n", WHITE);

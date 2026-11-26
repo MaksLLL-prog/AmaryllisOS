@@ -521,11 +521,14 @@ pub fn cmd_ipc(console: &mut Console<'_>) {
     let percpu = crate::arch::percpu::bsp_snapshot();
     console.write("\nKernel IPC (POSIX Pipes & Shared Memory) + SWAPGS:\n", GREEN);
     let head = alloc::format!(
-        "  Active Pipes: {} ({} bytes buffered)\n  SHM Regions:  {} ({} KiB total)\n  SWAPGS Base:  KERNEL_GS_BASE=0x{:x} BSP_APIC_ID={}\n",
+        "  Active Pipes: {} ({} bytes buffered)\n  SHM Regions:  {} ({} KiB total)\n  Mach Ports:   {} ({} queued msgs, {} bootstrap services)\n  SWAPGS Base:  KERNEL_GS_BASE=0x{:x} BSP_APIC_ID={}\n",
         snap.active_pipes,
         snap.buffered_pipe_bytes,
         snap.shm_regions.len(),
         snap.total_shm_bytes / 1024,
+        snap.mach_ports,
+        snap.mach_queued_msgs,
+        snap.bootstrap_services,
         crate::arch::percpu::read_msr(crate::arch::percpu::IA32_KERNEL_GS_BASE_MSR),
         percpu.apic_id,
     );

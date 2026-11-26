@@ -21,7 +21,9 @@ pub const SYS_CONNECT: u64 = 42;
 pub const SYS_SEND: u64 = 44;
 pub const SYS_RECV: u64 = 45;
 pub const SYS_BIND: u64 = 49;
+pub const SYS_FORK: u64 = 57;
 pub const SYS_EXIT: u64 = 60;
+pub const SYS_WAITPID: u64 = 61;
 pub const SYS_GETDENTS: u64 = 78;
 pub const SYS_MKDIR: u64 = 83;
 pub const SYS_UNLINK: u64 = 87;
@@ -40,6 +42,11 @@ pub const SYS_SPAWN_ELF: u64 = 310;
 pub const SYS_SHM_CREATE: u64 = 320;
 pub const SYS_SHM_MAP: u64 = 321;
 pub const SYS_SHM_UNMAP: u64 = 322;
+pub const SYS_MACH_PORT_ALLOCATE: u64 = 330;
+pub const SYS_MACH_PORT_DEALLOCATE: u64 = 331;
+pub const SYS_MACH_MSG: u64 = 332;
+pub const SYS_BOOTSTRAP_REGISTER: u64 = 333;
+pub const SYS_BOOTSTRAP_LOOKUP: u64 = 334;
 
 pub const ENOENT: i64 = -2;
 pub const EIO: i64 = -5;
@@ -135,6 +142,62 @@ pub unsafe fn syscall4(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> 
             in("rsi") arg2,
             in("rdx") arg3,
             in("r10") arg4,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack)
+        );
+    }
+    ret
+}
+
+#[inline(always)]
+pub unsafe fn syscall5(
+    num: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
+) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") num => ret,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r10") arg4,
+            in("r8") arg5,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack)
+        );
+    }
+    ret
+}
+
+#[inline(always)]
+pub unsafe fn syscall6(
+    num: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
+    arg6: u64,
+) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") num => ret,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r10") arg4,
+            in("r8") arg5,
+            in("r9") arg6,
             out("rcx") _,
             out("r11") _,
             options(nostack)

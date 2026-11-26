@@ -46,6 +46,8 @@ impl RamFs {
         let _ = self.write_file("/gui_demo.elf", &crate::userland::demo::build_gui_demo_elf());
         let _ = self.write_file("/net_demo.elf", &crate::userland::demo::build_net_demo_elf());
         let _ = self.write_file("/fault.elf", &crate::userland::demo::build_fault_elf());
+        let _ = self.write_file("/fork_demo.elf", &crate::userland::demo::build_fork_demo_elf());
+        let _ = self.write_file("/mach_ipc_demo.elf", &crate::userland::demo::build_mach_ipc_demo_elf());
         let _ = self.create_dir("/home/amaryllis");
         let _ = self.create_dir("/home/wallpapers");
         let _ = self.write_file("/home/wallpapers/nebula_glow.ppm", &build_sample_nebula_ppm());

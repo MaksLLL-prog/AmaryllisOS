@@ -13,13 +13,20 @@ use crate::console::Console;
 use crate::graphics::Color;
 use crate::interrupts::timer;
 use crate::klog::{self, KLogLevel};
-use crate::memory::vmm::{PhysicalMemoryMapping, PAGE_SIZE};
+use crate::memory::vmm::{PhysicalMemoryMapping, COW_FLAG, PAGE_SIZE};
 use crate::memory::PhysicalFrameAllocator;
 use crate::process::{ProcessState, PROCESS_MANAGER};
 use crate::storage::vfs::VfsDirEntry;
 use crate::task::kthread::{self, NetJobOutcome};
 
 use super::elf::{self, LoadedElfImage, USER_ADDR_LIMIT};
+use super::ipc::{
+    self, MachKernelMsg, MachMsgHeader, MachMsgOolDesc, MachOolPayload, MachPortName,
+    PortRightEntry, PortRightKind, MACH_MSGH_BITS_COMPLEX, MACH_MSGH_BITS_LOCAL_MASK,
+    MACH_MSGH_BITS_REMOTE_MASK, MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND,
+    MACH_MSG_TYPE_MAKE_SEND_ONCE, MACH_MSG_TYPE_MOVE_SEND, MACH_MSG_TYPE_MOVE_SEND_ONCE,
+    MACH_PORT_NULL, MACH_RCV_MSG, MACH_RCV_TIMEOUT, MACH_SEND_MSG,
+};
 use super::syscall::{self, UserFaultInfo, UserTrapOutcome};
 
 pub const MAX_USER_PROCS: usize = 16;
@@ -147,7 +154,17 @@ pub enum WaitReason {
         cap: usize,
         deadline_ms: u64,
     },
-    WaitPid { target_pid: isize, status_ptr: u64 },
+    WaitPid {
+        target_pid: isize,
+        status_ptr: u64,
+    },
+    MachPortRecv {
+        port_id: u64,
+        rcv_name: MachPortName,
+        msg_ptr: u64,
+        rcv_cap: usize,
+        deadline_ms: u64,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -156,7 +173,6 @@ pub enum UserTaskState {
     Running,
     Waiting(WaitReason),
     Exited(i64),
-    Zombie(i64),
     Faulted(UserFaultInfo),
 }
 
@@ -259,6 +275,8 @@ struct UserProcessSlot {
     vmas: Vec<VmRegion>,
     image: Option<LoadedElfImage>,
     fds: [Option<FdEntry>; MAX_PROC_FDS],
+    port_rights: Vec<PortRightEntry>,
+    next_port_name: u32,
     stdout_buf: String,
     has_gui_window: bool,
 }
@@ -304,6 +322,32 @@ impl UserProcessSlot {
         self.vmas = updated;
     }
 
+    fn alloc_port_right(
+        &mut self,
+        port_id: u64,
+        right: PortRightKind,
+        also_send: bool,
+    ) -> MachPortName {
+        let name = self.next_port_name.max(1);
+        self.next_port_name = name.saturating_add(1).max(1);
+        self.port_rights.push(PortRightEntry {
+            name,
+            port_id,
+            right,
+            also_send,
+        });
+        name
+    }
+
+    fn find_port_right(&self, name: MachPortName) -> Option<PortRightEntry> {
+        self.port_rights.iter().copied().find(|r| r.name == name)
+    }
+
+    fn take_port_right(&mut self, name: MachPortName) -> Option<PortRightEntry> {
+        let pos = self.port_rights.iter().position(|r| r.name == name)?;
+        Some(self.port_rights.swap_remove(pos))
+    }
+
     #[inline]
     fn charge_runtime(&mut self, elapsed_ms: u64) {
         self.cpu_ms = self.cpu_ms.saturating_add(elapsed_ms);
@@ -320,6 +364,7 @@ struct UserScheduler {
     quantum_deadline_ms: u64,
     pending_spawns: Vec<Vec<String>>,
     completed_for_sync: Vec<FinishedUserProcess>,
+    exited_for_wait: Vec<(usize, usize, i64)>,
 }
 
 impl UserScheduler {
@@ -332,6 +377,7 @@ impl UserScheduler {
             quantum_deadline_ms: 0,
             pending_spawns: Vec::new(),
             completed_for_sync: Vec::new(),
+            exited_for_wait: Vec::new(),
         }
     }
 
@@ -359,6 +405,12 @@ impl UserScheduler {
             .map(|p| p.vruntime_ms)
             .min()
             .unwrap_or(0)
+    }
+
+    fn has_live_child_matching(&self, parent_pid: usize, target_pid: isize) -> bool {
+        self.slots.iter().flatten().any(|c| {
+            c.parent_pid == parent_pid && (target_pid <= 0 || c.pid == target_pid as usize)
+        })
     }
 }
 
@@ -405,10 +457,23 @@ pub fn has_ready_now() -> bool {
                 | WaitReason::TcpConnect { deadline_ms, .. }
                 | WaitReason::NetJob { deadline_ms, .. }
                 | WaitReason::PipeRead { deadline_ms, .. } => now_ms >= deadline_ms,
-                WaitReason::WaitPid { .. } => true,
+                WaitReason::WaitPid { target_pid, .. } => {
+                    sched.exited_for_wait.iter().any(|&(ppid, cpid, _)| {
+                        ppid == p.pid && (target_pid <= 0 || cpid == target_pid as usize)
+                    }) || !sched.has_live_child_matching(p.pid, target_pid)
+                }
+                WaitReason::MachPortRecv {
+                    port_id,
+                    deadline_ms,
+                    ..
+                } => {
+                    now_ms >= deadline_ms
+                        || ipc::mach_port_has_queued_msg(port_id)
+                        || ipc::mach_port_is_dead(port_id)
+                }
             },
             UserTaskState::Exited(_) | UserTaskState::Faulted(_) => true,
-            UserTaskState::Running | UserTaskState::Zombie(_) => false,
+            UserTaskState::Running => false,
         })
     })
 }
@@ -502,6 +567,8 @@ pub fn register_process(
                 vmas,
                 image: Some(image),
                 fds: [const { None }; MAX_PROC_FDS],
+                port_rights: Vec::new(),
+                next_port_name: 1,
                 stdout_buf: String::new(),
                 has_gui_window: false,
             });
@@ -670,11 +737,13 @@ fn unmap_user_page_range(
     for i in 0..page_count {
         let vaddr = start_page + (i as u64) * PAGE_SIZE;
         if let Some(pos) = image.mapped_pages.iter().position(|&(v, _)| v == vaddr) {
-            let (_, frame) = image.mapped_pages.swap_remove(pos);
-            if let Ok(virt) = VirtAddr::try_new(vaddr) {
-                let _ = mapping.unmap_page_in(pml4, virt);
-            }
-            let _ = allocator.deallocate_frame(frame);
+            let (_, recorded_frame) = image.mapped_pages.swap_remove(pos);
+            let actual_frame = if let Ok(virt) = VirtAddr::try_new(vaddr) {
+                mapping.unmap_page_in(pml4, virt).unwrap_or(recorded_frame)
+            } else {
+                recorded_frame
+            };
+            let _ = allocator.deallocate_frame(actual_frame);
             freed += 1;
         }
     }
@@ -752,8 +821,8 @@ fn commit_single_lazy_page_for_slot(
     ok
 }
 
-/// Resolves a Ring 3 `#PF` against registered VMAs (lazy demand-paged `mmap` & stack growth)
-/// or identifies guard-page stack overflow.
+/// Resolves a Ring 3 `#PF` against registered VMAs (Copy-on-Write write faults & lazy demand-paged
+/// `mmap`/`stack` growth) or identifies guard-page stack overflow.
 pub fn try_resolve_user_page_fault(
     cr2: u64,
     error_code: u64,
@@ -769,10 +838,10 @@ pub fn try_resolve_user_page_fault(
         let idx = sched.current_slot?;
         let proc = sched.slots[idx].as_ref()?;
         let vma = proc.find_vma(cr2);
-        Some((idx, proc.pid, vma))
+        Some((idx, proc.pid, proc.pml4, vma))
     });
 
-    let Some((slot_idx, pid, Some(vma))) = info else {
+    let Some((slot_idx, pid, pml4, Some(vma))) = info else {
         return FaultResolveOutcome::NotHandled;
     };
 
@@ -789,6 +858,25 @@ pub fn try_resolve_user_page_fault(
         return FaultResolveOutcome::GuardPageHit;
     }
 
+    let page_vaddr = cr2 & !(PAGE_SIZE - 1);
+
+    // Present protection fault (bit 0 == 1): handle Copy-on-Write write faults on writable private VMAs.
+    if (error_code & 0x1) != 0 {
+        if (error_code & 0x2) != 0
+            && (error_code & 0x10) == 0
+            && vma.writable
+            && vma.kind != VmRegionKind::SharedMem
+        {
+            if let Ok(copied) = mapping.resolve_cow_fault_in(pml4, page_vaddr, allocator) {
+                if copied {
+                    klog::record_pf_cow_copy();
+                }
+                return FaultResolveOutcome::Resolved;
+            }
+        }
+        return FaultResolveOutcome::NotHandled;
+    }
+
     if !matches!(
         vma.kind,
         VmRegionKind::LazyMmap | VmRegionKind::Stack | VmRegionKind::LazyHeap
@@ -796,12 +884,6 @@ pub fn try_resolve_user_page_fault(
         return FaultResolveOutcome::NotHandled;
     }
 
-    if (error_code & 0x1) != 0 {
-        if (error_code & 0x2) != 0 && vma.writable && resolve_cow_page_for_slot(slot_idx, cr2 & !(PAGE_SIZE - 1), vma, mapping, allocator) {
-            return FaultResolveOutcome::Resolved;
-        }
-        return FaultResolveOutcome::NotHandled;
-    }
     // Bit 1 == 1 means write access on a read-only VMA.
     if (error_code & 0x2) != 0 && !vma.writable {
         return FaultResolveOutcome::NotHandled;
@@ -811,7 +893,6 @@ pub fn try_resolve_user_page_fault(
         return FaultResolveOutcome::NotHandled;
     }
 
-    let page_vaddr = cr2 & !(PAGE_SIZE - 1);
     if commit_single_lazy_page_for_slot(slot_idx, page_vaddr, vma, mapping, allocator) {
         FaultResolveOutcome::Resolved
     } else {
@@ -820,7 +901,7 @@ pub fn try_resolve_user_page_fault(
 }
 
 /// Ensures every 4 KiB page in `[first_page ..= last_page]` inside `user_pml4` is mapped
-/// and satisfies user/writable permissions, demand-paging lazy stack/mmap VMAs if `allocator` is provided.
+/// and satisfies user/writable permissions, resolving CoW pages or demand-paging lazy VMAs if `allocator` is provided.
 pub fn ensure_user_pages_committed(
     user_pml4: u64,
     first_page: u64,
@@ -837,13 +918,32 @@ pub fn ensure_user_pages_committed(
                 return Err(-14);
             }
             if require_writable && !trans.flags.contains(PageTableFlags::WRITABLE) {
-                if trans.flags.contains(crate::memory::vmm::COW_PAGE_FLAG) {
-                    if let Some(a) = allocator.as_deref_mut() {
-                        let ci = without_interrupts(|| { let sc = USER_SCHED.lock(); let i = sc.find_slot_by_pml4(user_pml4)?; let p = sc.slots[i].as_ref()?; Some((i, p.find_vma(page)?)) });
-                        if let Some((i, v)) = ci { if resolve_cow_page_for_slot(i, page, v, mapping, a) { page = page.saturating_add(PAGE_SIZE); continue; } }
+                if trans.flags.contains(COW_FLAG) {
+                    let Some(alloc_ref) = allocator.as_deref_mut() else {
+                        return Err(-14);
+                    };
+                    let writable_private = without_interrupts(|| {
+                        let sched = USER_SCHED.lock();
+                        let idx = sched.find_slot_by_pml4(user_pml4)?;
+                        let proc = sched.slots[idx].as_ref()?;
+                        let vma = proc.find_vma(page)?;
+                        Some(vma.writable && vma.kind != VmRegionKind::SharedMem)
+                    })
+                    .unwrap_or(false);
+                    if !writable_private {
+                        return Err(-14);
                     }
+                    match mapping.resolve_cow_fault_in(user_pml4, page, alloc_ref) {
+                        Ok(copied) => {
+                            if copied {
+                                klog::record_pf_cow_copy();
+                            }
+                        }
+                        Err(_) => return Err(-14),
+                    }
+                } else {
+                    return Err(-14);
                 }
-                return Err(-14);
             }
         } else {
             let Some(alloc_ref) = allocator.as_deref_mut() else {
@@ -1261,10 +1361,8 @@ pub unsafe fn finish_current_from_syscall(exit_code: i64) -> ! {
         let mut sched = USER_SCHED.lock();
         let start_ms = sched.quantum_start_ms;
         if let Some(idx) = sched.current_slot {
-            let ppid = sched.slots[idx].as_ref().map(|p| p.parent_pid).unwrap_or(0);
-            let live = ppid != 0 && sched.slots.iter().flatten().any(|p| p.pid == ppid && !matches!(p.state, UserTaskState::Exited(_) | UserTaskState::Zombie(_) | UserTaskState::Faulted(_)));
             if let Some(ref mut proc) = sched.slots[idx] {
-                proc.state = if live { UserTaskState::Zombie(exit_code) } else { UserTaskState::Exited(exit_code) };
+                proc.state = UserTaskState::Exited(exit_code);
                 let elapsed = now_ms.saturating_sub(start_ms);
                 proc.charge_runtime(elapsed);
             }
@@ -1430,15 +1528,6 @@ pub fn poll_wait_queues(
                     wake_ret = Some(-110);
                 }
             }
-            WaitReason::WaitPid { target_pid, status_ptr } => {
-                let z = without_interrupts(|| {
-                    let mut sc = USER_SCHED.lock();
-                    let mut found = false; let mut zi = None;
-                    for (i, sl) in sc.slots.iter().enumerate() { if let Some(c) = sl.as_ref() { if c.parent_pid == pid && (target_pid <= 0 || c.pid == target_pid as usize) { found = true; if matches!(c.state, UserTaskState::Zombie(_)) { zi = Some(i); break; } } } }
-                    if let Some(i) = zi { let p = sc.slots[i].take().unwrap(); let c = match p.state { UserTaskState::Zombie(x) => x, _ => 0 }; Some(Ok((p.pid, c, p.pml4, p.image, p.fds, p.has_gui_window, p.shm_attachments, p.owned_shm_ids, p.vmas))) } else if !found { Some(Err(-10)) } else { None }
-                });
-                match z { Some(Err(e)) => wake_ret = Some(e), Some(Ok((cpid, code, cpml4, cimg, cfds, gui, shms, owned, cvmas))) => { close_fd_list(cfds); cleanup_process_ipc_and_windows(cpid, cpml4, gui, shms, owned, mapping, allocator); if let Some(mut img) = cimg { elf::cleanup_loaded_image(&mut img, cpml4, mapping, allocator); } else { crate::memory::address_space::AddressSpace::destroy_forked_user_space(cpml4, &cvmas, mapping, allocator); } if status_ptr != 0 { let st: i32 = ((code as i32) & 0xFF) << 8; let _ = syscall::copy_to_user_bytes_in(mapping, Some(allocator), pml4, status_ptr, &st.to_le_bytes()); } wake_ret = Some(cpid as i64); } None => {} }
-            }
             WaitReason::PipeRead {
                 pipe_id,
                 buf_ptr,
@@ -1474,6 +1563,80 @@ pub fn poll_wait_queues(
                     }
                 }
             }
+            WaitReason::WaitPid {
+                target_pid,
+                status_ptr,
+            } => {
+                let reaped = without_interrupts(|| {
+                    let mut sched = USER_SCHED.lock();
+                    if let Some(pos) = sched.exited_for_wait.iter().position(|&(ppid, cpid, _)| {
+                        ppid == pid && (target_pid <= 0 || cpid == target_pid as usize)
+                    }) {
+                        let (_ppid, cpid, code) = sched.exited_for_wait.swap_remove(pos);
+                        Some(Ok((cpid, code)))
+                    } else if !sched.has_live_child_matching(pid, target_pid) {
+                        Some(Err(-10)) // ECHILD
+                    } else {
+                        None
+                    }
+                });
+                match reaped {
+                    Some(Ok((cpid, code))) => {
+                        if status_ptr != 0 {
+                            let status_bytes = (code as i32).to_le_bytes();
+                            if syscall::copy_to_user_bytes_in(
+                                mapping,
+                                Some(allocator),
+                                pml4,
+                                status_ptr,
+                                &status_bytes,
+                            )
+                            .is_err()
+                            {
+                                wake_ret = Some(-14);
+                            } else {
+                                wake_ret = Some(cpid as i64);
+                            }
+                        } else {
+                            wake_ret = Some(cpid as i64);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        wake_ret = Some(e);
+                    }
+                    None => {}
+                }
+            }
+            WaitReason::MachPortRecv {
+                port_id,
+                rcv_name,
+                msg_ptr,
+                rcv_cap,
+                deadline_ms,
+            } => match ipc::mach_try_recv_msg(port_id) {
+                Ok(msg) => {
+                    wake_ret = Some(deliver_mach_msg_to_slot(
+                        slot_idx,
+                        pid,
+                        pml4,
+                        port_id,
+                        rcv_name,
+                        msg,
+                        msg_ptr,
+                        rcv_cap,
+                        mapping,
+                        allocator,
+                    ));
+                }
+                Err(-11) => {
+                    if now_ms >= deadline_ms {
+                        wake_ret = Some(-110); // ETIMEDOUT
+                    }
+                }
+                Err(e) => {
+                    wake_ret = Some(e);
+                }
+            },
         }
 
         if let Some(ret_val) = wake_ret {
@@ -1607,9 +1770,13 @@ fn cleanup_process_ipc_and_windows(
     had_gui: bool,
     shm_attachments: Vec<ShmAttachment>,
     owned_shms: Vec<u64>,
+    port_rights: Vec<PortRightEntry>,
     mapping: &PhysicalMemoryMapping,
     allocator: &mut PhysicalFrameAllocator<'_>,
 ) {
+    for pr in port_rights {
+        ipc::mach_release_port_id_right(pr.port_id, pr.right, pr.also_send, allocator);
+    }
     for att in shm_attachments {
         for i in 0..att.page_count {
             if let Ok(virt) = VirtAddr::try_new(att.vaddr + (i as u64) * PAGE_SIZE) {
@@ -1643,10 +1810,14 @@ fn collect_finished_and_stdout(
         bool,
         Vec<ShmAttachment>,
         Vec<u64>,
+        Vec<PortRightEntry>,
     )> = Vec::new();
 
     without_interrupts(|| {
         let mut sched = USER_SCHED.lock();
+        let mut new_wait_entries: Vec<(usize, usize, i64)> = Vec::new();
+        let mut dead_parent_pids: Vec<usize> = Vec::new();
+
         for slot in &mut sched.slots {
             if let Some(ref mut proc) = slot {
                 if !proc.stdout_buf.is_empty() {
@@ -1656,6 +1827,10 @@ fn collect_finished_and_stdout(
                 match proc.state {
                     UserTaskState::Exited(exit_code) => {
                         let proc_owned = slot.take().unwrap();
+                        if proc_owned.parent_pid != 0 {
+                            new_wait_entries.push((proc_owned.parent_pid, proc_owned.pid, exit_code));
+                        }
+                        dead_parent_pids.push(proc_owned.pid);
                         deferred_cleanups.push((
                             proc_owned.pid,
                             proc_owned.pml4,
@@ -1664,6 +1839,7 @@ fn collect_finished_and_stdout(
                             proc_owned.has_gui_window,
                             proc_owned.shm_attachments,
                             proc_owned.owned_shm_ids,
+                            proc_owned.port_rights,
                         ));
                         finished.push(FinishedUserProcess {
                             pid: proc_owned.pid,
@@ -1679,6 +1855,10 @@ fn collect_finished_and_stdout(
                     }
                     UserTaskState::Faulted(fault) => {
                         let proc_owned = slot.take().unwrap();
+                        if proc_owned.parent_pid != 0 {
+                            new_wait_entries.push((proc_owned.parent_pid, proc_owned.pid, -11));
+                        }
+                        dead_parent_pids.push(proc_owned.pid);
                         deferred_cleanups.push((
                             proc_owned.pid,
                             proc_owned.pml4,
@@ -1687,6 +1867,7 @@ fn collect_finished_and_stdout(
                             proc_owned.has_gui_window,
                             proc_owned.shm_attachments,
                             proc_owned.owned_shm_ids,
+                            proc_owned.port_rights,
                         ));
                         finished.push(FinishedUserProcess {
                             pid: proc_owned.pid,
@@ -1704,9 +1885,20 @@ fn collect_finished_and_stdout(
                 }
             }
         }
+
+        if !dead_parent_pids.is_empty() {
+            sched
+                .exited_for_wait
+                .retain(|&(ppid, _, _)| !dead_parent_pids.contains(&ppid));
+        }
+        for (ppid, cpid, code) in new_wait_entries {
+            if sched.find_slot_by_pid(ppid).is_some() {
+                sched.exited_for_wait.push((ppid, cpid, code));
+            }
+        }
     });
 
-    for (pid, pml4, img_opt, fds, had_gui, shm_atts, owned_shms) in deferred_cleanups {
+    for (pid, pml4, img_opt, fds, had_gui, shm_atts, owned_shms, port_rights) in deferred_cleanups {
         close_fd_list(fds);
         cleanup_process_ipc_and_windows(
             pid,
@@ -1714,6 +1906,7 @@ fn collect_finished_and_stdout(
             had_gui,
             shm_atts,
             owned_shms,
+            port_rights,
             mapping,
             allocator,
         );
@@ -1870,7 +2063,12 @@ pub fn kill_user_process(
     let removed = without_interrupts(|| {
         let mut sched = USER_SCHED.lock();
         let idx = sched.find_slot_by_pid(pid)?;
-        sched.slots[idx].take()
+        let proc = sched.slots[idx].take()?;
+        sched.exited_for_wait.retain(|&(ppid, _, _)| ppid != pid);
+        if proc.parent_pid != 0 && sched.find_slot_by_pid(proc.parent_pid).is_some() {
+            sched.exited_for_wait.push((proc.parent_pid, pid, -9));
+        }
+        Some(proc)
     });
 
     let Some(mut proc) = removed else {
@@ -1884,6 +2082,7 @@ pub fn kill_user_process(
         proc.has_gui_window,
         proc.shm_attachments,
         proc.owned_shm_ids,
+        proc.port_rights,
         mapping,
         allocator,
     );
@@ -1927,10 +2126,10 @@ pub fn snapshot_processes() -> Vec<UserProcSnapshot> {
                     WaitReason::NetJob { .. } => "WaitNet",
                     WaitReason::PipeRead { .. } => "WaitPipe",
                     WaitReason::WaitPid { .. } => "WaitPid",
+                    WaitReason::MachPortRecv { .. } => "WaitMach",
                 },
                 UserTaskState::Exited(_) => "Exited",
                 UserTaskState::Faulted(_) => "Faulted",
-                UserTaskState::Zombie(_) => "Zombie",
             };
             out.push(UserProcSnapshot {
                 pid: proc.pid,
@@ -1973,123 +2172,1025 @@ pub fn dump_console_fault_tag(console: &mut Console<'_>, ok: bool) {
     console.write(if ok { "OK\n" } else { "LEAK\n" }, if ok { GREEN } else { RED });
 }
 
-fn resolve_cow_page_for_slot(
-    slot_idx: usize,
-    page_vaddr: u64,
-    vma: VmRegion,
+pub fn fork_current_process(
+    parent_ctx: UserCpuContext,
     mapping: &PhysicalMemoryMapping,
     allocator: &mut PhysicalFrameAllocator<'_>,
-) -> bool {
-    if !vma.writable || vma.kind == VmRegionKind::SharedMem || vma.kind == VmRegionKind::StackGuard {
-        return false;
+) -> i64 {
+    if active_count() >= MAX_USER_PROCS {
+        return -11; // EAGAIN
     }
-    let Some(pml4) = without_interrupts(|| USER_SCHED.lock().slots[slot_idx].as_ref().map(|p| p.pml4)) else {
-        return false;
+
+    let snapshot = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        let idx = sched.current_slot?;
+        let p = sched.slots[idx].as_ref()?;
+        let img = p.image.as_ref()?;
+        Some((
+            p.pid,
+            p.name.clone(),
+            p.pml4,
+            p.fpu_state,
+            p.weight,
+            p.entry_point,
+            p.bytes_loaded,
+            p.brk_base,
+            p.brk_current,
+            p.mmap_next,
+            p.shm_attach_next,
+            p.shm_attachments.clone(),
+            p.dynamic_bytes,
+            p.vmas.clone(),
+            p.fds.clone(),
+            p.port_rights.clone(),
+            p.next_port_name,
+            img.user_rsp,
+            img.initial_argc,
+            img.initial_argv,
+            img.load_regions.clone(),
+            img.load_segment_count,
+        ))
+    });
+
+    let Some((
+        parent_pid,
+        parent_name,
+        parent_pml4,
+        parent_fpu,
+        parent_weight,
+        entry_point,
+        bytes_loaded,
+        brk_base,
+        brk_current,
+        mmap_next,
+        shm_attach_next,
+        shm_attachments,
+        dynamic_bytes,
+        vmas,
+        mut child_fds,
+        parent_port_rights,
+        next_port_name,
+        user_rsp,
+        initial_argc,
+        initial_argv,
+        load_regions,
+        load_segment_count,
+    )) = snapshot
+    else {
+        return -22;
     };
-    let Ok(virt) = VirtAddr::try_new(page_vaddr) else { return false; };
-    let Some(trans) = mapping.translate_virtual_address_in(pml4, virt) else { return false; };
-    if trans.page_size != PAGE_SIZE || trans.flags.contains(PageTableFlags::WRITABLE) {
-        return false;
-    }
-    let old_phys = trans.physical_address & !(PAGE_SIZE - 1);
-    if crate::memory::frame_ref_count(old_phys) <= 1 {
-        let mut fl = trans.flags;
-        fl.remove(crate::memory::vmm::COW_PAGE_FLAG);
-        fl.insert(PageTableFlags::WRITABLE);
-        if !mapping.update_page_flags_in(pml4, virt, fl) { return false; }
-    } else {
-        let Some(nf) = allocator.allocate_frame() else { return false; };
-        let (Some(src), Some(dst)) = (mapping.translate_frame(old_phys), mapping.translate_frame(nf)) else {
-            allocator.deallocate_frame(nf);
-            return false;
+
+    let child_pid = {
+        let mut pm = PROCESS_MANAGER.lock();
+        match pm.create_process(mapping, allocator) {
+            Ok(pid) => pid,
+            Err(_) => return -12,
+        }
+    };
+
+    let child_pml4 = {
+        let mut pm = PROCESS_MANAGER.lock();
+        let Some(p) = pm.get_process(child_pid) else {
+            return -12;
         };
-        unsafe { core::ptr::copy_nonoverlapping(src.as_u64() as *const u8, dst.as_u64() as *mut u8, PAGE_SIZE as usize); }
-        let mut fl = trans.flags;
-        fl.remove(crate::memory::vmm::COW_PAGE_FLAG);
-        fl.insert(PageTableFlags::WRITABLE);
-        let _ = mapping.unmap_page_in(pml4, virt);
-        if mapping.map_page_in(allocator, pml4, virt, nf, fl).is_err() {
-            allocator.deallocate_frame(nf);
-            return false;
-        }
-        allocator.deallocate_frame(old_phys);
-    }
-    unsafe { asm!("invlpg [{}]", in(reg) page_vaddr, options(nostack, preserves_flags)); }
-    crate::arch::smp::tlb_shootdown_page(page_vaddr);
-    true
-}
+        let pml4 = p.address_space().pml4_physical_address();
+        pm.set_process_state(child_pid, ProcessState::Ready);
+        pml4
+    };
 
-pub fn sys_waitpid_current(target_pid: isize, status_ptr: u64, options: usize, parent_ctx: UserCpuContext, mapping: &PhysicalMemoryMapping, allocator: &mut PhysicalFrameAllocator<'_>) -> i64 {
-    let res = without_interrupts(|| {
-        let mut sc = USER_SCHED.lock();
-        let ppid = sc.slots[sc.current_slot?].as_ref()?.pid;
-        let mut has_child = false;
-        let mut zidx = None;
-        for (i, s) in sc.slots.iter().enumerate() {
-            let Some(c) = s.as_ref() else { continue; };
-            if c.parent_pid != ppid || (target_pid > 0 && c.pid != target_pid as usize) { continue; }
-            has_child = true;
-            if matches!(c.state, UserTaskState::Zombie(_)) { zidx = Some(i); break; }
-        }
-        if let Some(zi) = zidx {
-            let z = sc.slots[zi].take().unwrap();
-            let code = match z.state { UserTaskState::Zombie(c) => c, _ => 0 };
-            Some(Ok((z.pid, code, z.pml4, z.image, z.fds, z.has_gui_window, z.shm_attachments, z.owned_shm_ids, z.vmas)))
-        } else if !has_child { Some(Err(-10)) } else { None }
-    });
-    match res {
-        Some(Err(e)) => e,
-        Some(Ok((cpid, code, cpml4, cimg, cfds, gui, shms, owned, cvmas))) => {
-            close_fd_list(cfds);
-            cleanup_process_ipc_and_windows(cpid, cpml4, gui, shms, owned, mapping, allocator);
-            if let Some(mut img) = cimg { elf::cleanup_loaded_image(&mut img, cpml4, mapping, allocator); } else { crate::memory::address_space::AddressSpace::destroy_forked_user_space(cpml4, &cvmas, mapping, allocator); }
-            if status_ptr != 0 {
-                let st: i32 = ((code as i32) & 0xFF) << 8;
-                if syscall::copy_to_user_bytes_in(mapping, Some(allocator), syscall::active_user_pml4_raw(), status_ptr, &st.to_le_bytes()).is_err() { return -14; }
+    let shm_ranges: Vec<(u64, u64)> = shm_attachments
+        .iter()
+        .map(|a| (a.vaddr, a.vaddr + (a.page_count as u64) * PAGE_SIZE))
+        .collect();
+
+    let mut cloned_pages = match mapping.clone_user_cow_tables(parent_pml4, child_pml4, allocator, &shm_ranges) {
+        Ok(pages) => pages,
+        Err(_) => {
+            let mut pm = PROCESS_MANAGER.lock();
+            unsafe {
+                let _ = pm.terminate_process(child_pid, mapping, allocator);
             }
-            cpid as i64
+            let _ = pm.reap_process(child_pid);
+            return -12;
         }
-        None => {
-            if (options & 1) != 0 { return 0; }
-            unsafe { suspend_current_from_syscall(parent_ctx, UserTaskState::Waiting(WaitReason::WaitPid { target_pid, status_ptr })); }
-        }
-    }
-}
+    };
 
-pub fn sys_fork_current(parent_ctx: UserCpuContext, mapping: &PhysicalMemoryMapping, allocator: &mut PhysicalFrameAllocator<'_>) -> i64 {
-    let snap = without_interrupts(|| {
-        let sc = USER_SCHED.lock();
-        let p = sc.slots[sc.current_slot?].as_ref()?;
-        let _ = sc.slots.iter().position(|s| s.is_none())?;
-        Some((p.pid, p.name.clone(), p.pml4, p.fpu_state, p.weight, p.entry_point, p.pages_mapped, p.bytes_loaded, p.brk_base, p.brk_current, p.mmap_next, p.shm_attach_next, p.shm_attachments.clone(), p.dynamic_bytes, p.vmas.clone(), p.fds.clone()))
-    });
-    let Some((ppid, name, ppml4, fpu, weight, entry, pages, bytes, brk_b, brk_c, mmap_n, shm_n, shms, dyn_b, vmas, fds)) = snap else { return -11; };
-    let Some(cspace) = crate::memory::address_space::AddressSpace::new(mapping, allocator) else { return -12; };
-    let cpml4 = cspace.pml4_physical_address();
-    core::mem::forget(cspace);
-    if mapping.clone_user_pages_cow(allocator, ppml4, cpml4, &vmas).is_err() {
-        crate::memory::address_space::AddressSpace::destroy_forked_user_space(cpml4, &vmas, mapping, allocator);
+    // Re-attach shared memory regions directly without CoW duplication
+    let mut attached_shms: Vec<ShmAttachment> = Vec::with_capacity(shm_attachments.len());
+    let mut shm_pages_mapped = 0usize;
+    let mut shm_failed = false;
+
+    for att in &shm_attachments {
+        let Some(frames) = ipc::retain_shm_frames(att.shm_id) else {
+            shm_failed = true;
+            break;
+        };
+        let writable = vmas
+            .iter()
+            .find(|r| r.kind == VmRegionKind::SharedMem && r.start == att.vaddr)
+            .map(|r| r.writable)
+            .unwrap_or(true);
+        let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if writable {
+            flags |= PageTableFlags::WRITABLE;
+        }
+        if syscall::nxe_enabled() {
+            flags |= PageTableFlags::NO_EXECUTE;
+        }
+
+        let mut mapped_here = 0usize;
+        for (i, &frame) in frames.iter().enumerate() {
+            let va = att.vaddr + (i as u64) * PAGE_SIZE;
+            let Ok(virt) = VirtAddr::try_new(va) else {
+                shm_failed = true;
+                break;
+            };
+            if mapping.map_page_in(allocator, child_pml4, virt, frame, flags).is_err() {
+                shm_failed = true;
+                break;
+            }
+            mapped_here += 1;
+        }
+        if shm_failed {
+            for i in 0..mapped_here {
+                if let Ok(virt) = VirtAddr::try_new(att.vaddr + (i as u64) * PAGE_SIZE) {
+                    let _ = mapping.unmap_page_in(child_pml4, virt);
+                }
+            }
+            ipc::release_shm(att.shm_id, allocator);
+            break;
+        }
+        shm_pages_mapped += att.page_count;
+        attached_shms.push(*att);
+    }
+
+    if shm_failed {
+        for att in attached_shms {
+            for i in 0..att.page_count {
+                if let Ok(virt) = VirtAddr::try_new(att.vaddr + (i as u64) * PAGE_SIZE) {
+                    let _ = mapping.unmap_page_in(child_pml4, virt);
+                }
+            }
+            ipc::release_shm(att.shm_id, allocator);
+        }
+        for (va, fr) in cloned_pages.drain(..) {
+            if let Ok(virt) = VirtAddr::try_new(va) {
+                let _ = mapping.unmap_page_in(child_pml4, virt);
+            }
+            let _ = allocator.deallocate_frame(fr);
+        }
+        let mut pm = PROCESS_MANAGER.lock();
+        unsafe {
+            let _ = pm.terminate_process(child_pid, mapping, allocator);
+        }
+        let _ = pm.reap_process(child_pid);
         return -12;
     }
-    for e in fds.iter().flatten() {
-        match e { FdEntry::PipeRead { pipe_id } => super::ipc::retain_pipe_end(*pipe_id, false), FdEntry::PipeWrite { pipe_id } => super::ipc::retain_pipe_end(*pipe_id, true), _ => {} }
+
+    // Inherit file descriptors: pipes retain refcount, single-owner sockets are not duplicated
+    for slot in &mut child_fds {
+        match slot {
+            Some(FdEntry::PipeRead { pipe_id }) => ipc::retain_pipe_end(*pipe_id, false),
+            Some(FdEntry::PipeWrite { pipe_id }) => ipc::retain_pipe_end(*pipe_id, true),
+            Some(FdEntry::Socket(_)) => *slot = None,
+            _ => {}
+        }
     }
-    for att in &shms { let _ = super::ipc::retain_shm_frames(att.shm_id); }
-    crate::arch::smp::tlb_shootdown_page(u64::MAX);
-    let mut cctx = parent_ctx; cctx.rax = 0;
-    without_interrupts(|| {
-        let mut sc = USER_SCHED.lock();
-        let Some(si) = sc.slots.iter().position(|s| s.is_none()) else { return -11; };
-        static NEXT_FORK_PID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1000);
-        let cpid = NEXT_FORK_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let vr = sc.min_runnable_vruntime();
-        sc.slots[si] = Some(UserProcessSlot {
-            pid: cpid, parent_pid: ppid, name, pml4: cpml4, ctx: cctx, fpu_state: fpu, state: UserTaskState::Ready,
-            cpu_ms: 0, vruntime_ms: vr, weight, preempt_count: 0, lazy_faults: 0, syscalls_served: 0,
-            entry_point: entry, pages_mapped: pages, bytes_loaded: bytes, brk_base: brk_b, brk_current: brk_c,
-            mmap_next: mmap_n, shm_attach_next: shm_n, shm_attachments: shms, owned_shm_ids: Vec::new(),
-            dynamic_bytes: dyn_b, vmas, image: None, fds, stdout_buf: String::new(), has_gui_window: false,
+
+    // Inherit Mach IPC rights: Receive stays parent-only; Send (and also_send from allocate) is inherited
+    let mut child_port_rights = Vec::new();
+    for entry in &parent_port_rights {
+        match entry.right {
+            PortRightKind::Receive => {
+                if entry.also_send && ipc::mach_retain_right(entry.port_id, PortRightKind::Send, false) {
+                    child_port_rights.push(PortRightEntry {
+                        name: entry.name,
+                        port_id: entry.port_id,
+                        right: PortRightKind::Send,
+                        also_send: false,
+                    });
+                }
+            }
+            PortRightKind::Send => {
+                if ipc::mach_retain_right(entry.port_id, PortRightKind::Send, false) {
+                    child_port_rights.push(PortRightEntry {
+                        name: entry.name,
+                        port_id: entry.port_id,
+                        right: PortRightKind::Send,
+                        also_send: false,
+                    });
+                }
+            }
+            PortRightKind::SendOnce => {}
+        }
+    }
+
+    let mut child_ctx = parent_ctx;
+    child_ctx.rax = 0;
+
+    let pages_mapped = cloned_pages.len() + shm_pages_mapped;
+    let child_image = LoadedElfImage {
+        entry_point,
+        user_rsp,
+        brk_base,
+        initial_argc,
+        initial_argv,
+        mapped_pages: cloned_pages,
+        load_regions,
+        load_segment_count,
+        total_bytes_loaded: bytes_loaded,
+    };
+
+    let inserted = without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        let start_vr = sched.min_runnable_vruntime();
+        let Some(empty_idx) = sched.slots.iter().position(|s| s.is_none()) else {
+            return Err(child_image);
+        };
+        sched.slots[empty_idx] = Some(UserProcessSlot {
+            pid: child_pid,
+            parent_pid,
+            name: format!("{}[fork]", parent_name),
+            pml4: child_pml4,
+            ctx: child_ctx,
+            fpu_state: parent_fpu,
+            state: UserTaskState::Ready,
+            cpu_ms: 0,
+            vruntime_ms: start_vr,
+            weight: parent_weight,
+            preempt_count: 0,
+            lazy_faults: 0,
+            syscalls_served: 0,
+            entry_point,
+            pages_mapped,
+            bytes_loaded,
+            brk_base,
+            brk_current,
+            mmap_next,
+            shm_attach_next,
+            shm_attachments: attached_shms.clone(),
+            owned_shm_ids: Vec::new(),
+            dynamic_bytes,
+            vmas,
+            image: Some(child_image),
+            fds: child_fds.clone(),
+            port_rights: child_port_rights.clone(),
+            next_port_name,
+            stdout_buf: String::new(),
+            has_gui_window: false,
         });
-        cpid as i64
-    })
+        Ok(())
+    });
+
+    if let Err(mut returned_img) = inserted {
+        for pr in child_port_rights {
+            ipc::mach_release_port_id_right(pr.port_id, pr.right, pr.also_send, allocator);
+        }
+        close_fd_list(child_fds);
+        for att in attached_shms {
+            for i in 0..att.page_count {
+                if let Ok(virt) = VirtAddr::try_new(att.vaddr + (i as u64) * PAGE_SIZE) {
+                    let _ = mapping.unmap_page_in(child_pml4, virt);
+                }
+            }
+            ipc::release_shm(att.shm_id, allocator);
+        }
+        elf::cleanup_loaded_image(&mut returned_img, child_pml4, mapping, allocator);
+        let mut pm = PROCESS_MANAGER.lock();
+        unsafe {
+            let _ = pm.terminate_process(child_pid, mapping, allocator);
+        }
+        let _ = pm.reap_process(child_pid);
+        return -11;
+    }
+
+    klog::log_fmt(
+        KLogLevel::Mm,
+        "fork",
+        format_args!(
+            "PID {} forked -> child PID {} ({} CoW pages)",
+            parent_pid, child_pid, pages_mapped
+        ),
+    );
+    child_pid as i64
 }
+
+pub fn sys_waitpid_current(
+    target_pid: isize,
+    status_ptr: u64,
+    options: u64,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> Result<i64, WaitReason> {
+    enum PollResult {
+        Reaped {
+            pml4: u64,
+            cpid: usize,
+            code: i64,
+        },
+        Block,
+        Err(i64),
+    }
+
+    let check = without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        let Some(idx) = sched.current_slot else {
+            return PollResult::Err(-22);
+        };
+        let Some(ref proc) = sched.slots[idx] else {
+            return PollResult::Err(-22);
+        };
+        let my_pid = proc.pid;
+        let my_pml4 = proc.pml4;
+
+        if let Some(pos) = sched.exited_for_wait.iter().position(|&(ppid, cpid, _)| {
+            ppid == my_pid && (target_pid <= 0 || cpid == target_pid as usize)
+        }) {
+            let (_ppid, cpid, code) = sched.exited_for_wait.swap_remove(pos);
+            return PollResult::Reaped {
+                pml4: my_pml4,
+                cpid,
+                code,
+            };
+        }
+
+        if !sched.has_live_child_matching(my_pid, target_pid) {
+            return PollResult::Err(-10); // ECHILD
+        }
+        if (options & 1) != 0 {
+            return PollResult::Err(0); // WNOHANG
+        }
+        PollResult::Block
+    });
+
+    match check {
+        PollResult::Reaped { pml4, cpid, code } => {
+            if status_ptr != 0 {
+                let bytes = (code as i32).to_le_bytes();
+                if syscall::copy_to_user_bytes_in(mapping, Some(allocator), pml4, status_ptr, &bytes)
+                    .is_err()
+                {
+                    return Ok(-14);
+                }
+            }
+            Ok(cpid as i64)
+        }
+        PollResult::Err(e) => Ok(e),
+        PollResult::Block => Err(WaitReason::WaitPid {
+            target_pid,
+            status_ptr,
+        }),
+    }
+}
+
+pub fn sys_mach_port_allocate_current() -> i64 {
+    let has_slot = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        sched
+            .current_slot
+            .and_then(|idx| sched.slots[idx].as_ref())
+            .is_some()
+    });
+    if !has_slot {
+        return -22;
+    }
+    let Ok(port_id) = ipc::mach_port_allocate() else {
+        return -12;
+    };
+    let res = without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        let Some(idx) = sched.current_slot else {
+            return None;
+        };
+        let Some(ref mut proc) = sched.slots[idx] else {
+            return None;
+        };
+        Some(proc.alloc_port_right(port_id, PortRightKind::Receive, true))
+    });
+    match res {
+        Some(name) => name as i64,
+        None => -22,
+    }
+}
+
+pub fn sys_mach_port_deallocate_current(
+    port_name: MachPortName,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> i64 {
+    if port_name == MACH_PORT_NULL {
+        return -22;
+    }
+    let taken = without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        let idx = sched.current_slot?;
+        let proc = sched.slots[idx].as_mut()?;
+        proc.take_port_right(port_name)
+    });
+    let Some(entry) = taken else {
+        return -22; // EINVAL
+    };
+    ipc::mach_release_port_id_right(entry.port_id, entry.right, entry.also_send, allocator);
+    0
+}
+
+pub fn sys_bootstrap_register_current(
+    name: &str,
+    port_name: MachPortName,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> i64 {
+    let port_id = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        let idx = sched.current_slot?;
+        let proc = sched.slots[idx].as_ref()?;
+        let entry = proc.find_port_right(port_name)?;
+        match entry.right {
+            PortRightKind::Send => Some(entry.port_id),
+            PortRightKind::Receive if entry.also_send => Some(entry.port_id),
+            _ => None,
+        }
+    });
+    let Some(pid_port) = port_id else {
+        return -22;
+    };
+    match ipc::bootstrap_register_port(name, pid_port, allocator) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+pub fn sys_bootstrap_lookup_current(
+    name: &str,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> i64 {
+    let port_id = match ipc::bootstrap_lookup_port(name) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    let installed = without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        let idx = sched.current_slot?;
+        let proc = sched.slots[idx].as_mut()?;
+        Some(proc.alloc_port_right(port_id, PortRightKind::Send, false))
+    });
+    match installed {
+        Some(name_handle) => name_handle as i64,
+        None => {
+            ipc::mach_release_port_id_right(port_id, PortRightKind::Send, false, allocator);
+            -22
+        }
+    }
+}
+
+fn deliver_mach_msg_to_slot(
+    slot_idx: usize,
+    expected_pid: usize,
+    pml4: u64,
+    port_id: u64,
+    rcv_name: MachPortName,
+    mut msg: MachKernelMsg,
+    msg_ptr: u64,
+    rcv_cap: usize,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> i64 {
+    let hdr_size = core::mem::size_of::<MachMsgHeader>();
+    let ool_size = core::mem::size_of::<MachMsgOolDesc>();
+    let has_ool = msg.ool.is_some();
+    let total_needed = hdr_size + if has_ool { ool_size } else { 0 } + msg.inline_data.len();
+
+    if rcv_cap < total_needed {
+        if let Err(returned) = ipc::mach_requeue_front_msg(port_id, msg) {
+            ipc::mach_drop_msg_resources(returned, allocator);
+        }
+        return -12;
+    }
+
+    if syscall::validate_user_slice_in(mapping, Some(allocator), pml4, msg_ptr, total_needed, true)
+        .is_err()
+    {
+        ipc::mach_drop_msg_resources(msg, allocator);
+        return -14;
+    }
+
+    let mut out_ool_desc = MachMsgOolDesc::default();
+    if let Some(ool) = msg.ool.take() {
+        let page_count = ool.frames.len();
+        let aligned_bytes = page_count * (PAGE_SIZE as usize);
+        let reservation = without_interrupts(|| {
+            let mut sched = USER_SCHED.lock();
+            let proc = sched.slots[slot_idx].as_mut()?;
+            if proc.pid != expected_pid {
+                return None;
+            }
+            if proc.dynamic_bytes + aligned_bytes > MAX_DYNAMIC_USER_BYTES {
+                return None;
+            }
+            let base = proc.mmap_next;
+            let next = base.checked_add(aligned_bytes as u64)?;
+            if next >= USER_MMAP_LIMIT || next >= USER_ADDR_LIMIT {
+                return None;
+            }
+            proc.mmap_next = next;
+            Some(base)
+        });
+
+        let Some(map_base) = reservation else {
+            for fr in ool.frames {
+                let _ = allocator.deallocate_frame(fr);
+            }
+            if msg.reply_port_id != 0 {
+                if let Some(rr) = msg.reply_right {
+                    ipc::mach_release_port_id_right(msg.reply_port_id, rr, false, allocator);
+                }
+            }
+            return -12;
+        };
+
+        let mut base_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if syscall::nxe_enabled() {
+            base_flags |= PageTableFlags::NO_EXECUTE;
+        }
+
+        let mut mapped_ok = 0usize;
+        let mut map_err = false;
+        for (i, &frame) in ool.frames.iter().enumerate() {
+            let va = map_base + (i as u64) * PAGE_SIZE;
+            let Ok(virt) = VirtAddr::try_new(va) else {
+                map_err = true;
+                break;
+            };
+            let flags = if allocator.frame_refcount(frame) > 1 {
+                base_flags | COW_FLAG
+            } else {
+                base_flags | PageTableFlags::WRITABLE
+            };
+            if mapping.map_page_in(allocator, pml4, virt, frame, flags).is_err() {
+                map_err = true;
+                break;
+            }
+            mapped_ok += 1;
+        }
+
+        if map_err {
+            for i in 0..mapped_ok {
+                if let Ok(virt) = VirtAddr::try_new(map_base + (i as u64) * PAGE_SIZE) {
+                    let _ = mapping.unmap_page_in(pml4, virt);
+                }
+            }
+            for fr in ool.frames {
+                let _ = allocator.deallocate_frame(fr);
+            }
+            if msg.reply_port_id != 0 {
+                if let Some(rr) = msg.reply_right {
+                    ipc::mach_release_port_id_right(msg.reply_port_id, rr, false, allocator);
+                }
+            }
+            return -12;
+        }
+
+        let frames_len = ool.frames.len();
+        without_interrupts(|| {
+            let mut sched = USER_SCHED.lock();
+            if let Some(ref mut proc) = sched.slots[slot_idx] {
+                if proc.pid == expected_pid {
+                    if let Some(ref mut img) = proc.image {
+                        for (i, frame) in ool.frames.into_iter().enumerate() {
+                            img.mapped_pages.push((map_base + (i as u64) * PAGE_SIZE, frame));
+                        }
+                        proc.pages_mapped = img.mapped_pages.len();
+                    }
+                    proc.dynamic_bytes = proc.dynamic_bytes.saturating_add(aligned_bytes);
+                    proc.vmas.push(VmRegion {
+                        start: map_base,
+                        end: map_base + (frames_len as u64) * PAGE_SIZE,
+                        writable: true,
+                        executable: false,
+                        kind: VmRegionKind::LazyMmap,
+                    });
+                }
+            }
+        });
+
+        out_ool_desc = MachMsgOolDesc {
+            addr: map_base,
+            size: ool.size_bytes,
+            deallocate: false,
+            reserved: [0; 7],
+        };
+    }
+
+    let local_reply_name = if msg.reply_port_id != 0 {
+        if let Some(rr) = msg.reply_right {
+            let name_opt = without_interrupts(|| {
+                let mut sched = USER_SCHED.lock();
+                let proc = sched.slots[slot_idx].as_mut()?;
+                if proc.pid != expected_pid {
+                    return None;
+                }
+                Some(proc.alloc_port_right(msg.reply_port_id, rr, false))
+            });
+            match name_opt {
+                Some(n) => n,
+                None => {
+                    ipc::mach_release_port_id_right(msg.reply_port_id, rr, false, allocator);
+                    MACH_PORT_NULL
+                }
+            }
+        } else {
+            MACH_PORT_NULL
+        }
+    } else {
+        MACH_PORT_NULL
+    };
+
+    let out_hdr = MachMsgHeader {
+        bits: msg.bits,
+        size: total_needed as u32,
+        remote_port: rcv_name,
+        local_port: local_reply_name,
+        id: msg.id,
+        reserved: 0,
+    };
+
+    let mut wire = alloc::vec![0u8; total_needed];
+    unsafe {
+        let hdr_bytes = core::slice::from_raw_parts(
+            (&out_hdr as *const MachMsgHeader) as *const u8,
+            hdr_size,
+        );
+        wire[..hdr_size].copy_from_slice(hdr_bytes);
+        let mut cursor = hdr_size;
+        if has_ool {
+            let ool_bytes = core::slice::from_raw_parts(
+                (&out_ool_desc as *const MachMsgOolDesc) as *const u8,
+                ool_size,
+            );
+            wire[cursor..cursor + ool_size].copy_from_slice(ool_bytes);
+            cursor += ool_size;
+        }
+        if !msg.inline_data.is_empty() {
+            wire[cursor..cursor + msg.inline_data.len()].copy_from_slice(&msg.inline_data);
+        }
+    }
+
+    if syscall::copy_to_user_bytes_in(mapping, Some(allocator), pml4, msg_ptr, &wire).is_err() {
+        return -14;
+    }
+    0
+}
+
+pub fn sys_mach_msg_current(
+    msg_ptr: u64,
+    option: u32,
+    send_size: usize,
+    rcv_size: usize,
+    rcv_name: MachPortName,
+    timeout_ms: u64,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> Result<i64, WaitReason> {
+    let caller = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        let idx = sched.current_slot?;
+        let p = sched.slots[idx].as_ref()?;
+        Some((idx, p.pid, p.pml4))
+    });
+    let Some((slot_idx, my_pid, pml4)) = caller else {
+        return Ok(-22);
+    };
+
+    if (option & MACH_SEND_MSG) != 0 {
+        let hdr_size = core::mem::size_of::<MachMsgHeader>();
+        let ool_size = core::mem::size_of::<MachMsgOolDesc>();
+        let max_wire = hdr_size + ool_size + ipc::MAX_MACH_INLINE_BYTES;
+        if send_size < hdr_size || send_size > max_wire {
+            return Ok(-22);
+        }
+
+        let mut wire = alloc::vec![0u8; send_size];
+        if syscall::copy_from_user_bytes_in(mapping, Some(allocator), pml4, msg_ptr, &mut wire)
+            .is_err()
+        {
+            return Ok(-14);
+        }
+
+        let hdr: MachMsgHeader =
+            unsafe { core::ptr::read_unaligned(wire.as_ptr() as *const MachMsgHeader) };
+        let declared = hdr.size as usize;
+        if declared < hdr_size || declared > send_size {
+            return Ok(-22);
+        }
+
+        let is_complex = (hdr.bits & MACH_MSGH_BITS_COMPLEX) != 0;
+        let inline_offset = if is_complex {
+            if declared < hdr_size + ool_size {
+                return Ok(-22);
+            }
+            hdr_size + ool_size
+        } else {
+            hdr_size
+        };
+        let inline_len = declared - inline_offset;
+        if inline_len > ipc::MAX_MACH_INLINE_BYTES {
+            return Ok(-22);
+        }
+
+        // Resolve destination remote_port and local reply_port rights
+        let remote_disp = hdr.bits & MACH_MSGH_BITS_REMOTE_MASK;
+        let local_disp = (hdr.bits & MACH_MSGH_BITS_LOCAL_MASK) >> 8;
+
+        let resolved = without_interrupts(|| {
+            let sched = USER_SCHED.lock();
+            let p = sched.slots[slot_idx].as_ref()?;
+            let remote_entry = p.find_port_right(hdr.remote_port)?;
+            let consume_remote_so = match remote_entry.right {
+                PortRightKind::Send => remote_disp == MACH_MSG_TYPE_MOVE_SEND,
+                PortRightKind::Receive if remote_entry.also_send => false,
+                PortRightKind::SendOnce => {
+                    remote_disp == 0 || remote_disp == MACH_MSG_TYPE_MOVE_SEND_ONCE
+                }
+                _ => return None,
+            };
+
+            let reply_info = if hdr.local_port != MACH_PORT_NULL {
+                let le = p.find_port_right(hdr.local_port)?;
+                let effective_disp = if local_disp == 0 {
+                    match le.right {
+                        PortRightKind::Receive => MACH_MSG_TYPE_MAKE_SEND_ONCE,
+                        PortRightKind::Send => MACH_MSG_TYPE_COPY_SEND,
+                        PortRightKind::SendOnce => MACH_MSG_TYPE_MOVE_SEND_ONCE,
+                    }
+                } else {
+                    local_disp
+                };
+                match effective_disp {
+                    MACH_MSG_TYPE_MAKE_SEND => {
+                        if le.right != PortRightKind::Receive {
+                            return None;
+                        }
+                        Some((le.port_id, PortRightKind::Send, false, false))
+                    }
+                    MACH_MSG_TYPE_MAKE_SEND_ONCE => {
+                        if le.right != PortRightKind::Receive {
+                            return None;
+                        }
+                        Some((le.port_id, PortRightKind::SendOnce, false, false))
+                    }
+                    MACH_MSG_TYPE_COPY_SEND => {
+                        if !(le.right == PortRightKind::Send
+                            || (le.right == PortRightKind::Receive && le.also_send))
+                        {
+                            return None;
+                        }
+                        Some((le.port_id, PortRightKind::Send, false, false))
+                    }
+                    MACH_MSG_TYPE_MOVE_SEND => {
+                        if le.right != PortRightKind::Send {
+                            return None;
+                        }
+                        Some((le.port_id, PortRightKind::Send, true, false))
+                    }
+                    MACH_MSG_TYPE_MOVE_SEND_ONCE => {
+                        if le.right != PortRightKind::SendOnce {
+                            return None;
+                        }
+                        Some((le.port_id, PortRightKind::SendOnce, false, true))
+                    }
+                    _ => return None,
+                }
+            } else {
+                None
+            };
+
+            Some((remote_entry.port_id, remote_entry.right, consume_remote_so, reply_info))
+        });
+
+        let Some((target_port_id, remote_kind, remove_remote_after, reply_info)) = resolved else {
+            return Ok(-22);
+        };
+
+        // Parse and zero-copy retain/unmap OOL pages if complex message
+        let mut ool_payload: Option<MachOolPayload> = None;
+        if is_complex {
+            let desc_bytes = &wire[hdr_size..hdr_size + ool_size];
+            let ool_addr = u64::from_le_bytes(desc_bytes[0..8].try_into().unwrap());
+            let ool_len = u64::from_le_bytes(desc_bytes[8..16].try_into().unwrap());
+            let deallocate = desc_bytes[16] != 0;
+
+            if ool_len > 0 {
+                if ool_addr == 0 || (ool_addr & (PAGE_SIZE - 1)) != 0 {
+                    return Ok(-22);
+                }
+                let page_count = ((ool_len as usize) + PAGE_SIZE as usize - 1) / (PAGE_SIZE as usize);
+                if page_count == 0 || page_count > ipc::MAX_MACH_OOL_FRAMES {
+                    return Ok(-12);
+                }
+                let Some(ool_end) = ool_addr.checked_add((page_count as u64) * PAGE_SIZE) else {
+                    return Ok(-22);
+                };
+                if ool_end > USER_ADDR_LIMIT {
+                    return Ok(-14);
+                }
+
+                if ensure_user_pages_committed(
+                    pml4,
+                    ool_addr,
+                    ool_end - PAGE_SIZE,
+                    false,
+                    mapping,
+                    Some(allocator),
+                )
+                .is_err()
+                {
+                    return Ok(-14);
+                }
+
+                let mut frames = Vec::with_capacity(page_count);
+                for i in 0..page_count {
+                    let va = ool_addr + (i as u64) * PAGE_SIZE;
+                    let Ok(virt) = VirtAddr::try_new(va) else {
+                        for fr in frames {
+                            let _ = allocator.deallocate_frame(fr);
+                        }
+                        return Ok(-14);
+                    };
+                    let Some(trans) = mapping.translate_virtual_address_in(pml4, virt) else {
+                        for fr in frames {
+                            let _ = allocator.deallocate_frame(fr);
+                        }
+                        return Ok(-14);
+                    };
+                    let phys = trans.physical_address & !(PAGE_SIZE - 1);
+
+                    if deallocate {
+                        if mapping.unmap_page_in(pml4, virt).is_err() {
+                            for fr in frames {
+                                let _ = allocator.deallocate_frame(fr);
+                            }
+                            return Ok(-14);
+                        }
+                        frames.push(phys);
+                    } else {
+                        if !crate::memory::inc_frame_ref(allocator, phys) {
+                            for fr in frames {
+                                let _ = allocator.deallocate_frame(fr);
+                            }
+                            return Ok(-12);
+                        }
+                        if trans.flags.contains(PageTableFlags::WRITABLE) {
+                            let _ = mapping.mark_page_cow_in(pml4, virt);
+                        }
+                        frames.push(phys);
+                    }
+                }
+
+                if deallocate {
+                    without_interrupts(|| {
+                        let mut sched = USER_SCHED.lock();
+                        if let Some(ref mut proc) = sched.slots[slot_idx] {
+                            let mut removed_count = 0usize;
+                            if let Some(ref mut img) = proc.image {
+                                let before = img.mapped_pages.len();
+                                img.mapped_pages
+                                    .retain(|&(va, _)| va < ool_addr || va >= ool_end);
+                                removed_count = before.saturating_sub(img.mapped_pages.len());
+                                proc.pages_mapped = img.mapped_pages.len();
+                            }
+                            proc.remove_mmap_range(ool_addr, ool_end);
+                            proc.dynamic_bytes = proc
+                                .dynamic_bytes
+                                .saturating_sub(removed_count * (PAGE_SIZE as usize));
+                        }
+                    });
+                }
+
+                ool_payload = Some(MachOolPayload {
+                    frames,
+                    size_bytes: ool_len,
+                });
+            }
+        }
+
+        // Retain non-moved reply right
+        let (reply_port_id, reply_right, move_local) = match reply_info {
+            Some((rpid, rk, mv_s, mv_so)) => {
+                if !mv_s && !mv_so && !ipc::mach_retain_right(rpid, rk, false) {
+                    if let Some(ool) = ool_payload {
+                        for fr in ool.frames {
+                            let _ = allocator.deallocate_frame(fr);
+                        }
+                    }
+                    return Ok(-32);
+                }
+                (rpid, Some(rk), mv_s || mv_so)
+            }
+            None => (0, None, false),
+        };
+
+        let kmsg = MachKernelMsg {
+            bits: hdr.bits,
+            id: hdr.id,
+            reply_port_id,
+            reply_right,
+            inline_data: wire[inline_offset..declared].to_vec(),
+            ool: ool_payload,
+        };
+
+        let consume_so_in_port = remote_kind == PortRightKind::SendOnce;
+        if let Err((err, returned_msg)) = ipc::mach_send_msg(target_port_id, consume_so_in_port, kmsg)
+        {
+            // Clean up OOL frames and reply right (unless caller still retains moved local right)
+            if let Some(ool) = returned_msg.ool {
+                for fr in ool.frames {
+                    let _ = allocator.deallocate_frame(fr);
+                }
+            }
+            if returned_msg.reply_port_id != 0 && !move_local {
+                if let Some(rr) = returned_msg.reply_right {
+                    ipc::mach_release_port_id_right(returned_msg.reply_port_id, rr, false, allocator);
+                }
+            }
+            if consume_so_in_port {
+                without_interrupts(|| {
+                    let mut sched = USER_SCHED.lock();
+                    if let Some(ref mut p) = sched.slots[slot_idx] {
+                        let _ = p.take_port_right(hdr.remote_port);
+                    }
+                });
+            }
+            return Ok(err);
+        }
+
+        // Commit local/remote MOVE consumptions after successful enqueue
+        if remove_remote_after || consume_so_in_port || move_local {
+            without_interrupts(|| {
+                let mut sched = USER_SCHED.lock();
+                if let Some(ref mut p) = sched.slots[slot_idx] {
+                    if remove_remote_after || consume_so_in_port {
+                        let _ = p.take_port_right(hdr.remote_port);
+                    }
+                    if move_local {
+                        let _ = p.take_port_right(hdr.local_port);
+                    }
+                }
+            });
+        }
+    }
+
+    if (option & MACH_RCV_MSG) == 0 {
+        return Ok(0);
+    }
+
+    let rcv_port_id = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        let p = sched.slots[slot_idx].as_ref()?;
+        let entry = p.find_port_right(rcv_name)?;
+        if entry.right == PortRightKind::Receive {
+            Some(entry.port_id)
+        } else {
+            None
+        }
+    });
+    let Some(port_id) = rcv_port_id else {
+        return Ok(-22);
+    };
+
+    if rcv_size < core::mem::size_of::<MachMsgHeader>() {
+        return Ok(-22);
+    }
+
+    match ipc::mach_try_recv_msg(port_id) {
+        Ok(msg) => Ok(deliver_mach_msg_to_slot(
+            slot_idx,
+            my_pid,
+            pml4,
+            port_id,
+            rcv_name,
+            msg,
+            msg_ptr,
+            rcv_size,
+            mapping,
+            allocator,
+        )),
+        Err(-11) => {
+            if (option & MACH_RCV_TIMEOUT) != 0 && timeout_ms == 0 {
+                return Ok(-11);
+            }
+            let wait_ms = if (option & MACH_RCV_TIMEOUT) != 0 {
+                timeout_ms.min(30_000)
+            } else {
+                10_000
+            };
+            let deadline_ms = timer::uptime_ms().saturating_add(wait_ms);
+            Err(WaitReason::MachPortRecv {
+                port_id,
+                rcv_name,
+                msg_ptr,
+                rcv_cap: rcv_size,
+                deadline_ms,
+            })
+        }
+        Err(e) => Ok(e),
+    }
+}
+

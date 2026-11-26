@@ -4,13 +4,15 @@ use super::region::PmmRegion;
 
 use crate::memory::FRAME_SIZE;
 
-pub struct DynamicPmm<R, S>
+pub struct DynamicPmm<R, S, C>
 where
     R: AsRef<[PmmRegion]> + AsMut<[PmmRegion]>,
     S: AsRef<[u8]> + AsMut<[u8]>,
+    C: AsRef<[u16]> + AsMut<[u16]>,
 {
     regions: R,
     bitmap: FrameBitmap<S>,
+    refcounts: C,
 
     region_hint: usize,
 
@@ -21,10 +23,11 @@ where
     total_deallocations: u64,
 }
 
-impl<R, S> DynamicPmm<R, S>
+impl<R, S, C> DynamicPmm<R, S, C>
 where
     R: AsRef<[PmmRegion]> + AsMut<[PmmRegion]>,
     S: AsRef<[u8]> + AsMut<[u8]>,
+    C: AsRef<[u16]> + AsMut<[u16]>,
 {
     /// Creates a Dynamic PMM and imports Bootstrap allocations.
     ///
@@ -33,11 +36,13 @@ where
     pub fn new(
         regions: R,
         bitmap: FrameBitmap<S>,
+        refcounts: C,
         bootstrap_allocations: &[u64],
     ) -> Option<Self> {
         Self::new_with_stats(
             regions,
             bitmap,
+            refcounts,
             bootstrap_allocations,
             bootstrap_allocations.len() as u64,
             0,
@@ -48,6 +53,7 @@ where
     pub fn new_with_stats(
         regions: R,
         mut bitmap: FrameBitmap<S>,
+        mut refcounts: C,
         bootstrap_allocations: &[u64],
         total_allocations: u64,
         total_deallocations: u64,
@@ -79,6 +85,7 @@ where
         }
 
         if expected_offset != bitmap.frame_count()
+            || refcounts.as_ref().len() != expected_offset
             || bootstrap_allocations.len() > expected_offset
             || total_allocations < bootstrap_allocations.len() as u64
             || total_deallocations > total_allocations
@@ -109,6 +116,7 @@ where
         }
 
         bitmap.clear();
+        refcounts.as_mut().fill(0);
 
         for &frame in bootstrap_allocations {
             let mut marked = false;
@@ -119,8 +127,10 @@ where
 
                     if !bitmap.mark_allocated(bitmap_index) {
                         bitmap.clear();
+                        refcounts.as_mut().fill(0);
                         return None;
                     }
+                    refcounts.as_mut()[bitmap_index] = 1;
 
                     marked = true;
                     break;
@@ -129,6 +139,7 @@ where
 
             if !marked {
                 bitmap.clear();
+                refcounts.as_mut().fill(0);
                 return None;
             }
         }
@@ -136,6 +147,7 @@ where
         Some(Self {
             regions,
             bitmap,
+            refcounts,
             region_hint: 0,
             allocated_count: bootstrap_allocations.len(),
             total_frames: expected_offset,
@@ -177,6 +189,7 @@ where
                     if !self.bitmap.mark_allocated(bitmap_index) {
                         return None;
                     }
+                    self.refcounts.as_mut()[bitmap_index] = 1;
 
                     region.next_hint = if frame_index + 1 == count {
                         0
@@ -203,6 +216,53 @@ where
         None
     }
 
+    pub fn retain_frame(&mut self, frame: u64) -> bool {
+        if frame % FRAME_SIZE != 0 {
+            return false;
+        }
+
+        for region in self.regions.as_ref() {
+            let Some(frame_index) = region.frame_index(frame) else {
+                continue;
+            };
+            let Some(bitmap_index) = region.bitmap_index(frame_index) else {
+                return false;
+            };
+            if !self.bitmap.is_allocated(bitmap_index) {
+                return false;
+            }
+            let rc = &mut self.refcounts.as_mut()[bitmap_index];
+            if *rc == 0 || *rc == u16::MAX {
+                return false;
+            }
+            *rc += 1;
+            return true;
+        }
+
+        false
+    }
+
+    pub fn frame_refcount(&self, frame: u64) -> usize {
+        if frame % FRAME_SIZE != 0 {
+            return 0;
+        }
+
+        for region in self.regions.as_ref() {
+            let Some(frame_index) = region.frame_index(frame) else {
+                continue;
+            };
+            let Some(bitmap_index) = region.bitmap_index(frame_index) else {
+                return 0;
+            };
+            if !self.bitmap.is_allocated(bitmap_index) {
+                return 0;
+            }
+            return self.refcounts.as_ref()[bitmap_index] as usize;
+        }
+
+        0
+    }
+
     pub fn deallocate_frame(&mut self, frame: u64) -> bool {
         if frame % FRAME_SIZE != 0 || self.allocated_count == 0 {
             return false;
@@ -224,6 +284,14 @@ where
             if !self.bitmap.is_allocated(bitmap_index) {
                 return false;
             }
+
+            let rc = self.refcounts.as_ref()[bitmap_index];
+            if rc > 1 {
+                self.refcounts.as_mut()[bitmap_index] = rc - 1;
+                return true;
+            }
+
+            self.refcounts.as_mut()[bitmap_index] = 0;
 
             if !self.bitmap.mark_free(bitmap_index) {
                 return false;
@@ -287,6 +355,7 @@ where
         if !self.bitmap.check_integrity()
             || self.allocated_count > self.total_frames
             || self.bitmap.frame_count() != self.total_frames
+            || self.refcounts.as_ref().len() != self.total_frames
             || self.total_allocations < self.allocated_count as u64
             || self.total_deallocations > self.total_allocations
         {
@@ -332,8 +401,14 @@ where
                     None => return false,
                 };
 
+                let rc = self.refcounts.as_ref()[bitmap_index];
                 if self.bitmap.is_allocated(bitmap_index) {
+                    if rc == 0 {
+                        return false;
+                    }
                     actual_allocated += 1;
+                } else if rc != 0 {
+                    return false;
                 }
             }
         }

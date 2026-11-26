@@ -1766,7 +1766,7 @@ Planned concepts include:
 - Service discovery.
 - Exception ports.
 
-These are roadmap items and should not be confused with the currently implemented pipes and shared-memory interfaces.
+Typed Mach-inspired ports (`MachPort`), `Send`/`Receive`/`SendOnce` rights, Zero-Copy Out-of-Line (`OOL`) page transfer via PMM refcounting, and the `bootstrap_register` / `bootstrap_look_up` service registry are implemented in `kernel/src/userland/ipc.rs` and `amaryllis-sdk` (verified via `/mach_ipc_demo.elf`).
 
 ---
 

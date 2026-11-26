@@ -67,6 +67,11 @@ pub const SYS_SPAWN_ELF: u64 = 310;
 pub const SYS_SHM_CREATE: u64 = 320;
 pub const SYS_SHM_MAP: u64 = 321;
 pub const SYS_SHM_UNMAP: u64 = 322;
+pub const SYS_MACH_PORT_ALLOCATE: u64 = 330;
+pub const SYS_MACH_PORT_DEALLOCATE: u64 = 331;
+pub const SYS_MACH_MSG: u64 = 332;
+pub const SYS_BOOTSTRAP_REGISTER: u64 = 333;
+pub const SYS_BOOTSTRAP_LOOKUP: u64 = 334;
 
 const ENOENT: i64 = -2;
 const EIO: i64 = -5;
@@ -773,7 +778,26 @@ fn copy_from_user_bytes(
     Ok(())
 }
 
-pub(crate) fn active_user_pml4_raw() -> u64 { unsafe { ACTIVE_USER_PML4 } }
+pub(crate) fn validate_user_slice_in(
+    mapping: &PhysicalMemoryMapping,
+    allocator: Option<&mut PhysicalFrameAllocator<'_>>,
+    user_pml4: u64,
+    user_ptr: u64,
+    len: usize,
+    require_writable: bool,
+) -> Result<(), i64> {
+    validate_user_slice(mapping, allocator, user_pml4, user_ptr, len, require_writable)
+}
+
+pub(crate) fn copy_from_user_bytes_in(
+    mapping: &PhysicalMemoryMapping,
+    allocator: Option<&mut PhysicalFrameAllocator<'_>>,
+    user_pml4: u64,
+    user_ptr: u64,
+    out: &mut [u8],
+) -> Result<(), i64> {
+    copy_from_user_bytes(mapping, allocator, user_pml4, user_ptr, out)
+}
 
 pub(crate) fn copy_to_user_bytes_in(
     mapping: &PhysicalMemoryMapping,
@@ -1031,38 +1055,46 @@ extern "C" fn rust_syscall_dispatch(frame: &mut SyscallFrame) {
     let arg2 = frame.rsi;
     let arg3 = frame.rdx;
     let arg4 = frame.r10;
+    let arg5 = frame.r8;
+    let arg6 = frame.r9;
 
     let ret: i64 = match syscall_num {
         SYS_EXIT => unsafe {
             sched::finish_current_from_syscall(arg1 as i64);
         },
 
-        SYS_GETPID => unsafe { ACTIVE_PID as i64 },
-
         SYS_FORK => {
             if let (Some(mapping), Some(allocator)) = (mapping_opt, allocator_opt) {
                 let parent_ctx = build_resume_ctx_from_syscall(frame, 0);
-                sched::sys_fork_current(parent_ctx, mapping, allocator)
+                sched::fork_current_process(parent_ctx, mapping, allocator)
             } else {
                 ENOMEM
             }
         }
 
         SYS_WAITPID => {
+            let target_pid = arg1 as isize;
+            let status_ptr = arg2;
+            let options = arg3;
             if let (Some(mapping), Some(allocator)) = (mapping_opt, allocator_opt) {
-                let parent_ctx = build_resume_ctx_from_syscall(frame, 0);
-                sched::sys_waitpid_current(
-                    arg1 as isize,
-                    arg2,
-                    arg3 as usize,
-                    parent_ctx,
-                    mapping,
-                    allocator,
-                )
+                match sched::sys_waitpid_current(target_pid, status_ptr, options, mapping, allocator) {
+                    Ok(ret_val) => ret_val,
+                    Err(wait_reason) => {
+                        let ctx = build_resume_ctx_from_syscall(frame, 0);
+                        unsafe {
+                            sched::suspend_current_from_syscall(
+                                ctx,
+                                UserTaskState::Waiting(wait_reason),
+                            );
+                        }
+                    }
+                }
             } else {
                 EINVAL
             }
         }
+
+        SYS_GETPID => unsafe { ACTIVE_PID as i64 },
 
         SYS_YIELD => {
             let ctx = build_resume_ctx_from_syscall(frame, 0);
@@ -2378,6 +2410,113 @@ extern "C" fn rust_syscall_dispatch(frame: &mut SyscallFrame) {
                             Ok(()) => 0,
                             Err(e) => e,
                         }
+                    } else {
+                        EINVAL
+                    }
+                }
+            } else {
+                EINVAL
+            }
+        }
+
+        SYS_MACH_PORT_ALLOCATE => sched::sys_mach_port_allocate_current(),
+
+        SYS_MACH_PORT_DEALLOCATE => {
+            if let Some(allocator) = allocator_opt {
+                sched::sys_mach_port_deallocate_current(arg1 as u32, allocator)
+            } else {
+                EINVAL
+            }
+        }
+
+        SYS_MACH_MSG => {
+            let msg_ptr = arg1;
+            let option = arg2 as u32;
+            let send_size = arg3 as usize;
+            let rcv_size = arg4 as usize;
+            let rcv_name = arg5 as u32;
+            let timeout_ms = arg6;
+            if let (Some(mapping), Some(allocator)) = (mapping_opt, allocator_opt) {
+                match sched::sys_mach_msg_current(
+                    msg_ptr,
+                    option,
+                    send_size,
+                    rcv_size,
+                    rcv_name,
+                    timeout_ms,
+                    mapping,
+                    allocator,
+                ) {
+                    Ok(ret_val) => ret_val,
+                    Err(wait_reason) => {
+                        let ctx = build_resume_ctx_from_syscall(frame, 0);
+                        unsafe {
+                            sched::suspend_current_from_syscall(
+                                ctx,
+                                UserTaskState::Waiting(wait_reason),
+                            );
+                        }
+                    }
+                }
+            } else {
+                EINVAL
+            }
+        }
+
+        SYS_BOOTSTRAP_REGISTER => {
+            let name_ptr = arg1;
+            let name_len = (arg2 as usize).min(64);
+            let port_name = arg3 as u32;
+            if mapping_opt.is_some() && allocator_opt.is_some() {
+                let mapping = mapping_opt.unwrap();
+                if name_len == 0 {
+                    EINVAL
+                } else {
+                    let mut nbuf = [0u8; 64];
+                    if copy_from_user_bytes(
+                        mapping,
+                        allocator_opt.as_deref_mut(),
+                        user_pml4,
+                        name_ptr,
+                        &mut nbuf[..name_len],
+                    )
+                    .is_err()
+                    {
+                        EFAULT
+                    } else if let Ok(name) = core::str::from_utf8(&nbuf[..name_len]) {
+                        let allocator = allocator_opt.as_deref_mut().unwrap();
+                        sched::sys_bootstrap_register_current(name, port_name, allocator)
+                    } else {
+                        EINVAL
+                    }
+                }
+            } else {
+                EINVAL
+            }
+        }
+
+        SYS_BOOTSTRAP_LOOKUP => {
+            let name_ptr = arg1;
+            let name_len = (arg2 as usize).min(64);
+            if mapping_opt.is_some() && allocator_opt.is_some() {
+                let mapping = mapping_opt.unwrap();
+                if name_len == 0 {
+                    EINVAL
+                } else {
+                    let mut nbuf = [0u8; 64];
+                    if copy_from_user_bytes(
+                        mapping,
+                        allocator_opt.as_deref_mut(),
+                        user_pml4,
+                        name_ptr,
+                        &mut nbuf[..name_len],
+                    )
+                    .is_err()
+                    {
+                        EFAULT
+                    } else if let Ok(name) = core::str::from_utf8(&nbuf[..name_len]) {
+                        let allocator = allocator_opt.as_deref_mut().unwrap();
+                        sched::sys_bootstrap_lookup_current(name, allocator)
                     } else {
                         EINVAL
                     }

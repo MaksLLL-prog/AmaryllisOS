@@ -137,6 +137,7 @@ pub fn run_dynamic_tests() -> bool {
     ];
 
     let mut bitmap_storage = [0u8; 1];
+    let mut refcounts = [0u16; 8];
 
     let bitmap = match FrameBitmap::new(&mut bitmap_storage, 8) {
         Some(bitmap) => bitmap,
@@ -151,6 +152,7 @@ pub fn run_dynamic_tests() -> bool {
     let mut pmm = match DynamicPmm::new(
         &mut regions,
         bitmap,
+        &mut refcounts[..],
         &bootstrap_allocations,
     ) {
         Some(pmm) => pmm,
@@ -159,6 +161,7 @@ pub fn run_dynamic_tests() -> bool {
 
     if !pmm.owns_frame(0x10000000)
         || !pmm.owns_frame(0x20001000)
+        || pmm.frame_refcount(0x10000000) != 1
     {
         return false;
     }
@@ -209,11 +212,24 @@ pub fn run_dynamic_tests() -> bool {
 
     let released = allocated[0];
 
+    // Verify CoW reference counting keeps frame alive until last ref drops.
+    if !pmm.retain_frame(released) || pmm.frame_refcount(released) != 2 {
+        return false;
+    }
+    if !pmm.deallocate_frame(released)
+        || !pmm.owns_frame(released)
+        || pmm.frame_refcount(released) != 1
+        || pmm.allocated_frames() != 8
+    {
+        return false;
+    }
+
     if !pmm.deallocate_frame(released) {
         return false;
     }
 
     if pmm.owns_frame(released)
+        || pmm.frame_refcount(released) != 0
         || pmm.allocated_frames() != 7
         || pmm.free_frames() != 1
     {
@@ -231,7 +247,7 @@ pub fn run_dynamic_tests() -> bool {
         None => return false,
     };
 
-    if reused != released || !pmm.owns_frame(reused) {
+    if reused != released || !pmm.owns_frame(reused) || pmm.frame_refcount(reused) != 1 {
         return false;
     }
 

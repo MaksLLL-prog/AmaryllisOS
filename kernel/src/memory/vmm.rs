@@ -1,6 +1,7 @@
 
+use alloc::vec::Vec;
 use core::arch::asm;
-use core::ptr::{read_volatile, write_bytes, write_volatile};
+use core::ptr::{copy_nonoverlapping, read_volatile, write_bytes, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::{PhysAddr, VirtAddr};
@@ -10,9 +11,9 @@ use x86_64::structures::paging::page_table::PageTableEntry;
 
 use super::PhysicalFrameAllocator;
 
-pub const PAGE_SIZE: u64 = 4096;
-pub const COW_PAGE_FLAG: PageTableFlags = PageTableFlags::BIT_9;
+pub const COW_FLAG: PageTableFlags = PageTableFlags::BIT_9;
 
+pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_TABLE_ENTRIES: usize = 512;
 
 const ADDRESS_MASK_4K: u64 = 0x000F_FFFF_FFFF_F000;
@@ -955,95 +956,6 @@ impl PhysicalMemoryMapping {
     // VIRTUAL ADDRESS TRANSLATION: ACTIVE SPACE
     // --------------------------------------------------------
 
-
-    /// Updates the PTE flags of an existing 4 KiB page inside `pml4` in place.
-    pub fn update_page_flags_in(
-        &self,
-        pml4: u64,
-        virtual_address: VirtAddr,
-        new_flags: PageTableFlags,
-    ) -> bool {
-        if self.validate_pml4(pml4).is_err() || virtual_address.as_u64() % PAGE_SIZE != 0 {
-            return false;
-        }
-        let p4_index = usize::from(virtual_address.p4_index());
-        let p3_index = usize::from(virtual_address.p3_index());
-        let p2_index = usize::from(virtual_address.p2_index());
-        let p1_index = usize::from(virtual_address.p1_index());
-
-        let Some(pml4_entry) = self.read_table_entry(pml4, p4_index) else { return false; };
-        if !pml4_entry.flags().contains(PageTableFlags::PRESENT) { return false; }
-
-        let pdpt = pml4_entry.addr().as_u64();
-        let Some(pdpt_entry) = self.read_table_entry(pdpt, p3_index) else { return false; };
-        if !pdpt_entry.flags().contains(PageTableFlags::PRESENT) || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return false;
-        }
-
-        let pd = pdpt_entry.addr().as_u64();
-        let Some(pd_entry) = self.read_table_entry(pd, p2_index) else { return false; };
-        if !pd_entry.flags().contains(PageTableFlags::PRESENT) || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return false;
-        }
-
-        let pt = pd_entry.addr().as_u64();
-        let Some(mut pt_entry) = self.read_table_entry(pt, p1_index) else { return false; };
-        if !pt_entry.flags().contains(PageTableFlags::PRESENT) {
-            return false;
-        }
-
-        let phys = pt_entry.addr();
-        pt_entry.set_addr(phys, new_flags);
-        self.write_table_entry(pt, p1_index, pt_entry).is_some()
-    }
-
-    /// Clones all committed 4 KiB user pages from `parent_pml4` into `child_pml4` using Copy-on-Write.
-    pub fn clone_user_pages_cow(
-        &self,
-        allocator: &mut PhysicalFrameAllocator<'_>,
-        parent_pml4: u64,
-        child_pml4: u64,
-        regions: &[crate::userland::sched::VmRegion],
-    ) -> Result<usize, MapError> {
-        let mut shared_pages = 0usize;
-        for region in regions {
-            if region.kind == crate::userland::sched::VmRegionKind::StackGuard {
-                continue;
-            }
-            let is_shared_mem = region.kind == crate::userland::sched::VmRegionKind::SharedMem;
-            let mut page = region.start & !(PAGE_SIZE - 1);
-            let end = (region.end.saturating_add(PAGE_SIZE - 1)) & !(PAGE_SIZE - 1);
-
-            while page < end {
-                let Ok(virt) = VirtAddr::try_new(page) else {
-                    break;
-                };
-                if let Some(trans) = self.translate_virtual_address_in(parent_pml4, virt) {
-                    if trans.page_size == PAGE_SIZE && trans.flags.contains(PageTableFlags::USER_ACCESSIBLE) {
-                        let phys = trans.physical_address & !(PAGE_SIZE - 1);
-                        let mut child_flags = trans.flags;
-
-                        if !is_shared_mem && trans.flags.contains(PageTableFlags::WRITABLE) {
-                            let mut cow_flags = trans.flags;
-                            cow_flags.remove(PageTableFlags::WRITABLE);
-                            cow_flags.insert(COW_PAGE_FLAG);
-                            if !self.update_page_flags_in(parent_pml4, virt, cow_flags) {
-                                return Err(MapError::InvalidFlags);
-                            }
-                            child_flags = cow_flags;
-                        }
-
-                        self.map_page_in(allocator, child_pml4, virt, phys, child_flags)?;
-                        crate::memory::inc_frame_ref(phys);
-                        shared_pages += 1;
-                    }
-                }
-                page = page.saturating_add(PAGE_SIZE);
-            }
-        }
-        Ok(shared_pages)
-    }
-
     pub fn translate_virtual_address(
         &self,
         virtual_address: VirtAddr,
@@ -1157,6 +1069,270 @@ impl PhysicalMemoryMapping {
             page_size: PAGE_SIZE,
             flags: pt_flags,
         })
+    }
+
+    // --------------------------------------------------------
+    // COPY-ON-WRITE (CoW) HELPERS
+    // --------------------------------------------------------
+
+    fn locate_4k_pte(
+        &self,
+        pml4: u64,
+        virtual_address: VirtAddr,
+    ) -> Result<(u64, usize, PageTableEntry), MapError> {
+        self.validate_pml4(pml4)?;
+        if virtual_address.as_u64() % PAGE_SIZE != 0 {
+            return Err(MapError::UnalignedAddress);
+        }
+
+        let p4_index = usize::from(virtual_address.p4_index());
+        let p3_index = usize::from(virtual_address.p3_index());
+        let p2_index = usize::from(virtual_address.p2_index());
+        let p1_index = usize::from(virtual_address.p1_index());
+
+        if is_shared_kernel_entry(p4_index) {
+            return Err(MapError::InvalidFlags);
+        }
+
+        let pml4_entry = self
+            .read_table_entry(pml4, p4_index)
+            .ok_or(MapError::InvalidTableAddress)?;
+        if !pml4_entry.flags().contains(PageTableFlags::PRESENT) {
+            return Err(MapError::NotMapped);
+        }
+        if pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Err(MapError::HugePageConflict);
+        }
+
+        let pdpt = pml4_entry.addr().as_u64();
+        let pdpt_entry = self
+            .read_table_entry(pdpt, p3_index)
+            .ok_or(MapError::InvalidTableAddress)?;
+        if !pdpt_entry.flags().contains(PageTableFlags::PRESENT) {
+            return Err(MapError::NotMapped);
+        }
+        if pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Err(MapError::HugePageConflict);
+        }
+
+        let pd = pdpt_entry.addr().as_u64();
+        let pd_entry = self
+            .read_table_entry(pd, p2_index)
+            .ok_or(MapError::InvalidTableAddress)?;
+        if !pd_entry.flags().contains(PageTableFlags::PRESENT) {
+            return Err(MapError::NotMapped);
+        }
+        if pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Err(MapError::HugePageConflict);
+        }
+
+        let pt = pd_entry.addr().as_u64();
+        let pte = self
+            .read_table_entry(pt, p1_index)
+            .ok_or(MapError::InvalidTableAddress)?;
+        if !pte.flags().contains(PageTableFlags::PRESENT) {
+            return Err(MapError::NotMapped);
+        }
+
+        Ok((pt, p1_index, pte))
+    }
+
+    pub fn mark_page_cow_in(
+        &self,
+        pml4: u64,
+        virtual_address: VirtAddr,
+    ) -> Result<(), MapError> {
+        let (pt, p1_index, mut pte) = self.locate_4k_pte(pml4, virtual_address)?;
+        let mut flags = pte.flags();
+        if flags.contains(PageTableFlags::WRITABLE) || !flags.contains(COW_FLAG) {
+            flags.remove(PageTableFlags::WRITABLE);
+            flags.insert(COW_FLAG);
+            pte.set_flags(flags);
+            self.write_table_entry(pt, p1_index, pte)
+                .ok_or(MapError::InvalidTableAddress)?;
+            self.flush_if_active(pml4, virtual_address);
+        }
+        Ok(())
+    }
+
+    /// Clones private user-space 4 KiB mappings from `src_pml4` into `dst_pml4` using Copy-on-Write.
+    /// Shared memory (`shm_ranges`) is skipped here and attached separately by `fork`.
+    pub fn clone_user_cow_tables(
+        &self,
+        src_pml4: u64,
+        dst_pml4: u64,
+        allocator: &mut PhysicalFrameAllocator<'_>,
+        shm_ranges: &[(u64, u64)],
+    ) -> Result<Vec<(u64, u64)>, MapError> {
+        self.validate_pml4(src_pml4)?;
+        self.validate_pml4(dst_pml4)?;
+
+        let mut cloned_pages: Vec<(u64, u64)> = Vec::new();
+
+        for p4_idx in 0..KERNEL_PML4_START {
+            if is_shared_kernel_entry(p4_idx) {
+                continue;
+            }
+            let Some(pml4_entry) = self.read_table_entry(src_pml4, p4_idx) else {
+                continue;
+            };
+            if !pml4_entry.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            if pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                continue;
+            }
+            let pdpt = pml4_entry.addr().as_u64();
+
+            for p3_idx in 0..PAGE_TABLE_ENTRIES {
+                let Some(pdpt_entry) = self.read_table_entry(pdpt, p3_idx) else {
+                    continue;
+                };
+                if !pdpt_entry.flags().contains(PageTableFlags::PRESENT)
+                    || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE)
+                {
+                    continue;
+                }
+                let pd = pdpt_entry.addr().as_u64();
+
+                for p2_idx in 0..PAGE_TABLE_ENTRIES {
+                    let Some(pd_entry) = self.read_table_entry(pd, p2_idx) else {
+                        continue;
+                    };
+                    if !pd_entry.flags().contains(PageTableFlags::PRESENT)
+                        || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE)
+                    {
+                        continue;
+                    }
+                    let pt = pd_entry.addr().as_u64();
+
+                    for p1_idx in 0..PAGE_TABLE_ENTRIES {
+                        let Some(mut pte) = self.read_table_entry(pt, p1_idx) else {
+                            continue;
+                        };
+                        let flags = pte.flags();
+                        if !flags.contains(PageTableFlags::PRESENT)
+                            || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                        {
+                            continue;
+                        }
+
+                        let vaddr = ((p4_idx as u64) << 39)
+                            | ((p3_idx as u64) << 30)
+                            | ((p2_idx as u64) << 21)
+                            | ((p1_idx as u64) << 12);
+                        if shm_ranges.iter().any(|&(s, e)| vaddr >= s && vaddr < e) {
+                            continue;
+                        }
+
+                        let Ok(virt) = VirtAddr::try_new(vaddr) else {
+                            continue;
+                        };
+                        let phys = pte.addr().as_u64() & ADDRESS_MASK_4K;
+
+                        if !allocator.retain_frame(phys) {
+                            for (va, fr) in cloned_pages.drain(..) {
+                                if let Ok(v) = VirtAddr::try_new(va) {
+                                    let _ = self.unmap_page_in(dst_pml4, v);
+                                }
+                                let _ = allocator.deallocate_frame(fr);
+                            }
+                            return Err(MapError::AllocationFailed);
+                        }
+
+                        let mut shared_flags = flags;
+                        if shared_flags.contains(PageTableFlags::WRITABLE) {
+                            shared_flags.remove(PageTableFlags::WRITABLE);
+                            shared_flags.insert(COW_FLAG);
+                            pte.set_flags(shared_flags);
+                            let _ = self.write_table_entry(pt, p1_idx, pte);
+                            self.flush_if_active(src_pml4, virt);
+                        }
+
+                        if let Err(err) =
+                            self.map_page_in(allocator, dst_pml4, virt, phys, shared_flags)
+                        {
+                            let _ = allocator.deallocate_frame(phys);
+                            for (va, fr) in cloned_pages.drain(..) {
+                                if let Ok(v) = VirtAddr::try_new(va) {
+                                    let _ = self.unmap_page_in(dst_pml4, v);
+                                }
+                                let _ = allocator.deallocate_frame(fr);
+                            }
+                            return Err(err);
+                        }
+
+                        cloned_pages.push((vaddr, phys));
+                    }
+                }
+            }
+        }
+
+        Ok(cloned_pages)
+    }
+
+    /// Resolves a Copy-on-Write write fault on `page_vaddr` inside `pml4`.
+    /// Returns `Ok(true)` if a new frame was copied, `Ok(false)` if promoted in-place.
+    pub fn resolve_cow_fault_in(
+        &self,
+        pml4: u64,
+        page_vaddr: u64,
+        allocator: &mut PhysicalFrameAllocator<'_>,
+    ) -> Result<bool, MapError> {
+        let virt = VirtAddr::try_new(page_vaddr).map_err(|_| MapError::InvalidVirtualAddress)?;
+        let (pt, p1_index, mut pte) = self.locate_4k_pte(pml4, virt)?;
+        let flags = pte.flags();
+        if !flags.contains(PageTableFlags::USER_ACCESSIBLE) || !flags.contains(COW_FLAG) {
+            return Err(MapError::InvalidFlags);
+        }
+
+        let old_phys = pte.addr().as_u64() & ADDRESS_MASK_4K;
+        let mut new_flags = flags;
+        new_flags.remove(COW_FLAG);
+        new_flags.insert(PageTableFlags::WRITABLE);
+
+        if allocator.frame_refcount(old_phys) <= 1 {
+            pte.set_flags(new_flags);
+            self.write_table_entry(pt, p1_index, pte)
+                .ok_or(MapError::InvalidTableAddress)?;
+            self.flush_if_active(pml4, virt);
+            return Ok(false);
+        }
+
+        let new_phys = allocator.allocate_frame().ok_or(MapError::AllocationFailed)?;
+        let (Some(src_hhdm), Some(dst_hhdm)) = (
+            self.translate_frame(old_phys),
+            self.translate_frame(new_phys),
+        ) else {
+            let _ = allocator.deallocate_frame(new_phys);
+            return Err(MapError::InvalidTableAddress);
+        };
+
+        unsafe {
+            copy_nonoverlapping(
+                src_hhdm.as_u64() as *const u8,
+                dst_hhdm.as_u64() as *mut u8,
+                PAGE_SIZE as usize,
+            );
+        }
+
+        let new_phys_addr = match PhysAddr::try_new(new_phys) {
+            Ok(a) => a,
+            Err(_) => {
+                let _ = allocator.deallocate_frame(new_phys);
+                return Err(MapError::InvalidPhysicalAddress);
+            }
+        };
+
+        pte.set_addr(new_phys_addr, new_flags);
+        if self.write_table_entry(pt, p1_index, pte).is_none() {
+            let _ = allocator.deallocate_frame(new_phys);
+            return Err(MapError::InvalidTableAddress);
+        }
+
+        self.flush_if_active(pml4, virt);
+        let _ = allocator.deallocate_frame(old_phys);
+        Ok(true)
     }
 }
 

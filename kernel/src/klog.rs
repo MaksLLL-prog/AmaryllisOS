@@ -71,6 +71,7 @@ pub struct KLogStats {
     pub kthread_preempts: u64,
     pub user_preempts: u64,
     pub pf_lazy_commits: u64,
+    pub pf_cow_copies: u64,
     pub pf_guard_faults: u64,
     pub pf_user_kills: u64,
     pub copy_user_faults: u64,
@@ -131,6 +132,7 @@ static APIC_TIMER_IRQS: AtomicU64 = AtomicU64::new(0);
 static KTHREAD_PREEMPTS: AtomicU64 = AtomicU64::new(0);
 static USER_PREEMPTS: AtomicU64 = AtomicU64::new(0);
 static PF_LAZY_COMMITS: AtomicU64 = AtomicU64::new(0);
+static PF_COW_COPIES: AtomicU64 = AtomicU64::new(0);
 static PF_GUARD_FAULTS: AtomicU64 = AtomicU64::new(0);
 static PF_USER_KILLS: AtomicU64 = AtomicU64::new(0);
 static COPY_USER_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -184,6 +186,11 @@ pub fn record_user_preempt() {
 #[inline]
 pub fn record_pf_lazy_commit() {
     PF_LAZY_COMMITS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_pf_cow_copy() {
+    PF_COW_COPIES.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -266,6 +273,7 @@ pub fn stats() -> KLogStats {
         kthread_preempts: KTHREAD_PREEMPTS.load(Ordering::Relaxed),
         user_preempts: USER_PREEMPTS.load(Ordering::Relaxed),
         pf_lazy_commits: PF_LAZY_COMMITS.load(Ordering::Relaxed),
+        pf_cow_copies: PF_COW_COPIES.load(Ordering::Relaxed),
         pf_guard_faults: PF_GUARD_FAULTS.load(Ordering::Relaxed),
         pf_user_kills: PF_USER_KILLS.load(Ordering::Relaxed),
         copy_user_faults: COPY_USER_FAULTS.load(Ordering::Relaxed),

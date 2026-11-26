@@ -637,64 +637,314 @@ pub fn build_guard_fault_elf() -> Vec<u8> {
     b.build()
 }
 
-
-
-/// Copy-on-Write `fork()` + `waitpid()` verification ELF (`/fork_demo.elf`).
+/// CoW `fork()` + `waitpid()` verification ELF (`/fork_demo.elf`):
+/// 1) Maps an RW page and writes `0x11223344`
+/// 2) Forks with CoW (`SYS_FORK`)
+/// 3) Child writes `0x55667788` (copy-on-write private page fault) and exits with code 42
+/// 4) Parent reaps child via `SYS_WAITPID` and verifies parent's page still reads `0x11223344`
 pub fn build_fork_demo_elf() -> Vec<u8> {
     let mut b = MiniElfBuilder::new();
-    b.emit_write_literal(b"[fork_demo] Mapping private CoW test page (VAL = 42)...\n");
+    b.emit_write_literal(b"[fork_demo] Starting CoW fork() + waitpid() test...\n");
 
-    // SYS_MMAP(0, 4096, PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=0x22, -1, 0)
+    // SYS_MMAP(addr=0, len=4096, prot=3)
     b.emit_mov_eax(9);
-    b.emit(&[0x31, 0xFF]); // xor edi, edi
+    b.emit_mov_edi(0);
     b.emit(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
     b.emit_mov_edx(3);
-    b.emit(&[0x41, 0xBA, 0x22, 0x00, 0x00, 0x00]); // mov r10d, 0x22
-    b.emit(&[0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]); // mov r8, -1
-    b.emit(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
     b.emit_syscall();
-    b.emit(&[0x49, 0x89, 0xC4]); // mov r12, rax
 
-    // Write initial value 42 into [r12]
-    b.emit(&[0x49, 0xC7, 0x04, 0x24, 42, 0, 0, 0]); // mov qword ptr [r12], 42
+    b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+    let jns_mmap = b.code.len();
+    b.emit(&[0x0F, 0x89, 0, 0, 0, 0]); // jns mmap_ok
+    b.emit_write_literal(b"[fork_demo] mmap failed!\n");
+    b.emit_exit(1);
+
+    let mmap_ok = b.code.len();
+    let d = (mmap_ok as isize - (jns_mmap + 6) as isize) as i32;
+    b.code[jns_mmap + 2..jns_mmap + 6].copy_from_slice(&d.to_le_bytes());
+
+    // r12 = shared CoW test page; store 0x11223344
+    b.emit(&[0x49, 0x89, 0xC4]); // mov r12, rax
+    b.emit(&[0x41, 0xC7, 0x04, 0x24, 0x44, 0x33, 0x22, 0x11]); // mov dword ptr [r12], 0x11223344
 
     // SYS_FORK (57)
     b.emit_mov_eax(57);
     b.emit_syscall();
 
-    // test rax, rax; jz rel32 child_branch
-    b.emit(&[0x48, 0x85, 0xC0]);
+    b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
     let jz_child = b.code.len();
-    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]);
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]); // je child_path
 
-    // === PARENT BRANCH ===
+    let jns_parent = b.code.len();
+    b.emit(&[0x0F, 0x89, 0, 0, 0, 0]); // jns parent_path
+    b.emit_write_literal(b"[fork_demo] SYS_FORK failed!\n");
+    b.emit_exit(2);
+
+    // Parent path
+    let parent_lbl = b.code.len();
+    let d_parent = (parent_lbl as isize - (jns_parent + 6) as isize) as i32;
+    b.code[jns_parent + 2..jns_parent + 6].copy_from_slice(&d_parent.to_le_bytes());
+
     b.emit(&[0x49, 0x89, 0xC5]); // mov r13, rax (child_pid)
-    b.emit_write_literal(b"[fork_demo] Parent waiting via SYS_WAITPID for child PID=");
-    b.emit(&[0x4C, 0x89, 0xE8]); // mov rax, r13
-    b.emit_print_rax_u64_ln();
-
-    // SYS_WAITPID(-1, r12 + 8, 0)
-    b.emit_mov_eax(61);
-    b.emit(&[0x48, 0xC7, 0xC7, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rdi, -1
-    b.emit(&[0x49, 0x8D, 0x74, 0x24, 0x08]); // lea rsi, [r12 + 8]
+    b.emit(&[0x48, 0x83, 0xEC, 16]); // sub rsp, 16
+    b.emit_mov_eax(61); // SYS_WAITPID
+    b.emit(&[0x4C, 0x89, 0xEF]); // mov rdi, r13
+    b.emit(&[0x48, 0x89, 0xE6]); // mov rsi, rsp
     b.emit(&[0x31, 0xD2]); // xor edx, edx
     b.emit_syscall();
 
-    b.emit_write_literal(b"[fork_demo] Child exited! Parent reads [r12] (must still be 42) = ");
-    b.emit(&[0x49, 0x8B, 0x04, 0x24]); // mov rax, [r12]
+    b.emit(&[0x44, 0x8B, 0x34, 0x24]); // mov r14d, dword ptr [rsp]
+    b.emit(&[0x48, 0x83, 0xC4, 16]); // add rsp, 16
+
+    b.emit_write_literal(b"[fork_demo parent] Reaped child, exit code=");
+    b.emit(&[0x44, 0x89, 0xF0]); // mov eax, r14d
     b.emit_print_rax_u64_ln();
+
+    // Verify parent's CoW page still contains 0x11223344
+    b.emit(&[0x41, 0x8B, 0x04, 0x24]); // mov eax, dword ptr [r12]
+    b.emit(&[0x3D, 0x44, 0x33, 0x22, 0x11]); // cmp eax, 0x11223344
+    let je_cow_ok = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]); // je cow_ok
+
+    b.emit_write_literal(b"[fork_demo parent] CoW isolation FAILED!\n");
+    b.emit_mov_eax(11); // SYS_MUNMAP
+    b.emit(&[0x4C, 0x89, 0xE7]); // mov rdi, r12
+    b.emit(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
+    b.emit_syscall();
+    b.emit_exit(3);
+
+    let cow_ok_lbl = b.code.len();
+    let d_cow = (cow_ok_lbl as isize - (je_cow_ok + 6) as isize) as i32;
+    b.code[je_cow_ok + 2..je_cow_ok + 6].copy_from_slice(&d_cow.to_le_bytes());
+
+    b.emit_write_literal(b"[fork_demo parent] CoW value preserved (0x11223344) PASS!\n");
+    b.emit_mov_eax(11); // SYS_MUNMAP
+    b.emit(&[0x4C, 0x89, 0xE7]); // mov rdi, r12
+    b.emit(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
+    b.emit_syscall();
     b.emit_exit(0);
 
-    // === CHILD BRANCH ===
+    // Child path
     let child_lbl = b.code.len();
-    let rel32 = (child_lbl - (jz_child + 6)) as i32;
-    b.code[jz_child + 2..jz_child + 6].copy_from_slice(&rel32.to_le_bytes());
-    b.emit_write_literal(b"[fork_demo] Child running! Mutating shared CoW page [r12] -> 99...\n");
-    b.emit(&[0x49, 0xC7, 0x04, 0x24, 99, 0, 0, 0]); // mov qword ptr [r12], 99 (triggers CoW #PF!)
-    b.emit_write_literal(b"[fork_demo] Child verified isolated [r12] = ");
-    b.emit(&[0x49, 0x8B, 0x04, 0x24]); // mov rax, [r12]
+    let d_child = (child_lbl as isize - (jz_child + 6) as isize) as i32;
+    b.code[jz_child + 2..jz_child + 6].copy_from_slice(&d_child.to_le_bytes());
+
+    // Trigger CoW fault on [r12]
+    b.emit(&[0x41, 0xC7, 0x04, 0x24, 0x88, 0x77, 0x66, 0x55]); // mov dword ptr [r12], 0x55667788
+    b.emit_write_literal(b"[fork_demo child] Wrote private CoW copy (0x55667788), PID=");
+    b.emit_mov_eax(39); // SYS_GETPID
+    b.emit_syscall();
     b.emit_print_rax_u64_ln();
-    b.emit_exit(7);
+    b.emit_exit(42);
 
     b.build()
 }
+
+/// Mach IPC Ports + Zero-Copy OOL Page Transfer + Bootstrap Registry Demo (`/mach_ipc_demo.elf`):
+/// 1) Parent allocates a Mach port and registers `"demo.mach.svc"` in Bootstrap
+/// 2) Parent forks; child looks up `"demo.mach.svc"`, maps a 4 KiB page (`0xCAFEBABE`),
+///    and performs an atomic `SYS_MACH_MSG` RPC (`SEND | RCV`) with complex OOL descriptor
+/// 3) Parent receives the OOL page zero-copy, validates `0xCAFEBABE`, replies on `SendOnce`,
+///    and reaps child via `SYS_WAITPID`.
+pub fn build_mach_ipc_demo_elf() -> Vec<u8> {
+    let mut b = MiniElfBuilder::new();
+    let (svc_off, svc_len) = b.add_string(b"demo.mach.svc");
+
+    b.emit_write_literal(b"[mach_demo] Allocating Mach port & registering 'demo.mach.svc'...\n");
+
+    // r12 = SYS_MACH_PORT_ALLOCATE (330)
+    b.emit_mov_eax(330);
+    b.emit_syscall();
+    b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+    let jg_alloc = b.code.len();
+    b.emit(&[0x0F, 0x8F, 0, 0, 0, 0]);
+    b.emit_write_literal(b"[mach_demo] port allocate failed\n");
+    b.emit_exit(1);
+
+    let alloc_ok = b.code.len();
+    let d_alloc = (alloc_ok as isize - (jg_alloc + 6) as isize) as i32;
+    b.code[jg_alloc + 2..jg_alloc + 6].copy_from_slice(&d_alloc.to_le_bytes());
+    b.emit(&[0x49, 0x89, 0xC4]); // mov r12, rax
+
+    // SYS_BOOTSTRAP_REGISTER (333)(svc_ptr, svc_len, r12)
+    b.emit_mov_eax(333);
+    b.emit(&[0x48, 0x8D, 0x3D]); // lea rdi, [rip + disp32]
+    let p_reg = b.code.len();
+    b.emit(&[0, 0, 0, 0]);
+    b.lea_patches.push((p_reg, svc_off));
+    b.emit(&[0xBE]);
+    b.emit(&svc_len.to_le_bytes());
+    b.emit(&[0x4C, 0x89, 0xE2]); // mov rdx, r12
+    b.emit_syscall();
+
+    // SYS_FORK (57)
+    b.emit_mov_eax(57);
+    b.emit_syscall();
+    b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+    let jz_child = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]); // je child_lbl
+
+    // Parent (Server) path: r13 = child_pid
+    b.emit(&[0x49, 0x89, 0xC5]); // mov r13, rax
+    b.emit(&[0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00]); // sub rsp, 128
+
+    // SYS_MACH_MSG(rsp, MACH_RCV_MSG=2, send=0, rcv_cap=128, rcv_name=r12, timeout=0)
+    b.emit_mov_eax(332);
+    b.emit(&[0x48, 0x89, 0xE7]); // mov rdi, rsp
+    b.emit(&[0xBE, 0x02, 0x00, 0x00, 0x00]); // mov esi, 2
+    b.emit_mov_edx(0);
+    b.emit(&[0x41, 0xBA, 0x80, 0x00, 0x00, 0x00]); // mov r10d, 128
+    b.emit(&[0x4D, 0x89, 0xE0]); // mov r8, r12
+    b.emit(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    b.emit_syscall();
+
+    b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+    let jns_rcv = b.code.len();
+    b.emit(&[0x0F, 0x89, 0, 0, 0, 0]);
+    b.emit_write_literal(b"[mach_demo server] recv failed\n");
+    b.emit(&[0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00]);
+    b.emit_exit(2);
+
+    let rcv_ok = b.code.len();
+    let d_rcv = (rcv_ok as isize - (jns_rcv + 6) as isize) as i32;
+    b.code[jns_rcv + 2..jns_rcv + 6].copy_from_slice(&d_rcv.to_le_bytes());
+
+    // ebx = header.local_port ([rsp+12]), rbp = ool.addr ([rsp+24])
+    b.emit(&[0x8B, 0x5C, 0x24, 0x0C]); // mov ebx, dword ptr [rsp + 12]
+    b.emit(&[0x48, 0x8B, 0x6C, 0x24, 0x18]); // mov rbp, qword ptr [rsp + 24]
+
+    // Check [rbp] == 0xCAFEBABE
+    b.emit(&[0x81, 0x7D, 0x00, 0xBE, 0xBA, 0xFE, 0xCA]); // cmp dword ptr [rbp], 0xCAFEBABE
+    let je_ool = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]);
+    b.emit_write_literal(b"[mach_demo server] OOL payload mismatch!\n");
+    b.emit(&[0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00]);
+    b.emit_exit(3);
+
+    let ool_ok = b.code.len();
+    let d_ool = (ool_ok as isize - (je_ool + 6) as isize) as i32;
+    b.code[je_ool + 2..je_ool + 6].copy_from_slice(&d_ool.to_le_bytes());
+
+    b.emit_write_literal(b"[mach_demo server] Zero-copy OOL page verified (0xCAFEBABE), replying...\n");
+
+    // SYS_MUNMAP(rbp, 4096)
+    b.emit_mov_eax(11);
+    b.emit(&[0x48, 0x89, 0xEF]); // mov rdi, rbp
+    b.emit(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
+    b.emit_syscall();
+
+    // Build simple reply MachMsgHeader at [rsp..rsp+24]
+    b.emit(&[0xC7, 0x04, 0x24, 18, 0, 0, 0]); // bits = MOVE_SEND_ONCE (18)
+    b.emit(&[0xC7, 0x44, 0x24, 4, 24, 0, 0, 0]); // size = 24
+    b.emit(&[0x89, 0x5C, 0x24, 8]); // remote_port = ebx
+    b.emit(&[0xC7, 0x44, 0x24, 12, 0, 0, 0, 0]); // local_port = 0
+    b.emit(&[0xC7, 0x44, 0x24, 16, 0x09, 0x03, 0, 0]); // id = 777
+    b.emit(&[0xC7, 0x44, 0x24, 20, 0, 0, 0, 0]); // reserved = 0
+
+    // SYS_MACH_MSG(rsp, MACH_SEND_MSG=1, 24, 0, 0, 0)
+    b.emit_mov_eax(332);
+    b.emit(&[0x48, 0x89, 0xE7]); // mov rdi, rsp
+    b.emit(&[0xBE, 0x01, 0x00, 0x00, 0x00]); // mov esi, 1
+    b.emit_mov_edx(24);
+    b.emit(&[0x45, 0x31, 0xD2]); // xor r10d, r10d
+    b.emit(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+    b.emit(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    b.emit_syscall();
+
+    // SYS_WAITPID(r13, rsp, 0)
+    b.emit_mov_eax(61);
+    b.emit(&[0x4C, 0x89, 0xEF]); // mov rdi, r13
+    b.emit(&[0x48, 0x89, 0xE6]); // mov rsi, rsp
+    b.emit(&[0x31, 0xD2]); // xor edx, edx
+    b.emit_syscall();
+
+    b.emit_write_literal(b"[mach_demo server] RPC reply + child reaped PASS!\n");
+    b.emit(&[0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00]); // add rsp, 128
+    b.emit_exit(0);
+
+    // Child (Client) path
+    let child_lbl = b.code.len();
+    let d_child = (child_lbl as isize - (jz_child + 6) as isize) as i32;
+    b.code[jz_child + 2..jz_child + 6].copy_from_slice(&d_child.to_le_bytes());
+
+    // Sleep 20 ms
+    b.emit_mov_eax(35);
+    b.emit_mov_edi(20);
+    b.emit_syscall();
+
+    // r13 = SYS_BOOTSTRAP_LOOKUP(334)(svc_ptr, svc_len)
+    b.emit_mov_eax(334);
+    b.emit(&[0x48, 0x8D, 0x3D]);
+    let p_lup = b.code.len();
+    b.emit(&[0, 0, 0, 0]);
+    b.lea_patches.push((p_lup, svc_off));
+    b.emit(&[0xBE]);
+    b.emit(&svc_len.to_le_bytes());
+    b.emit_syscall();
+    b.emit(&[0x49, 0x89, 0xC5]); // mov r13, rax
+
+    // r14 = SYS_MACH_PORT_ALLOCATE (reply port)
+    b.emit_mov_eax(330);
+    b.emit_syscall();
+    b.emit(&[0x49, 0x89, 0xC6]); // mov r14, rax
+
+    // r15 = SYS_MMAP(0, 4096, 3) (OOL zero-copy page)
+    b.emit_mov_eax(9);
+    b.emit_mov_edi(0);
+    b.emit(&[0xBE, 0x00, 0x10, 0x00, 0x00]);
+    b.emit_mov_edx(3);
+    b.emit_syscall();
+    b.emit(&[0x49, 0x89, 0xC7]); // mov r15, rax
+
+    // Write 0xCAFEBABE into OOL page
+    b.emit(&[0x41, 0xC7, 0x07, 0xBE, 0xBA, 0xFE, 0xCA]); // mov dword ptr [r15], 0xCAFEBABE
+
+    b.emit(&[0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00]); // sub rsp, 128
+
+    // Build complex MachMsgHeader + MachMsgOolDesc at [rsp..rsp+48]
+    b.emit(&[0xC7, 0x04, 0x24, 19, 21, 0x00, 0x80]); // bits = COMPLEX | MAKE_SEND_ONCE<<8 | COPY_SEND
+    b.emit(&[0xC7, 0x44, 0x24, 4, 48, 0, 0, 0]); // size = 48
+    b.emit(&[0x44, 0x89, 0x6C, 0x24, 8]); // remote_port = r13d
+    b.emit(&[0x44, 0x89, 0x74, 0x24, 12]); // local_port = r14d
+    b.emit(&[0xC7, 0x44, 0x24, 16, 0x2B, 0x02, 0, 0]); // id = 555
+    b.emit(&[0xC7, 0x44, 0x24, 20, 0, 0, 0, 0]); // reserved = 0
+    b.emit(&[0x4C, 0x89, 0x7C, 0x24, 24]); // ool.addr = r15
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 32, 0x00, 0x10, 0x00, 0x00]); // ool.size = 4096
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 40, 0, 0, 0, 0]); // ool.deallocate + reserved = 0
+
+    // Atomic RPC: SYS_MACH_MSG(rsp, SEND|RCV=3, send=48, rcv_cap=128, rcv_name=r14, timeout=0)
+    b.emit_mov_eax(332);
+    b.emit(&[0x48, 0x89, 0xE7]); // mov rdi, rsp
+    b.emit(&[0xBE, 0x03, 0x00, 0x00, 0x00]); // mov esi, 3
+    b.emit_mov_edx(48);
+    b.emit(&[0x41, 0xBA, 0x80, 0x00, 0x00, 0x00]); // mov r10d, 128
+    b.emit(&[0x4D, 0x89, 0xF0]); // mov r8, r14
+    b.emit(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    b.emit_syscall();
+
+    // Unmap OOL page in client
+    b.emit_mov_eax(11);
+    b.emit(&[0x4C, 0x89, 0xFF]); // mov rdi, r15
+    b.emit(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
+    b.emit_syscall();
+
+    // Verify reply header.id == 777
+    b.emit(&[0x81, 0x7C, 0x24, 16, 0x09, 0x03, 0, 0]); // cmp dword ptr [rsp + 16], 777
+    let je_rep = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]);
+    b.emit_write_literal(b"[mach_demo child] Bad RPC reply id\n");
+    b.emit(&[0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00]);
+    b.emit_exit(4);
+
+    let rep_ok = b.code.len();
+    let d_rep = (rep_ok as isize - (je_rep + 6) as isize) as i32;
+    b.code[je_rep + 2..je_rep + 6].copy_from_slice(&d_rep.to_le_bytes());
+
+    b.emit_write_literal(b"[mach_demo child] Received reply id=777 via Bootstrap RPC PASS!\n");
+    b.emit(&[0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00]); // add rsp, 128
+    b.emit_exit(0);
+
+    b.build()
+}
+
+

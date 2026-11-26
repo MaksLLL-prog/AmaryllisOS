@@ -631,10 +631,12 @@ pub fn cleanup_loaded_image(
     mapping: &PhysicalMemoryMapping,
     allocator: &mut PhysicalFrameAllocator<'_>,
 ) {
-    while let Some((vaddr, frame)) = image.mapped_pages.pop() {
-        if let Ok(virt) = VirtAddr::try_new(vaddr) {
-            let _ = mapping.unmap_page_in(pml4, virt);
-        }
-        let _ = allocator.deallocate_frame(frame);
+    while let Some((vaddr, recorded_frame)) = image.mapped_pages.pop() {
+        let freed_frame = if let Ok(virt) = VirtAddr::try_new(vaddr) {
+            mapping.unmap_page_in(pml4, virt).unwrap_or(recorded_frame)
+        } else {
+            recorded_frame
+        };
+        let _ = allocator.deallocate_frame(freed_frame);
     }
 }
