@@ -99,7 +99,7 @@ pub fn execute(
             console.write("  mkdir <path>       - Create directory\n", WHITE);
             console.write("  rm <path>          - Remove file or empty directory\n", WHITE);
             console.write("  diskinfo           - Show disks, partitions, Page Cache & VFS\n", WHITE);
-            console.write("  mount [target]     - Mount VFS disk (auto|virtio|ahci|pm|ps|sm|ss)\n", WHITE);
+            console.write("  mount [target]     - Mount VFS disk (auto|nvme|virtio|ahci|pm|ps|sm|ss)\n", WHITE);
             console.write("  sync               - Flush dirty Block/Page Cache pages to disk\n", WHITE);
 
             console.write("\nATA commands:\n", YELLOW);
@@ -115,6 +115,8 @@ pub fn execute(
             console.write("  kthread [demo]     - Inspect preemptive kernel threads & guard stacks\n", WHITE);
             console.write("  ahci [read <LBA>]  - Inspect AHCI SATA DMA HBA & read sectors\n", WHITE);
             console.write("  virtio [read LBA]  - Inspect VirtIO-Blk split-ring DMA driver\n", WHITE);
+            console.write("  nvme [read <LBA>]  - Inspect FreeBSD-KPI NVMe DMA driver & read sectors\n", WHITE);
+            console.write("  kpi                - Show FreeBSD Driver KPI Newbus, bus_dma & e1000/AHCI checks\n", WHITE);
             console.write("  ipc                - Inspect POSIX pipes, SHM, Mach ports & Bootstrap services\n", WHITE);
             console.write("  netinfo            - Show Intel e1000 & IPv4 status\n", WHITE);
             console.write("  dhcp               - Acquire IPv4 config via DHCP\n", WHITE);
@@ -125,7 +127,7 @@ pub fn execute(
             console.write("  play <file.wav>    - Stream WAV file from FAT32\n", WHITE);
 
             console.write("\nUserland & ELF (Ring 3) commands:\n", YELLOW);
-            console.write("  mkelf [all|path]   - Write /hello,/echo,/fault,/gui_demo,/counter,/net_demo,/lazy,/guard,/fork,/mach ELFs\n", WHITE);
+            console.write("  mkelf [all|path]   - Write /hello,/echo,/fault,/gui_demo,/counter,/net_demo,/lazy,/guard,/fork,/mach,/freebsd ELFs\n", WHITE);
             console.write("  elfinfo <path.elf> - Inspect ELF64 headers and PT_LOAD segments\n", WHITE);
             console.write("  exec <path.elf>    - Execute ELF64 in Ring 3 (non-blocking in Desktop GUI)\n", WHITE);
             console.write("  execbg <path.elf>  - Spawn ELF64 asynchronously in preemptive scheduler\n", WHITE);
@@ -178,6 +180,8 @@ pub fn execute(
         "kthread" | "kthreads" => super::driver_commands::cmd_kthread(console, arguments),
         "ahci" => super::driver_commands::cmd_ahci(console, arguments),
         "virtio" => super::driver_commands::cmd_virtio(console, arguments),
+        "nvme" => super::driver_commands::cmd_nvme(console, arguments),
+        "kpi" => super::driver_commands::cmd_kpi(console),
         "ipc" => super::driver_commands::cmd_ipc(console),
         "netinfo" => super::net_commands::cmd_netinfo(console),
         "dhcp" => super::net_commands::cmd_dhcp(console),

@@ -20,6 +20,17 @@ use crate::storage::vfs::VfsDirEntry;
 use crate::task::kthread::{self, NetJobOutcome};
 
 use super::elf::{self, LoadedElfImage, USER_ADDR_LIMIT};
+use super::freebsd::signal::{
+    self, FreeBsdSigAction, FreeBsdSigSet, SavedSignalFrame, SignalDefault, SignalHandlerConfig,
+    SignalState, SIGCHLD, SIGKILL, SIGTRAMP_CODE, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_SETMASK,
+    SIG_UNBLOCK, USER_SIGTRAMP_ADDR,
+};
+use super::freebsd::{
+    self,
+    kqueue::{self, KEvent},
+    ProcessAbi, ThrParam, UMTX_OP_WAIT, UMTX_OP_WAIT_UINT, UMTX_OP_WAIT_UINT_PRIVATE,
+    UMTX_OP_WAKE, UMTX_OP_WAKE_PRIVATE,
+};
 use super::ipc::{
     self, MachKernelMsg, MachMsgHeader, MachMsgOolDesc, MachOolPayload, MachPortName,
     PortRightEntry, PortRightKind, MACH_MSGH_BITS_COMPLEX, MACH_MSGH_BITS_LOCAL_MASK,
@@ -27,7 +38,7 @@ use super::ipc::{
     MACH_MSG_TYPE_MAKE_SEND_ONCE, MACH_MSG_TYPE_MOVE_SEND, MACH_MSG_TYPE_MOVE_SEND_ONCE,
     MACH_PORT_NULL, MACH_RCV_MSG, MACH_RCV_TIMEOUT, MACH_SEND_MSG,
 };
-use super::syscall::{self, UserFaultInfo, UserTrapOutcome};
+use super::syscall::{self, SyscallFrame, UserFaultInfo, UserTrapOutcome};
 
 pub const MAX_USER_PROCS: usize = 16;
 pub const MAX_PROC_FDS: usize = 16;
@@ -165,6 +176,19 @@ pub enum WaitReason {
         rcv_cap: usize,
         deadline_ms: u64,
     },
+    Kqueue {
+        kq_id: usize,
+        eventlist_ptr: u64,
+        nevents: usize,
+        deadline_ms: u64,
+    },
+    UmtxWait {
+        pml4: u64,
+        addr: u64,
+        val: u64,
+        is_u64: bool,
+        deadline_ms: u64,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -215,6 +239,9 @@ pub enum FdEntry {
     PipeWrite {
         pipe_id: usize,
     },
+    Kqueue {
+        kq_id: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -250,11 +277,18 @@ pub struct FinishedUserProcess {
 
 struct UserProcessSlot {
     pid: usize,
+    tgid: usize,
+    is_thread: bool,
     parent_pid: usize,
+    abi: ProcessAbi,
     name: String,
     pml4: u64,
     ctx: UserCpuContext,
     fpu_state: FxSaveArea,
+    fs_base: u64,
+    gs_base: u64,
+    clear_child_tid: u64,
+    signals: SignalState,
     state: UserTaskState,
     cpu_ms: u64,
     vruntime_ms: u64,
@@ -360,6 +394,7 @@ struct UserScheduler {
     slots: [Option<UserProcessSlot>; MAX_USER_PROCS],
     current_slot: Option<usize>,
     rr_cursor: usize,
+    next_tid: usize,
     quantum_start_ms: u64,
     quantum_deadline_ms: u64,
     pending_spawns: Vec<Vec<String>>,
@@ -373,11 +408,22 @@ impl UserScheduler {
             slots: [const { None }; MAX_USER_PROCS],
             current_slot: None,
             rr_cursor: 0,
+            next_tid: 10_000,
             quantum_start_ms: 0,
             quantum_deadline_ms: 0,
             pending_spawns: Vec::new(),
             completed_for_sync: Vec::new(),
             exited_for_wait: Vec::new(),
+        }
+    }
+
+    fn alloc_tid(&mut self) -> usize {
+        loop {
+            let candidate = self.next_tid;
+            self.next_tid = self.next_tid.saturating_add(1).max(10_000);
+            if self.find_slot_by_pid(candidate).is_none() {
+                return candidate;
+            }
         }
     }
 
@@ -397,6 +443,14 @@ impl UserScheduler {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
 
+    fn count_tgid(&self, tgid: usize) -> usize {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|p| p.tgid == tgid)
+            .count()
+    }
+
     fn min_runnable_vruntime(&self) -> u64 {
         self.slots
             .iter()
@@ -409,7 +463,9 @@ impl UserScheduler {
 
     fn has_live_child_matching(&self, parent_pid: usize, target_pid: isize) -> bool {
         self.slots.iter().flatten().any(|c| {
-            c.parent_pid == parent_pid && (target_pid <= 0 || c.pid == target_pid as usize)
+            !c.is_thread
+                && c.parent_pid == parent_pid
+                && (target_pid <= 0 || c.pid == target_pid as usize)
         })
     }
 }
@@ -425,6 +481,16 @@ pub fn is_quantum_active() -> bool {
 
 pub fn active_count() -> usize {
     without_interrupts(|| USER_SCHED.lock().count_active())
+}
+
+pub fn is_process_alive(pid: usize) -> bool {
+    without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        sched.slots.iter().flatten().any(|p| {
+            (p.pid == pid || p.tgid == pid)
+                && !matches!(p.state, UserTaskState::Exited(_) | UserTaskState::Faulted(_))
+        })
+    })
 }
 
 pub fn has_runnable_tasks() -> bool {
@@ -449,31 +515,40 @@ pub fn has_ready_now() -> bool {
         if !sched.pending_spawns.is_empty() {
             return true;
         }
-        sched.slots.iter().flatten().any(|p| match p.state {
-            UserTaskState::Ready => true,
-            UserTaskState::Waiting(reason) => match reason {
-                WaitReason::Sleep { wake_ms } => now_ms >= wake_ms,
-                WaitReason::GuiEvent { deadline_ms, .. }
-                | WaitReason::TcpConnect { deadline_ms, .. }
-                | WaitReason::NetJob { deadline_ms, .. }
-                | WaitReason::PipeRead { deadline_ms, .. } => now_ms >= deadline_ms,
-                WaitReason::WaitPid { target_pid, .. } => {
-                    sched.exited_for_wait.iter().any(|&(ppid, cpid, _)| {
-                        ppid == p.pid && (target_pid <= 0 || cpid == target_pid as usize)
-                    }) || !sched.has_live_child_matching(p.pid, target_pid)
-                }
-                WaitReason::MachPortRecv {
-                    port_id,
-                    deadline_ms,
-                    ..
-                } => {
-                    now_ms >= deadline_ms
-                        || ipc::mach_port_has_queued_msg(port_id)
-                        || ipc::mach_port_is_dead(port_id)
-                }
-            },
-            UserTaskState::Exited(_) | UserTaskState::Faulted(_) => true,
-            UserTaskState::Running => false,
+        sched.slots.iter().flatten().any(|p| {
+            if p.signals.next_deliverable().is_some() {
+                return true;
+            }
+            match p.state {
+                UserTaskState::Ready => true,
+                UserTaskState::Waiting(reason) => match reason {
+                    WaitReason::Sleep { wake_ms } => now_ms >= wake_ms,
+                    WaitReason::GuiEvent { deadline_ms, .. }
+                    | WaitReason::TcpConnect { deadline_ms, .. }
+                    | WaitReason::NetJob { deadline_ms, .. }
+                    | WaitReason::PipeRead { deadline_ms, .. }
+                    | WaitReason::UmtxWait { deadline_ms, .. } => now_ms >= deadline_ms,
+                    WaitReason::Kqueue {
+                        kq_id, deadline_ms, ..
+                    } => now_ms >= deadline_ms || kqueue::has_ready_note(kq_id, now_ms),
+                    WaitReason::WaitPid { target_pid, .. } => {
+                        sched.exited_for_wait.iter().any(|&(ppid, cpid, _)| {
+                            ppid == p.tgid && (target_pid <= 0 || cpid == target_pid as usize)
+                        }) || !sched.has_live_child_matching(p.tgid, target_pid)
+                    }
+                    WaitReason::MachPortRecv {
+                        port_id,
+                        deadline_ms,
+                        ..
+                    } => {
+                        now_ms >= deadline_ms
+                            || ipc::mach_port_has_queued_msg(port_id)
+                            || ipc::mach_port_is_dead(port_id)
+                    }
+                },
+                UserTaskState::Exited(_) | UserTaskState::Faulted(_) => true,
+                UserTaskState::Running => false,
+            }
         })
     })
 }
@@ -488,6 +563,78 @@ pub fn current_pid() -> usize {
     })
 }
 
+pub fn current_tgid() -> usize {
+    without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        sched
+            .current_slot
+            .and_then(|idx| sched.slots[idx].as_ref().map(|p| p.tgid))
+            .unwrap_or(0)
+    })
+}
+
+pub fn current_parent_pid() -> usize {
+    without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        sched
+            .current_slot
+            .and_then(|idx| sched.slots[idx].as_ref().map(|p| p.parent_pid))
+            .unwrap_or(0)
+    })
+}
+
+pub fn current_abi() -> ProcessAbi {
+    without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        sched
+            .current_slot
+            .and_then(|idx| sched.slots[idx].as_ref().map(|p| p.abi))
+            .unwrap_or(ProcessAbi::Amaryllis)
+    })
+}
+
+pub fn set_current_fs_base(addr: u64) {
+    without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        if let Some(idx) = sched.current_slot {
+            if let Some(ref mut proc) = sched.slots[idx] {
+                proc.fs_base = addr;
+            }
+        }
+    });
+}
+
+pub fn get_current_fs_base() -> u64 {
+    without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        sched
+            .current_slot
+            .and_then(|idx| sched.slots[idx].as_ref().map(|p| p.fs_base))
+            .unwrap_or(0)
+    })
+}
+
+pub fn set_current_gs_base(addr: u64) {
+    without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        if let Some(idx) = sched.current_slot {
+            if let Some(ref mut proc) = sched.slots[idx] {
+                proc.gs_base = addr;
+            }
+        }
+    });
+}
+
+pub fn get_current_gs_base() -> u64 {
+    without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        sched
+            .current_slot
+            .and_then(|idx| sched.slots[idx].as_ref().map(|p| p.gs_base))
+            .unwrap_or(0)
+    })
+}
+
 pub fn register_process(
     pid: usize,
     name: &str,
@@ -495,11 +642,16 @@ pub fn register_process(
     image: LoadedElfImage,
 ) -> Result<(), LoadedElfImage> {
     let selectors = crate::arch::gdt::selectors();
+    let abi = image.abi;
+    let (init_rdi, init_rsi) = match abi {
+        ProcessAbi::FreeBsd => (image.user_rsp, 0u64),
+        ProcessAbi::Amaryllis => (image.initial_argc, image.initial_argv),
+    };
     let ctx = UserCpuContext {
         rip: image.entry_point,
         rsp: image.user_rsp,
-        rdi: image.initial_argc,
-        rsi: image.initial_argv,
+        rdi: init_rdi,
+        rsi: init_rsi,
         cs: selectors.user_code.0 as u64,
         ss: selectors.user_data.0 as u64,
         rflags: 0x0202,
@@ -542,11 +694,18 @@ pub fn register_process(
         if let Some(empty_idx) = sched.slots.iter().position(|s| s.is_none()) {
             sched.slots[empty_idx] = Some(UserProcessSlot {
                 pid,
+                tgid: pid,
+                is_thread: false,
                 parent_pid: 0,
+                abi,
                 name: String::from(name),
                 pml4,
                 ctx,
                 fpu_state: FxSaveArea::new_clean(),
+                fs_base: 0,
+                gs_base: 0,
+                clear_child_tid: 0,
+                signals: SignalState::new(),
                 state: UserTaskState::Ready,
                 cpu_ms: 0,
                 vruntime_ms: start_vr,
@@ -841,7 +1000,27 @@ pub fn try_resolve_user_page_fault(
         Some((idx, proc.pid, proc.pml4, vma))
     });
 
-    let Some((slot_idx, pid, pml4, Some(vma))) = info else {
+    let Some((slot_idx, pid, pml4, vma_opt)) = info else {
+        crate::serial::log_fmt("pf_dbg", format_args!("no current_slot for cr2=0x{:x} err=0x{:x}", cr2, error_code));
+        return FaultResolveOutcome::NotHandled;
+    };
+    let page_vaddr = cr2 & !(PAGE_SIZE - 1);
+    if (error_code & 0x3) == 0x3 && (error_code & 0x10) == 0 {
+        if let Ok(virt) = VirtAddr::try_new(page_vaddr) {
+            if let Some(trans) = mapping.translate_virtual_address_in(pml4, virt) {
+                if trans.flags.contains(PageTableFlags::USER_ACCESSIBLE) && trans.flags.contains(COW_FLAG) {
+                    if let Ok(copied) = mapping.resolve_cow_fault_in(pml4, page_vaddr, allocator) {
+                        if copied {
+                            klog::record_pf_cow_copy();
+                        }
+                        return FaultResolveOutcome::Resolved;
+                    }
+                }
+            }
+        }
+    }
+    let Some(vma) = vma_opt else {
+        crate::serial::log_fmt("pf_dbg", format_args!("PID={} no VMA for cr2=0x{:x} err=0x{:x}", pid, cr2, error_code));
         return FaultResolveOutcome::NotHandled;
     };
 
@@ -858,8 +1037,6 @@ pub fn try_resolve_user_page_fault(
         return FaultResolveOutcome::GuardPageHit;
     }
 
-    let page_vaddr = cr2 & !(PAGE_SIZE - 1);
-
     // Present protection fault (bit 0 == 1): handle Copy-on-Write write faults on writable private VMAs.
     if (error_code & 0x1) != 0 {
         if (error_code & 0x2) != 0
@@ -867,11 +1044,16 @@ pub fn try_resolve_user_page_fault(
             && vma.writable
             && vma.kind != VmRegionKind::SharedMem
         {
-            if let Ok(copied) = mapping.resolve_cow_fault_in(pml4, page_vaddr, allocator) {
-                if copied {
-                    klog::record_pf_cow_copy();
+            match mapping.resolve_cow_fault_in(pml4, page_vaddr, allocator) {
+                Ok(copied) => {
+                    if copied {
+                        klog::record_pf_cow_copy();
+                    }
+                    return FaultResolveOutcome::Resolved;
                 }
-                return FaultResolveOutcome::Resolved;
+                Err(e) => {
+                    crate::serial::log_fmt("cow_err", format_args!("resolve_cow_fault_in failed: {:?} pml4=0x{:x} page=0x{:x}", e, pml4, page_vaddr));
+                }
             }
         }
         return FaultResolveOutcome::NotHandled;
@@ -1387,20 +1569,25 @@ pub unsafe fn abort_current_fault(fault: UserFaultInfo) -> ! {
     syscall::exit_quantum_trampoline();
 }
 
-/// Polls all non-blocking Ring 3 wait queues (`Sleep`, `GuiEvent`, `TcpConnect`, `NetJob`, `PipeRead`)
+/// Polls all non-blocking Ring 3 wait queues (`Sleep`, `GuiEvent`, `TcpConnect`, `NetJob`, `PipeRead`, `Kqueue`, `UmtxWait`)
 /// without holding `USER_SCHED` across external locks.
 pub fn poll_wait_queues(
     mapping: &PhysicalMemoryMapping,
     allocator: &mut PhysicalFrameAllocator<'_>,
 ) {
     let now_ms = timer::uptime_ms();
-    let waiters: Vec<(usize, usize, u64, WaitReason)> = without_interrupts(|| {
+    let waiters: Vec<(usize, usize, usize, u64, WaitReason, bool)> = without_interrupts(|| {
         let sched = USER_SCHED.lock();
         let mut list = Vec::new();
         for (idx, slot) in sched.slots.iter().enumerate() {
             if let Some(ref proc) = slot {
                 if let UserTaskState::Waiting(reason) = proc.state {
-                    list.push((idx, proc.pid, proc.pml4, reason));
+                    let sig_ready = proc
+                        .signals
+                        .next_deliverable()
+                        .map(|s| proc.signals.is_interrupting_signal(s))
+                        .unwrap_or(false);
+                    list.push((idx, proc.pid, proc.tgid, proc.pml4, reason, sig_ready));
                 }
             }
         }
@@ -1411,232 +1598,324 @@ pub fn poll_wait_queues(
         return;
     }
 
-    for (slot_idx, pid, pml4, reason) in waiters {
+    for (slot_idx, pid, tgid, pml4, reason, sig_ready) in waiters {
         let mut wake_ret: Option<i64> = None;
         let mut update_tcp_fd: Option<(usize, usize)> = None;
 
-        match reason {
-            WaitReason::Sleep { wake_ms } => {
-                if now_ms >= wake_ms {
-                    wake_ret = Some(0);
-                }
-            }
-            WaitReason::GuiEvent {
-                win_id,
-                evt_ptr,
-                deadline_ms,
-            } => {
-                let evt = crate::graphics::wm::pop_external_event_from_syscall(win_id);
-                if evt.kind != 0 || now_ms >= deadline_ms {
-                    let evt_bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            (&evt as *const crate::graphics::wm::UserGuiEvent) as *const u8,
-                            core::mem::size_of::<crate::graphics::wm::UserGuiEvent>(),
-                        )
-                    };
-                    if syscall::copy_to_user_bytes_in(
-                        mapping,
-                        Some(allocator),
-                        pml4,
-                        evt_ptr,
-                        evt_bytes,
-                    )
-                    .is_err()
-                    {
-                        wake_ret = Some(-14); // EFAULT
-                    } else if evt.kind != 0 {
-                        wake_ret = Some(1);
-                    } else {
+        if sig_ready {
+            wake_ret = Some(-4); // EINTR
+        } else {
+            match reason {
+                WaitReason::Sleep { wake_ms } => {
+                    if now_ms >= wake_ms {
                         wake_ret = Some(0);
                     }
                 }
-            }
-            WaitReason::TcpConnect {
-                fd,
-                handle,
-                deadline_ms,
-            } => match crate::net::tcp::poll_connect(handle) {
-                Ok(true) => {
-                    update_tcp_fd = Some((fd, handle));
-                    wake_ret = Some(0);
-                }
-                Ok(false) => {
-                    if now_ms >= deadline_ms {
-                        crate::net::tcp::close_socket(handle);
-                        wake_ret = Some(-110); // ETIMEDOUT
+                WaitReason::GuiEvent {
+                    win_id,
+                    evt_ptr,
+                    deadline_ms,
+                } => {
+                    let evt = crate::graphics::wm::pop_external_event_from_syscall(win_id);
+                    if evt.kind != 0 || now_ms >= deadline_ms {
+                        let evt_bytes = unsafe {
+                            core::slice::from_raw_parts(
+                                (&evt as *const crate::graphics::wm::UserGuiEvent) as *const u8,
+                                core::mem::size_of::<crate::graphics::wm::UserGuiEvent>(),
+                            )
+                        };
+                        if syscall::copy_to_user_bytes_in(
+                            mapping,
+                            Some(allocator),
+                            pml4,
+                            evt_ptr,
+                            evt_bytes,
+                        )
+                        .is_err()
+                        {
+                            wake_ret = Some(-14); // EFAULT
+                        } else if evt.kind != 0 {
+                            wake_ret = Some(1);
+                        } else {
+                            wake_ret = Some(0);
+                        }
                     }
                 }
-                Err(_) => {
-                    crate::net::tcp::close_socket(handle);
-                    wake_ret = Some(-111); // ECONNREFUSED
-                }
-            },
-            WaitReason::NetJob {
-                job_id,
-                kind,
-                out_ptr,
-                out_cap,
-                deadline_ms,
-            } => {
-                if let Some(outcome) = kthread::take_net_job_result(job_id) {
-                    let ret = match (kind, outcome) {
-                        (NetWaitKind::Ping, NetJobOutcome::Ping(res)) => match res {
-                            Ok(reply) => reply.rtt_ms as i64,
-                            Err(_) => -110,
-                        },
-                        (NetWaitKind::DnsResolve, NetJobOutcome::DnsResolve(res)) => match res {
-                            Ok(ip) => {
-                                if syscall::copy_to_user_bytes_in(
-                                    mapping,
-                                    Some(allocator),
-                                    pml4,
-                                    out_ptr,
-                                    &ip,
-                                )
-                                .is_err()
-                                {
-                                    -14
-                                } else {
-                                    0
-                                }
-                            }
-                            Err(_) => -110,
-                        },
-                        (NetWaitKind::HttpGet, NetJobOutcome::HttpGet { result }) => match result {
-                            Ok((_ip, _total, body)) => {
-                                let n = body.len().min(out_cap);
-                                if syscall::copy_to_user_bytes_in(
-                                    mapping,
-                                    Some(allocator),
-                                    pml4,
-                                    out_ptr,
-                                    &body[..n],
-                                )
-                                .is_err()
-                                {
-                                    -14
-                                } else {
-                                    n as i64
-                                }
-                            }
-                            Err(_) => -110,
-                        },
-                        _ => -22,
-                    };
-                    wake_ret = Some(ret);
-                } else if now_ms >= deadline_ms {
-                    wake_ret = Some(-110);
-                }
-            }
-            WaitReason::PipeRead {
-                pipe_id,
-                buf_ptr,
-                cap,
-                deadline_ms,
-            } => {
-                let max_read = cap.min(4096);
-                let mut kbuf = alloc::vec![0u8; max_read];
-                match super::ipc::read_pipe(pipe_id, &mut kbuf) {
-                    Ok(n) => {
-                        if n > 0
-                            && syscall::copy_to_user_bytes_in(
-                                mapping,
-                                Some(allocator),
-                                pml4,
-                                buf_ptr,
-                                &kbuf[..n],
-                            )
-                            .is_err()
-                        {
-                            wake_ret = Some(-14);
-                        } else {
-                            wake_ret = Some(n as i64);
+                WaitReason::TcpConnect {
+                    fd,
+                    handle,
+                    deadline_ms,
+                } => match crate::net::tcp::poll_connect(handle) {
+                    Ok(true) => {
+                        update_tcp_fd = Some((fd, handle));
+                        wake_ret = Some(0);
+                    }
+                    Ok(false) => {
+                        if now_ms >= deadline_ms {
+                            crate::net::tcp::close_socket(handle);
+                            wake_ret = Some(-110); // ETIMEDOUT
                         }
+                    }
+                    Err(_) => {
+                        crate::net::tcp::close_socket(handle);
+                        wake_ret = Some(-111); // ECONNREFUSED
+                    }
+                },
+                WaitReason::NetJob {
+                    job_id,
+                    kind,
+                    out_ptr,
+                    out_cap,
+                    deadline_ms,
+                } => {
+                    if let Some(outcome) = kthread::take_net_job_result(job_id) {
+                        let ret = match (kind, outcome) {
+                            (NetWaitKind::Ping, NetJobOutcome::Ping(res)) => match res {
+                                Ok(reply) => reply.rtt_ms as i64,
+                                Err(_) => -110,
+                            },
+                            (NetWaitKind::DnsResolve, NetJobOutcome::DnsResolve(res)) => {
+                                match res {
+                                    Ok(ip) => {
+                                        if syscall::copy_to_user_bytes_in(
+                                            mapping,
+                                            Some(allocator),
+                                            pml4,
+                                            out_ptr,
+                                            &ip,
+                                        )
+                                        .is_err()
+                                        {
+                                            -14
+                                        } else {
+                                            0
+                                        }
+                                    }
+                                    Err(_) => -110,
+                                }
+                            }
+                            (NetWaitKind::HttpGet, NetJobOutcome::HttpGet { result }) => {
+                                match result {
+                                    Ok((_ip, _total, body)) => {
+                                        let n = body.len().min(out_cap);
+                                        if syscall::copy_to_user_bytes_in(
+                                            mapping,
+                                            Some(allocator),
+                                            pml4,
+                                            out_ptr,
+                                            &body[..n],
+                                        )
+                                        .is_err()
+                                        {
+                                            -14
+                                        } else {
+                                            n as i64
+                                        }
+                                    }
+                                    Err(_) => -110,
+                                }
+                            }
+                            _ => -22,
+                        };
+                        wake_ret = Some(ret);
+                    } else if now_ms >= deadline_ms {
+                        wake_ret = Some(-110);
+                    }
+                }
+                WaitReason::PipeRead {
+                    pipe_id,
+                    buf_ptr,
+                    cap,
+                    deadline_ms,
+                } => {
+                    let max_read = cap.min(4096);
+                    let mut kbuf = alloc::vec![0u8; max_read];
+                    match super::ipc::read_pipe(pipe_id, &mut kbuf) {
+                        Ok(n) => {
+                            if n > 0
+                                && syscall::copy_to_user_bytes_in(
+                                    mapping,
+                                    Some(allocator),
+                                    pml4,
+                                    buf_ptr,
+                                    &kbuf[..n],
+                                )
+                                .is_err()
+                            {
+                                wake_ret = Some(-14);
+                            } else {
+                                wake_ret = Some(n as i64);
+                            }
+                        }
+                        Err(-11) => {
+                            if now_ms >= deadline_ms {
+                                wake_ret = Some(-11);
+                            }
+                        }
+                        Err(e) => {
+                            wake_ret = Some(e);
+                        }
+                    }
+                }
+                WaitReason::WaitPid {
+                    target_pid,
+                    status_ptr,
+                } => {
+                    let reaped = without_interrupts(|| {
+                        let mut sched = USER_SCHED.lock();
+                        if let Some(pos) = sched.exited_for_wait.iter().position(|&(ppid, cpid, _)| {
+                            ppid == tgid && (target_pid <= 0 || cpid == target_pid as usize)
+                        }) {
+                            let (_ppid, cpid, code) = sched.exited_for_wait.swap_remove(pos);
+                            Some(Ok((cpid, code)))
+                        } else if !sched.has_live_child_matching(tgid, target_pid) {
+                            Some(Err(-10)) // ECHILD
+                        } else {
+                            None
+                        }
+                    });
+                    match reaped {
+                        Some(Ok((cpid, code))) => {
+                            if status_ptr != 0 {
+                                let status_bytes = (code as i32).to_le_bytes();
+                                if syscall::copy_to_user_bytes_in(
+                                    mapping,
+                                    Some(allocator),
+                                    pml4,
+                                    status_ptr,
+                                    &status_bytes,
+                                )
+                                .is_err()
+                                {
+                                    wake_ret = Some(-14);
+                                } else {
+                                    wake_ret = Some(cpid as i64);
+                                }
+                            } else {
+                                wake_ret = Some(cpid as i64);
+                            }
+                        }
+                        Some(Err(e)) => {
+                            wake_ret = Some(e);
+                        }
+                        None => {}
+                    }
+                }
+                WaitReason::MachPortRecv {
+                    port_id,
+                    rcv_name,
+                    msg_ptr,
+                    rcv_cap,
+                    deadline_ms,
+                } => match ipc::mach_try_recv_msg(port_id) {
+                    Ok(msg) => {
+                        wake_ret = Some(deliver_mach_msg_to_slot(
+                            slot_idx,
+                            pid,
+                            pml4,
+                            port_id,
+                            rcv_name,
+                            msg,
+                            msg_ptr,
+                            rcv_cap,
+                            mapping,
+                            allocator,
+                        ));
                     }
                     Err(-11) => {
                         if now_ms >= deadline_ms {
-                            wake_ret = Some(-11);
+                            wake_ret = Some(-110); // ETIMEDOUT
                         }
                     }
                     Err(e) => {
                         wake_ret = Some(e);
                     }
-                }
-            }
-            WaitReason::WaitPid {
-                target_pid,
-                status_ptr,
-            } => {
-                let reaped = without_interrupts(|| {
-                    let mut sched = USER_SCHED.lock();
-                    if let Some(pos) = sched.exited_for_wait.iter().position(|&(ppid, cpid, _)| {
-                        ppid == pid && (target_pid <= 0 || cpid == target_pid as usize)
-                    }) {
-                        let (_ppid, cpid, code) = sched.exited_for_wait.swap_remove(pos);
-                        Some(Ok((cpid, code)))
-                    } else if !sched.has_live_child_matching(pid, target_pid) {
-                        Some(Err(-10)) // ECHILD
-                    } else {
-                        None
-                    }
-                });
-                match reaped {
-                    Some(Ok((cpid, code))) => {
-                        if status_ptr != 0 {
-                            let status_bytes = (code as i32).to_le_bytes();
+                },
+                WaitReason::Kqueue {
+                    kq_id,
+                    eventlist_ptr,
+                    nevents,
+                    deadline_ms,
+                } => {
+                    let owner_fds = without_interrupts(|| {
+                        let sched = USER_SCHED.lock();
+                        sched.slots[slot_idx]
+                            .as_ref()
+                            .map(|p| p.fds.clone())
+                            .unwrap_or([const { None }; MAX_PROC_FDS])
+                    });
+                    match kqueue::poll_events(
+                        kq_id,
+                        &owner_fds,
+                        nevents,
+                        now_ms,
+                        &|target| is_process_alive(target),
+                    ) {
+                        Ok(events) if !events.is_empty() => {
+                            let elem_sz = core::mem::size_of::<KEvent>();
+                            let raw_bytes = unsafe {
+                                core::slice::from_raw_parts(
+                                    events.as_ptr() as *const u8,
+                                    events.len() * elem_sz,
+                                )
+                            };
                             if syscall::copy_to_user_bytes_in(
                                 mapping,
                                 Some(allocator),
                                 pml4,
-                                status_ptr,
-                                &status_bytes,
+                                eventlist_ptr,
+                                raw_bytes,
                             )
                             .is_err()
                             {
                                 wake_ret = Some(-14);
                             } else {
-                                wake_ret = Some(cpid as i64);
+                                wake_ret = Some(events.len() as i64);
                             }
-                        } else {
-                            wake_ret = Some(cpid as i64);
+                        }
+                        Ok(_) => {
+                            if now_ms >= deadline_ms {
+                                wake_ret = Some(0);
+                            }
+                        }
+                        Err(e) => {
+                            wake_ret = Some(e);
                         }
                     }
-                    Some(Err(e)) => {
-                        wake_ret = Some(e);
+                }
+                WaitReason::UmtxWait {
+                    pml4: wait_pml4,
+                    addr,
+                    val,
+                    is_u64,
+                    deadline_ms,
+                } => {
+                    let mut raw = [0u8; 8];
+                    let sz = if is_u64 { 8 } else { 4 };
+                    if syscall::copy_from_user_bytes_in(
+                        mapping,
+                        Some(allocator),
+                        wait_pml4,
+                        addr,
+                        &mut raw[..sz],
+                    )
+                    .is_err()
+                    {
+                        wake_ret = Some(-14);
+                    } else {
+                        let cur = if is_u64 {
+                            u64::from_le_bytes(raw)
+                        } else {
+                            u32::from_le_bytes(raw[0..4].try_into().unwrap()) as u64
+                        };
+                        if cur != val {
+                            wake_ret = Some(0);
+                        } else if now_ms >= deadline_ms {
+                            wake_ret = Some(-110);
+                        }
                     }
-                    None => {}
                 }
             }
-            WaitReason::MachPortRecv {
-                port_id,
-                rcv_name,
-                msg_ptr,
-                rcv_cap,
-                deadline_ms,
-            } => match ipc::mach_try_recv_msg(port_id) {
-                Ok(msg) => {
-                    wake_ret = Some(deliver_mach_msg_to_slot(
-                        slot_idx,
-                        pid,
-                        pml4,
-                        port_id,
-                        rcv_name,
-                        msg,
-                        msg_ptr,
-                        rcv_cap,
-                        mapping,
-                        allocator,
-                    ));
-                }
-                Err(-11) => {
-                    if now_ms >= deadline_ms {
-                        wake_ret = Some(-110); // ETIMEDOUT
-                    }
-                }
-                Err(e) => {
-                    wake_ret = Some(e);
-                }
-            },
         }
 
         if let Some(ret_val) = wake_ret {
@@ -1654,7 +1933,8 @@ pub fn poll_wait_queues(
                         proc.vruntime_ms = proc
                             .vruntime_ms
                             .max(min_vr.saturating_sub(DEFAULT_QUANTUM_MS * 2));
-                        proc.ctx.rax = ret_val as u64;
+                        proc.ctx.rax =
+                            freebsd::apply_abi_syscall_result(proc.abi, ret_val, &mut proc.ctx.rflags);
                         proc.state = UserTaskState::Ready;
                     }
                 }
@@ -1685,15 +1965,282 @@ fn pick_next_ready_slot(sched: &mut UserScheduler) -> Option<usize> {
     best_idx
 }
 
+fn ensure_sigtramp_mapped_for_slot(
+    slot_idx: usize,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> bool {
+    let info = without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        let proc = sched.slots[slot_idx].as_mut()?;
+        if proc.signals.sigtramp_mapped {
+            return Some((true, proc.pml4, None));
+        }
+        let pml4 = proc.pml4;
+        // Find thread-group leader or any sibling holding the LoadedElfImage
+        let tgid = proc.tgid;
+        let img = proc.image.take().or_else(|| {
+            sched
+                .slots
+                .iter_mut()
+                .flatten()
+                .find(|s| s.tgid == tgid && s.image.is_some())
+                .and_then(|s| s.image.take())
+        });
+        Some((false, pml4, img))
+    });
+
+    let Some((already, pml4, mut img_opt)) = info else {
+        return false;
+    };
+    if already {
+        return true;
+    }
+
+    let tramp_virt = VirtAddr::new(USER_SIGTRAMP_ADDR);
+    if mapping.translate_virtual_address_in(pml4, tramp_virt).is_some() {
+        without_interrupts(|| {
+            let mut sched = USER_SCHED.lock();
+            let tgid = sched.slots[slot_idx].as_ref().map(|p| p.tgid).unwrap_or(0);
+            if let Some(ref mut proc) = sched.slots[slot_idx] {
+                proc.signals.sigtramp_mapped = true;
+            }
+            if let Some(img) = img_opt.take() {
+                if let Some(ref mut proc) = sched.slots[slot_idx] {
+                    if !proc.is_thread {
+                        proc.image = Some(img);
+                        return;
+                    }
+                }
+                if let Some(owner) = sched
+                    .slots
+                    .iter_mut()
+                    .flatten()
+                    .find(|s| s.tgid == tgid && !s.is_thread)
+                {
+                    owner.image = Some(img);
+                } else if let Some(ref mut proc) = sched.slots[slot_idx] {
+                    proc.image = Some(img);
+                }
+            }
+        });
+        return true;
+    }
+
+    let Some(frame) = allocator.allocate_frame() else {
+        if let Some(img) = img_opt {
+            without_interrupts(|| {
+                let mut sched = USER_SCHED.lock();
+                if let Some(ref mut proc) = sched.slots[slot_idx] {
+                    proc.image = Some(img);
+                }
+            });
+        }
+        return false;
+    };
+    let Some(hhdm) = mapping.translate_frame(frame) else {
+        let _ = allocator.deallocate_frame(frame);
+        return false;
+    };
+    unsafe {
+        write_bytes(hhdm.as_u64() as *mut u8, 0, PAGE_SIZE as usize);
+        core::ptr::copy_nonoverlapping(
+            SIGTRAMP_CODE.as_ptr(),
+            hhdm.as_u64() as *mut u8,
+            SIGTRAMP_CODE.len(),
+        );
+    }
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if mapping
+        .map_page_in(allocator, pml4, tramp_virt, frame, flags)
+        .is_err()
+    {
+        let _ = allocator.deallocate_frame(frame);
+        if let Some(img) = img_opt {
+            without_interrupts(|| {
+                let mut sched = USER_SCHED.lock();
+                if let Some(ref mut proc) = sched.slots[slot_idx] {
+                    proc.image = Some(img);
+                }
+            });
+        }
+        return false;
+    }
+
+    without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        let tgid = sched.slots[slot_idx].as_ref().map(|p| p.tgid).unwrap_or(0);
+        if let Some(mut img) = img_opt.take() {
+            img.mapped_pages.push((USER_SIGTRAMP_ADDR, frame));
+            let total_pages = img.mapped_pages.len();
+            if let Some(owner) = sched
+                .slots
+                .iter_mut()
+                .flatten()
+                .find(|s| s.tgid == tgid && !s.is_thread)
+            {
+                owner.pages_mapped = total_pages;
+                owner.image = Some(img);
+            } else if let Some(ref mut proc) = sched.slots[slot_idx] {
+                proc.pages_mapped = total_pages;
+                proc.image = Some(img);
+            }
+        }
+        if let Some(ref mut proc) = sched.slots[slot_idx] {
+            proc.signals.sigtramp_mapped = true;
+        }
+    });
+    true
+}
+
+fn try_deliver_pending_signal_slot(
+    slot_idx: usize,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> bool {
+    loop {
+        let next = without_interrupts(|| {
+            let mut sched = USER_SCHED.lock();
+            let proc = sched.slots[slot_idx].as_mut()?;
+            let sig = proc.signals.next_deliverable()?;
+            proc.signals.clear_pending(sig);
+            let cfg = proc.signals.actions[sig as usize];
+            Some((proc.pml4, proc.ctx, proc.signals.blocked_mask, sig, cfg))
+        });
+
+        let Some((pml4, ctx, old_blocked, sig, cfg)) = next else {
+            return true;
+        };
+
+        if sig == SIGKILL {
+            without_interrupts(|| {
+                let mut sched = USER_SCHED.lock();
+                if let Some(ref mut proc) = sched.slots[slot_idx] {
+                    proc.state = UserTaskState::Exited(-9);
+                }
+            });
+            return false;
+        }
+
+        if cfg.handler == SIG_IGN {
+            continue;
+        }
+        if cfg.handler == SIG_DFL {
+            if signal::default_signal_action(sig) == SignalDefault::Terminate {
+                without_interrupts(|| {
+                    let mut sched = USER_SCHED.lock();
+                    if let Some(ref mut proc) = sched.slots[slot_idx] {
+                        proc.state = UserTaskState::Exited(-(sig as i64));
+                    }
+                });
+                return false;
+            }
+            continue;
+        }
+
+        if !ensure_sigtramp_mapped_for_slot(slot_idx, mapping, allocator) {
+            return true;
+        }
+
+        let frame_size = core::mem::size_of::<SavedSignalFrame>() as u64;
+        // Align signal frame top below red zone, leaving ucontext right above return address so RSP+8 == uctx_ptr
+        let frame_vaddr = ((ctx.rsp.saturating_sub(128)) & !0xF).saturating_sub(frame_size) & !0xF;
+        let ret_addr_rsp = frame_vaddr.saturating_sub(8);
+
+        let saved = SavedSignalFrame {
+            r15: ctx.r15,
+            r14: ctx.r14,
+            r13: ctx.r13,
+            r12: ctx.r12,
+            rbp: ctx.rbp,
+            rbx: ctx.rbx,
+            r11: ctx.r11,
+            r10: ctx.r10,
+            r9: ctx.r9,
+            r8: ctx.r8,
+            rax: ctx.rax,
+            rcx: ctx.rcx,
+            rdx: ctx.rdx,
+            rsi: ctx.rsi,
+            rdi: ctx.rdi,
+            rip: ctx.rip,
+            rflags: ctx.rflags,
+            rsp: ctx.rsp,
+            old_blocked_mask: old_blocked,
+            signo: sig,
+            reserved: 0,
+        };
+
+        let frame_bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&saved as *const SavedSignalFrame) as *const u8,
+                frame_size as usize,
+            )
+        };
+        if syscall::copy_to_user_bytes_in(
+            mapping,
+            Some(allocator),
+            pml4,
+            frame_vaddr,
+            frame_bytes,
+        )
+        .is_err()
+            || syscall::copy_to_user_bytes_in(
+                mapping,
+                Some(allocator),
+                pml4,
+                ret_addr_rsp,
+                &USER_SIGTRAMP_ADDR.to_le_bytes(),
+            )
+            .is_err()
+        {
+            without_interrupts(|| {
+                let mut sched = USER_SCHED.lock();
+                if let Some(ref mut proc) = sched.slots[slot_idx] {
+                    proc.state = UserTaskState::Exited(-(sig as i64));
+                }
+            });
+            return false;
+        }
+
+        without_interrupts(|| {
+            let mut sched = USER_SCHED.lock();
+            if let Some(ref mut proc) = sched.slots[slot_idx] {
+                proc.signals.blocked_mask |= cfg.mask | signal::sig_bit(sig);
+                proc.ctx.rip = cfg.handler;
+                proc.ctx.rsp = ret_addr_rsp;
+                proc.ctx.rdi = sig as u64;
+                proc.ctx.rsi = 0;
+                proc.ctx.rdx = frame_vaddr;
+                proc.ctx.rflags &= !1;
+            }
+        });
+        return true;
+    }
+}
+
 /// Runs up to one preemptive Ring 3 time slice (`DEFAULT_QUANTUM_MS`). Returns `true` if a task executed.
 fn dispatch_one_quantum(
     console: &mut Console<'_>,
     mapping: &PhysicalMemoryMapping,
     allocator: &mut PhysicalFrameAllocator<'_>,
 ) -> bool {
+    let picked_idx = without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        pick_next_ready_slot(&mut sched)
+    });
+
+    let Some(idx) = picked_idx else {
+        return false;
+    };
+
+    if !try_deliver_pending_signal_slot(idx, mapping, allocator) {
+        return false;
+    }
+
     let picked = without_interrupts(|| {
         let mut sched = USER_SCHED.lock();
-        let idx = pick_next_ready_slot(&mut sched)?;
         let now_ms = timer::uptime_ms();
         sched.current_slot = Some(idx);
         sched.quantum_start_ms = now_ms;
@@ -1701,21 +2248,31 @@ fn dispatch_one_quantum(
         let proc = sched.slots[idx].as_mut()?;
         proc.state = UserTaskState::Running;
         LAST_DISPATCH_PID.store(proc.pid as u64, Ordering::Relaxed);
-        Some((proc.pid, proc.pml4, proc.ctx, proc.fpu_state))
+        Some((proc.pid, proc.tgid, proc.abi, proc.fs_base, proc.pml4, proc.ctx, proc.fpu_state))
     });
 
-    let Some((pid, pml4, ctx, mut fpu_state)) = picked else {
+    let Some((pid, tgid, abi, fs_base, pml4, ctx, mut fpu_state)) = picked else {
         return false;
     };
 
-    {
+    if pid == tgid {
         let mut pm = PROCESS_MANAGER.lock();
-        pm.set_process_state(pid, ProcessState::Running);
+        pm.set_process_state(tgid, ProcessState::Running);
     }
 
     QUANTUM_ACTIVE.store(true, Ordering::Release);
     unsafe {
-        syscall::run_user_quantum(console, mapping, allocator, pid, pml4, &ctx, &mut fpu_state);
+        syscall::run_user_quantum(
+            console,
+            mapping,
+            allocator,
+            pid,
+            abi,
+            fs_base,
+            pml4,
+            &ctx,
+            &mut fpu_state,
+        );
     }
     QUANTUM_ACTIVE.store(false, Ordering::Release);
 
@@ -1736,6 +2293,7 @@ fn dispatch_one_quantum(
         sched
             .find_slot_by_pid(pid)
             .and_then(|idx| sched.slots[idx].as_ref())
+            .filter(|p| p.pid == p.tgid)
             .map(|p| match p.state {
                 UserTaskState::Waiting(_) => ProcessState::Blocked,
                 _ => ProcessState::Ready,
@@ -1743,7 +2301,7 @@ fn dispatch_one_quantum(
     });
     if let Some(st) = new_pm_state {
         let mut pm = PROCESS_MANAGER.lock();
-        pm.set_process_state(pid, st);
+        pm.set_process_state(tgid, st);
     }
 
     true
@@ -1759,6 +2317,7 @@ fn close_fd_list(fds: [Option<FdEntry>; MAX_PROC_FDS]) {
             },
             FdEntry::PipeRead { pipe_id } => super::ipc::close_pipe_end(pipe_id, false),
             FdEntry::PipeWrite { pipe_id } => super::ipc::close_pipe_end(pipe_id, true),
+            FdEntry::Kqueue { kq_id } => kqueue::destroy_kqueue(kq_id),
             FdEntry::File { .. } | FdEntry::Dir { .. } => {}
         }
     }
@@ -1802,8 +2361,10 @@ fn collect_finished_and_stdout(
 ) -> (Vec<(usize, String, String)>, Vec<FinishedUserProcess>) {
     let mut stdouts = Vec::new();
     let mut finished = Vec::new();
+    let mut proc_exit_notes: Vec<(usize, i64)> = Vec::new();
     let mut deferred_cleanups: Vec<(
         usize,
+        bool,
         u64,
         Option<LoadedElfImage>,
         [Option<FdEntry>; MAX_PROC_FDS],
@@ -1818,71 +2379,96 @@ fn collect_finished_and_stdout(
         let mut new_wait_entries: Vec<(usize, usize, i64)> = Vec::new();
         let mut dead_parent_pids: Vec<usize> = Vec::new();
 
-        for slot in &mut sched.slots {
-            if let Some(ref mut proc) = slot {
-                if !proc.stdout_buf.is_empty() {
-                    let text = core::mem::take(&mut proc.stdout_buf);
-                    stdouts.push((proc.pid, proc.name.clone(), text));
-                }
-                match proc.state {
-                    UserTaskState::Exited(exit_code) => {
-                        let proc_owned = slot.take().unwrap();
-                        if proc_owned.parent_pid != 0 {
-                            new_wait_entries.push((proc_owned.parent_pid, proc_owned.pid, exit_code));
-                        }
-                        dead_parent_pids.push(proc_owned.pid);
-                        deferred_cleanups.push((
-                            proc_owned.pid,
-                            proc_owned.pml4,
-                            proc_owned.image,
-                            proc_owned.fds,
-                            proc_owned.has_gui_window,
-                            proc_owned.shm_attachments,
-                            proc_owned.owned_shm_ids,
-                            proc_owned.port_rights,
-                        ));
-                        finished.push(FinishedUserProcess {
-                            pid: proc_owned.pid,
-                            name: proc_owned.name,
-                            entry_point: proc_owned.entry_point,
-                            pages_mapped: proc_owned.pages_mapped,
-                            bytes_loaded: proc_owned.bytes_loaded,
-                            outcome: UserTrapOutcome::Exited {
-                                exit_code,
-                                syscalls_served: proc_owned.syscalls_served,
-                            },
-                        });
+        for idx in 0..MAX_USER_PROCS {
+            let Some(ref mut proc) = sched.slots[idx] else {
+                continue;
+            };
+            if !proc.stdout_buf.is_empty() {
+                let text = core::mem::take(&mut proc.stdout_buf);
+                stdouts.push((proc.pid, proc.name.clone(), text));
+            }
+            let exit_outcome = match proc.state {
+                UserTaskState::Exited(code) => Some((true, code)),
+                UserTaskState::Faulted(fault) => Some((false, fault.vector as i64)),
+                _ => None,
+            };
+            let Some((is_clean_exit, raw_code)) = exit_outcome else {
+                continue;
+            };
+            let proc_owned = sched.slots[idx].take().unwrap();
+            let siblings_remain = sched.count_tgid(proc_owned.tgid) > 0;
+
+            let mut img_to_free = proc_owned.image;
+            let mut shms_to_free = proc_owned.shm_attachments;
+            let mut owned_shms_to_free = proc_owned.owned_shm_ids;
+            let mut ports_to_free = proc_owned.port_rights;
+            let mut had_gui_to_free = proc_owned.has_gui_window;
+
+            if siblings_remain {
+                if let Some(survivor) = sched
+                    .slots
+                    .iter_mut()
+                    .flatten()
+                    .find(|s| s.tgid == proc_owned.tgid)
+                {
+                    if survivor.image.is_none() {
+                        survivor.image = img_to_free.take();
                     }
-                    UserTaskState::Faulted(fault) => {
-                        let proc_owned = slot.take().unwrap();
-                        if proc_owned.parent_pid != 0 {
-                            new_wait_entries.push((proc_owned.parent_pid, proc_owned.pid, -11));
-                        }
-                        dead_parent_pids.push(proc_owned.pid);
-                        deferred_cleanups.push((
-                            proc_owned.pid,
-                            proc_owned.pml4,
-                            proc_owned.image,
-                            proc_owned.fds,
-                            proc_owned.has_gui_window,
-                            proc_owned.shm_attachments,
-                            proc_owned.owned_shm_ids,
-                            proc_owned.port_rights,
-                        ));
-                        finished.push(FinishedUserProcess {
-                            pid: proc_owned.pid,
-                            name: proc_owned.name,
-                            entry_point: proc_owned.entry_point,
-                            pages_mapped: proc_owned.pages_mapped,
-                            bytes_loaded: proc_owned.bytes_loaded,
-                            outcome: UserTrapOutcome::Faulted {
-                                fault,
-                                syscalls_served: proc_owned.syscalls_served,
-                            },
-                        });
+                    if !shms_to_free.is_empty() && survivor.shm_attachments.is_empty() {
+                        survivor.shm_attachments = core::mem::take(&mut shms_to_free);
                     }
-                    _ => {}
+                    if !owned_shms_to_free.is_empty() {
+                        survivor.owned_shm_ids.extend(owned_shms_to_free.drain(..));
+                    }
+                    if !ports_to_free.is_empty() && survivor.port_rights.is_empty() {
+                        survivor.port_rights = core::mem::take(&mut ports_to_free);
+                    }
+                    if had_gui_to_free {
+                        survivor.has_gui_window = true;
+                        had_gui_to_free = false;
+                    }
                 }
+            } else {
+                let report_code = if is_clean_exit { raw_code } else { -11 };
+                if proc_owned.parent_pid != 0 {
+                    new_wait_entries.push((proc_owned.parent_pid, proc_owned.tgid, report_code));
+                }
+                dead_parent_pids.push(proc_owned.tgid);
+                proc_exit_notes.push((proc_owned.tgid, report_code));
+            }
+
+            deferred_cleanups.push((
+                proc_owned.tgid,
+                !siblings_remain,
+                proc_owned.pml4,
+                img_to_free,
+                proc_owned.fds,
+                had_gui_to_free,
+                shms_to_free,
+                owned_shms_to_free,
+                ports_to_free,
+            ));
+
+            if !siblings_remain {
+                let outcome = match proc_owned.state {
+                    UserTaskState::Exited(exit_code) => UserTrapOutcome::Exited {
+                        exit_code,
+                        syscalls_served: proc_owned.syscalls_served,
+                    },
+                    UserTaskState::Faulted(fault) => UserTrapOutcome::Faulted {
+                        fault,
+                        syscalls_served: proc_owned.syscalls_served,
+                    },
+                    _ => unreachable!(),
+                };
+                finished.push(FinishedUserProcess {
+                    pid: proc_owned.tgid,
+                    name: proc_owned.name,
+                    entry_point: proc_owned.entry_point,
+                    pages_mapped: proc_owned.pages_mapped,
+                    bytes_loaded: proc_owned.bytes_loaded,
+                    outcome,
+                });
             }
         }
 
@@ -1892,32 +2478,56 @@ fn collect_finished_and_stdout(
                 .retain(|&(ppid, _, _)| !dead_parent_pids.contains(&ppid));
         }
         for (ppid, cpid, code) in new_wait_entries {
-            if sched.find_slot_by_pid(ppid).is_some() {
+            if let Some(p_idx) = sched
+                .slots
+                .iter()
+                .position(|s| s.as_ref().map(|p| p.tgid) == Some(ppid))
+            {
                 sched.exited_for_wait.push((ppid, cpid, code));
+                if let Some(ref mut parent_slot) = sched.slots[p_idx] {
+                    parent_slot.signals.raise(SIGCHLD);
+                }
             }
         }
     });
 
-    for (pid, pml4, img_opt, fds, had_gui, shm_atts, owned_shms, port_rights) in deferred_cleanups {
+    for (pid, code) in proc_exit_notes {
+        kqueue::notify_process_exit(pid, code);
+    }
+
+    for (
+        tgid,
+        destroy_aspace,
+        pml4,
+        img_opt,
+        fds,
+        had_gui,
+        shm_atts,
+        owned_shms,
+        port_rights,
+    ) in deferred_cleanups
+    {
         close_fd_list(fds);
-        cleanup_process_ipc_and_windows(
-            pid,
-            pml4,
-            had_gui,
-            shm_atts,
-            owned_shms,
-            port_rights,
-            mapping,
-            allocator,
-        );
-        if let Some(mut img) = img_opt {
-            elf::cleanup_loaded_image(&mut img, pml4, mapping, allocator);
+        if destroy_aspace {
+            cleanup_process_ipc_and_windows(
+                tgid,
+                pml4,
+                had_gui,
+                shm_atts,
+                owned_shms,
+                port_rights,
+                mapping,
+                allocator,
+            );
+            if let Some(mut img) = img_opt {
+                elf::cleanup_loaded_image(&mut img, pml4, mapping, allocator);
+            }
+            let mut pm = PROCESS_MANAGER.lock();
+            unsafe {
+                let _ = pm.terminate_process(tgid, mapping, allocator);
+            }
+            let _ = pm.reap_process(tgid);
         }
-        let mut pm = PROCESS_MANAGER.lock();
-        unsafe {
-            let _ = pm.terminate_process(pid, mapping, allocator);
-        }
-        let _ = pm.reap_process(pid);
     }
 
     (stdouts, finished)
@@ -2062,22 +2672,42 @@ pub fn kill_user_process(
     let mapping = mapping.ok_or("Physical memory mapping is unavailable")?;
     let removed = without_interrupts(|| {
         let mut sched = USER_SCHED.lock();
-        let idx = sched.find_slot_by_pid(pid)?;
+        let idx = sched
+            .find_slot_by_pid(pid)
+            .or_else(|| sched.slots.iter().position(|s| s.as_ref().map(|p| p.tgid) == Some(pid)))?;
         let proc = sched.slots[idx].take()?;
-        sched.exited_for_wait.retain(|&(ppid, _, _)| ppid != pid);
-        if proc.parent_pid != 0 && sched.find_slot_by_pid(proc.parent_pid).is_some() {
-            sched.exited_for_wait.push((proc.parent_pid, pid, -9));
+        let tgid = proc.tgid;
+        let mut extras = Vec::new();
+        for s_idx in 0..MAX_USER_PROCS {
+            if sched.slots[s_idx].as_ref().map(|p| p.tgid) == Some(tgid) {
+                if let Some(extra) = sched.slots[s_idx].take() {
+                    extras.push(extra);
+                }
+            }
         }
-        Some(proc)
+        sched.exited_for_wait.retain(|&(ppid, _, _)| ppid != tgid);
+        if proc.parent_pid != 0 && sched.find_slot_by_pid(proc.parent_pid).is_some() {
+            sched.exited_for_wait.push((proc.parent_pid, tgid, -9));
+        }
+        Some((proc, extras))
     });
 
-    let Some(mut proc) = removed else {
+    let Some((mut proc, extras)) = removed else {
         return Err("Ring 3 PID not found in active scheduler");
     };
 
+    let tgid = proc.tgid;
+    kqueue::notify_process_exit(tgid, -9);
+
+    for extra in extras {
+        close_fd_list(extra.fds);
+        if proc.image.is_none() {
+            proc.image = extra.image;
+        }
+    }
     close_fd_list(proc.fds);
     cleanup_process_ipc_and_windows(
-        pid,
+        tgid,
         proc.pml4,
         proc.has_gui_window,
         proc.shm_attachments,
@@ -2091,14 +2721,14 @@ pub fn kill_user_process(
     }
     let mut pm = PROCESS_MANAGER.lock();
     unsafe {
-        let _ = pm.terminate_process(pid, mapping, allocator);
+        let _ = pm.terminate_process(tgid, mapping, allocator);
     }
-    let _ = pm.reap_process(pid);
+    let _ = pm.reap_process(tgid);
 
     if crate::graphics::wm::is_desktop_active() {
         crate::graphics::wm::append_user_stdout(&format!(
             "[PID {} '{}' killed by user]\n",
-            pid, proc.name
+            tgid, proc.name
         ));
     }
     Ok(())
@@ -2127,6 +2757,8 @@ pub fn snapshot_processes() -> Vec<UserProcSnapshot> {
                     WaitReason::PipeRead { .. } => "WaitPipe",
                     WaitReason::WaitPid { .. } => "WaitPid",
                     WaitReason::MachPortRecv { .. } => "WaitMach",
+                    WaitReason::Kqueue { .. } => "WaitKev",
+                    WaitReason::UmtxWait { .. } => "WaitUmtx",
                 },
                 UserTaskState::Exited(_) => "Exited",
                 UserTaskState::Faulted(_) => "Faulted",
@@ -2185,12 +2817,24 @@ pub fn fork_current_process(
         let sched = USER_SCHED.lock();
         let idx = sched.current_slot?;
         let p = sched.slots[idx].as_ref()?;
-        let img = p.image.as_ref()?;
+        let tgid = p.tgid;
+        let img = p.image.as_ref().or_else(|| {
+            sched
+                .slots
+                .iter()
+                .flatten()
+                .find(|s| s.tgid == tgid && s.image.is_some())
+                .and_then(|s| s.image.as_ref())
+        })?;
         Some((
-            p.pid,
+            tgid,
+            p.abi,
             p.name.clone(),
             p.pml4,
             p.fpu_state,
+            p.fs_base,
+            p.gs_base,
+            p.signals.clone_for_fork(),
             p.weight,
             p.entry_point,
             p.bytes_loaded,
@@ -2207,6 +2851,11 @@ pub fn fork_current_process(
             img.user_rsp,
             img.initial_argc,
             img.initial_argv,
+            img.auxv_ptr,
+            img.phdr_vaddr,
+            img.ph_ent,
+            img.ph_num,
+            img.osreldate,
             img.load_regions.clone(),
             img.load_segment_count,
         ))
@@ -2214,9 +2863,13 @@ pub fn fork_current_process(
 
     let Some((
         parent_pid,
+        parent_abi,
         parent_name,
         parent_pml4,
         parent_fpu,
+        parent_fs_base,
+        parent_gs_base,
+        child_signals,
         parent_weight,
         entry_point,
         bytes_loaded,
@@ -2233,6 +2886,11 @@ pub fn fork_current_process(
         user_rsp,
         initial_argc,
         initial_argv,
+        auxv_ptr,
+        phdr_vaddr,
+        ph_ent,
+        ph_num,
+        osreldate,
         load_regions,
         load_segment_count,
     )) = snapshot
@@ -2263,17 +2921,18 @@ pub fn fork_current_process(
         .map(|a| (a.vaddr, a.vaddr + (a.page_count as u64) * PAGE_SIZE))
         .collect();
 
-    let mut cloned_pages = match mapping.clone_user_cow_tables(parent_pml4, child_pml4, allocator, &shm_ranges) {
-        Ok(pages) => pages,
-        Err(_) => {
-            let mut pm = PROCESS_MANAGER.lock();
-            unsafe {
-                let _ = pm.terminate_process(child_pid, mapping, allocator);
+    let mut cloned_pages =
+        match mapping.clone_user_cow_tables(parent_pml4, child_pml4, allocator, &shm_ranges) {
+            Ok(pages) => pages,
+            Err(_) => {
+                let mut pm = PROCESS_MANAGER.lock();
+                unsafe {
+                    let _ = pm.terminate_process(child_pid, mapping, allocator);
+                }
+                let _ = pm.reap_process(child_pid);
+                return -12;
             }
-            let _ = pm.reap_process(child_pid);
-            return -12;
-        }
-    };
+        };
 
     // Re-attach shared memory regions directly without CoW duplication
     let mut attached_shms: Vec<ShmAttachment> = Vec::with_capacity(shm_attachments.len());
@@ -2347,12 +3006,12 @@ pub fn fork_current_process(
         return -12;
     }
 
-    // Inherit file descriptors: pipes retain refcount, single-owner sockets are not duplicated
+    // Inherit file descriptors: pipes retain refcount, sockets & kqueues are per-process and cleared
     for slot in &mut child_fds {
         match slot {
             Some(FdEntry::PipeRead { pipe_id }) => ipc::retain_pipe_end(*pipe_id, false),
             Some(FdEntry::PipeWrite { pipe_id }) => ipc::retain_pipe_end(*pipe_id, true),
-            Some(FdEntry::Socket(_)) => *slot = None,
+            Some(FdEntry::Socket(_)) | Some(FdEntry::Kqueue { .. }) => *slot = None,
             _ => {}
         }
     }
@@ -2362,7 +3021,8 @@ pub fn fork_current_process(
     for entry in &parent_port_rights {
         match entry.right {
             PortRightKind::Receive => {
-                if entry.also_send && ipc::mach_retain_right(entry.port_id, PortRightKind::Send, false) {
+                if entry.also_send && ipc::mach_retain_right(entry.port_id, PortRightKind::Send, false)
+                {
                     child_port_rights.push(PortRightEntry {
                         name: entry.name,
                         port_id: entry.port_id,
@@ -2387,6 +3047,8 @@ pub fn fork_current_process(
 
     let mut child_ctx = parent_ctx;
     child_ctx.rax = 0;
+    child_ctx.rdx = 1; // FreeBSD ABI fork convention: child has rdx=1, parent rdx=0
+    child_ctx.rflags &= !1;
 
     let pages_mapped = cloned_pages.len() + shm_pages_mapped;
     let child_image = LoadedElfImage {
@@ -2395,6 +3057,12 @@ pub fn fork_current_process(
         brk_base,
         initial_argc,
         initial_argv,
+        abi: parent_abi,
+        auxv_ptr,
+        phdr_vaddr,
+        ph_ent,
+        ph_num,
+        osreldate,
         mapped_pages: cloned_pages,
         load_regions,
         load_segment_count,
@@ -2409,11 +3077,18 @@ pub fn fork_current_process(
         };
         sched.slots[empty_idx] = Some(UserProcessSlot {
             pid: child_pid,
+            tgid: child_pid,
+            is_thread: false,
             parent_pid,
+            abi: parent_abi,
             name: format!("{}[fork]", parent_name),
             pml4: child_pml4,
             ctx: child_ctx,
             fpu_state: parent_fpu,
+            fs_base: parent_fs_base,
+            gs_base: parent_gs_base,
+            clear_child_tid: 0,
+            signals: child_signals,
             state: UserTaskState::Ready,
             cpu_ms: 0,
             vruntime_ms: start_vr,
@@ -2468,8 +3143,11 @@ pub fn fork_current_process(
         KLogLevel::Mm,
         "fork",
         format_args!(
-            "PID {} forked -> child PID {} ({} CoW pages)",
-            parent_pid, child_pid, pages_mapped
+            "PID {} ({}) forked -> child PID {} ({} CoW pages)",
+            parent_pid,
+            parent_abi.name(),
+            child_pid,
+            pages_mapped
         ),
     );
     child_pid as i64
@@ -3191,6 +3869,798 @@ pub fn sys_mach_msg_current(
             })
         }
         Err(e) => Ok(e),
+    }
+}
+
+pub fn sys_kevent_current(
+    fd: usize,
+    changelist_ptr: u64,
+    nchanges: usize,
+    eventlist_ptr: u64,
+    nevents: usize,
+    timeout_ptr: u64,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> Result<i64, WaitReason> {
+    let caller = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        let idx = sched.current_slot?;
+        let proc = sched.slots[idx].as_ref()?;
+        if fd < FD_OFFSET || fd >= FD_OFFSET + MAX_PROC_FDS {
+            return None;
+        }
+        let Some(FdEntry::Kqueue { kq_id }) = proc.fds[fd - FD_OFFSET] else {
+            return None;
+        };
+        Some((idx, proc.pml4, kq_id, proc.fds.clone()))
+    });
+
+    let Some((_slot_idx, pml4, kq_id, owner_fds)) = caller else {
+        return Ok(-9); // EBADF
+    };
+
+    let now_ms = timer::uptime_ms();
+    let kevent_sz = core::mem::size_of::<KEvent>();
+
+    if nchanges > 0 {
+        let capped = nchanges.min(64);
+        let byte_len = capped * kevent_sz;
+        let mut raw = alloc::vec![0u8; byte_len];
+        if syscall::copy_from_user_bytes_in(mapping, Some(allocator), pml4, changelist_ptr, &mut raw)
+            .is_err()
+        {
+            return Ok(-14);
+        }
+        let mut changes = Vec::with_capacity(capped);
+        for i in 0..capped {
+            let ev = unsafe {
+                core::ptr::read_unaligned(raw[i * kevent_sz..].as_ptr() as *const KEvent)
+            };
+            changes.push(ev);
+        }
+        if let Err(e) = kqueue::apply_changes(kq_id, &changes, now_ms) {
+            return Ok(e);
+        }
+    }
+
+    if nevents == 0 || eventlist_ptr == 0 {
+        return Ok(0);
+    }
+
+    let capped_ev = nevents.min(64);
+    let wait_ms = if timeout_ptr == 0 {
+        10_000u64
+    } else {
+        let mut raw_ts = [0u8; core::mem::size_of::<freebsd::TimeSpec>()];
+        if syscall::copy_from_user_bytes_in(mapping, Some(allocator), pml4, timeout_ptr, &mut raw_ts)
+            .is_err()
+        {
+            return Ok(-14);
+        }
+        let ts: freebsd::TimeSpec =
+            unsafe { core::ptr::read_unaligned(raw_ts.as_ptr() as *const freebsd::TimeSpec) };
+        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+            return Ok(-22);
+        }
+        ((ts.tv_sec as u64).saturating_mul(1000))
+            .saturating_add((ts.tv_nsec as u64) / 1_000_000)
+            .min(30_000)
+    };
+
+    match kqueue::poll_events(
+        kq_id,
+        &owner_fds,
+        capped_ev,
+        now_ms,
+        &|target| is_process_alive(target),
+    ) {
+        Ok(events) if !events.is_empty() => {
+            let raw_bytes = unsafe {
+                core::slice::from_raw_parts(events.as_ptr() as *const u8, events.len() * kevent_sz)
+            };
+            if syscall::copy_to_user_bytes_in(
+                mapping,
+                Some(allocator),
+                pml4,
+                eventlist_ptr,
+                raw_bytes,
+            )
+            .is_err()
+            {
+                Ok(-14)
+            } else {
+                Ok(events.len() as i64)
+            }
+        }
+        Ok(_) => {
+            if wait_ms == 0 {
+                Ok(0)
+            } else {
+                Err(WaitReason::Kqueue {
+                    kq_id,
+                    eventlist_ptr,
+                    nevents: capped_ev,
+                    deadline_ms: now_ms.saturating_add(wait_ms),
+                })
+            }
+        }
+        Err(e) => Ok(e),
+    }
+}
+
+pub fn sys_sigprocmask_current(
+    how: i32,
+    set_ptr: u64,
+    oset_ptr: u64,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> i64 {
+    let info = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        let idx = sched.current_slot?;
+        let proc = sched.slots[idx].as_ref()?;
+        Some((idx, proc.pml4, proc.signals.blocked_mask))
+    });
+    let Some((slot_idx, pml4, old_mask)) = info else {
+        return -22;
+    };
+
+    let sigset_sz = core::mem::size_of::<FreeBsdSigSet>();
+    if oset_ptr != 0 {
+        let old_set = FreeBsdSigSet::from_mask64(old_mask);
+        let bytes = unsafe {
+            core::slice::from_raw_parts((&old_set as *const FreeBsdSigSet) as *const u8, sigset_sz)
+        };
+        if syscall::copy_to_user_bytes_in(mapping, Some(allocator), pml4, oset_ptr, bytes).is_err()
+        {
+            return -14;
+        }
+    }
+
+    if set_ptr != 0 {
+        let mut raw = [0u8; core::mem::size_of::<FreeBsdSigSet>()];
+        if syscall::copy_from_user_bytes_in(mapping, Some(allocator), pml4, set_ptr, &mut raw)
+            .is_err()
+        {
+            return -14;
+        }
+        let in_set: FreeBsdSigSet =
+            unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const FreeBsdSigSet) };
+        let req = in_set.to_mask64() & !signal::sig_bit(SIGKILL);
+        let new_mask = match how {
+            SIG_BLOCK => old_mask | req,
+            SIG_UNBLOCK => old_mask & !req,
+            SIG_SETMASK => req,
+            _ => return -22,
+        };
+        without_interrupts(|| {
+            let mut sched = USER_SCHED.lock();
+            if let Some(ref mut proc) = sched.slots[slot_idx] {
+                proc.signals.blocked_mask = new_mask;
+            }
+        });
+    }
+    0
+}
+
+pub fn sys_sigaction_current(
+    sig: u32,
+    act_ptr: u64,
+    oact_ptr: u64,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> i64 {
+    if sig == 0 || sig > signal::MAX_SIGNAL || sig == SIGKILL {
+        return -22;
+    }
+
+    let info = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        let idx = sched.current_slot?;
+        let proc = sched.slots[idx].as_ref()?;
+        Some((idx, proc.pml4, proc.signals.actions[sig as usize]))
+    });
+    let Some((slot_idx, pml4, prev_cfg)) = info else {
+        return -22;
+    };
+
+    let act_sz = core::mem::size_of::<FreeBsdSigAction>();
+    if oact_ptr != 0 {
+        let oact = FreeBsdSigAction {
+            sa_handler: prev_cfg.handler,
+            sa_flags: prev_cfg.flags,
+            _pad: 0,
+            sa_mask: FreeBsdSigSet::from_mask64(prev_cfg.mask).bits,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts((&oact as *const FreeBsdSigAction) as *const u8, act_sz)
+        };
+        if syscall::copy_to_user_bytes_in(mapping, Some(allocator), pml4, oact_ptr, bytes).is_err()
+        {
+            return -14;
+        }
+    }
+
+    if act_ptr != 0 {
+        let mut raw = [0u8; core::mem::size_of::<FreeBsdSigAction>()];
+        if syscall::copy_from_user_bytes_in(mapping, Some(allocator), pml4, act_ptr, &mut raw)
+            .is_err()
+        {
+            return -14;
+        }
+        let act: FreeBsdSigAction =
+            unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const FreeBsdSigAction) };
+        let new_cfg = SignalHandlerConfig {
+            handler: act.sa_handler,
+            flags: act.sa_flags,
+            mask: (act.sa_mask[0] as u64) & 0xFFFF_FFFF & !signal::sig_bit(SIGKILL),
+        };
+        without_interrupts(|| {
+            let mut sched = USER_SCHED.lock();
+            if let Some(ref mut proc) = sched.slots[slot_idx] {
+                proc.signals.actions[sig as usize] = new_cfg;
+            }
+        });
+    }
+    0
+}
+
+pub fn sys_sigreturn_current(
+    frame: &mut SyscallFrame,
+    uctx_ptr: u64,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> i64 {
+    let info = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        let idx = sched.current_slot?;
+        let proc = sched.slots[idx].as_ref()?;
+        Some((idx, proc.pml4))
+    });
+    let Some((slot_idx, pml4)) = info else {
+        return -22;
+    };
+
+    let mut raw = [0u8; core::mem::size_of::<SavedSignalFrame>()];
+    if syscall::copy_from_user_bytes_in(mapping, Some(allocator), pml4, uctx_ptr, &mut raw).is_err()
+    {
+        return -14;
+    }
+    let saved: SavedSignalFrame =
+        unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const SavedSignalFrame) };
+    if saved.rip == 0 || saved.rip >= USER_ADDR_LIMIT {
+        return -22;
+    }
+
+    frame.r15 = saved.r15;
+    frame.r14 = saved.r14;
+    frame.r13 = saved.r13;
+    frame.r12 = saved.r12;
+    frame.rbp = saved.rbp;
+    frame.rbx = saved.rbx;
+    frame.r10 = saved.r10;
+    frame.r9 = saved.r9;
+    frame.r8 = saved.r8;
+    frame.rax = saved.rax;
+    frame.rdx = saved.rdx;
+    frame.rsi = saved.rsi;
+    frame.rdi = saved.rdi;
+    frame.user_rip = saved.rip;
+    frame.user_rflags = (saved.rflags & 0x0020_0CD5) | 0x0202 | (saved.rflags & 1);
+    frame.user_rsp = saved.rsp;
+
+    without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        if let Some(ref mut proc) = sched.slots[slot_idx] {
+            proc.signals.blocked_mask = saved.old_blocked_mask & !signal::sig_bit(SIGKILL);
+        }
+    });
+    0
+}
+
+pub fn deliver_pending_signal_on_syscall_return(
+    frame: &mut SyscallFrame,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) {
+    let cur_idx = without_interrupts(|| USER_SCHED.lock().current_slot);
+    let Some(slot_idx) = cur_idx else {
+        return;
+    };
+
+    loop {
+        let next = without_interrupts(|| {
+            let mut sched = USER_SCHED.lock();
+            let proc = sched.slots[slot_idx].as_mut()?;
+            let sig = proc.signals.next_deliverable()?;
+            proc.signals.clear_pending(sig);
+            let cfg = proc.signals.actions[sig as usize];
+            Some((proc.pml4, proc.signals.blocked_mask, sig, cfg))
+        });
+
+        let Some((pml4, old_blocked, sig, cfg)) = next else {
+            return;
+        };
+
+        if sig == SIGKILL {
+            unsafe {
+                finish_current_from_syscall(-9);
+            }
+        }
+        if cfg.handler == SIG_IGN {
+            continue;
+        }
+        if cfg.handler == SIG_DFL {
+            if signal::default_signal_action(sig) == SignalDefault::Terminate {
+                unsafe {
+                    finish_current_from_syscall(-(sig as i64));
+                }
+            }
+            continue;
+        }
+
+        if !ensure_sigtramp_mapped_for_slot(slot_idx, mapping, allocator) {
+            return;
+        }
+
+        let frame_size = core::mem::size_of::<SavedSignalFrame>() as u64;
+        let frame_vaddr =
+            ((frame.user_rsp.saturating_sub(128)) & !0xF).saturating_sub(frame_size) & !0xF;
+        let ret_addr_rsp = frame_vaddr.saturating_sub(8);
+
+        let saved = SavedSignalFrame {
+            r15: frame.r15,
+            r14: frame.r14,
+            r13: frame.r13,
+            r12: frame.r12,
+            rbp: frame.rbp,
+            rbx: frame.rbx,
+            r11: frame.user_rflags,
+            r10: frame.r10,
+            r9: frame.r9,
+            r8: frame.r8,
+            rax: frame.rax,
+            rcx: frame.user_rip,
+            rdx: frame.rdx,
+            rsi: frame.rsi,
+            rdi: frame.rdi,
+            rip: frame.user_rip,
+            rflags: frame.user_rflags,
+            rsp: frame.user_rsp,
+            old_blocked_mask: old_blocked,
+            signo: sig,
+            reserved: 0,
+        };
+
+        let frame_bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&saved as *const SavedSignalFrame) as *const u8,
+                frame_size as usize,
+            )
+        };
+        if syscall::copy_to_user_bytes_in(
+            mapping,
+            Some(allocator),
+            pml4,
+            frame_vaddr,
+            frame_bytes,
+        )
+        .is_err()
+            || syscall::copy_to_user_bytes_in(
+                mapping,
+                Some(allocator),
+                pml4,
+                ret_addr_rsp,
+                &USER_SIGTRAMP_ADDR.to_le_bytes(),
+            )
+            .is_err()
+        {
+            unsafe {
+                finish_current_from_syscall(-(sig as i64));
+            }
+        }
+
+        without_interrupts(|| {
+            let mut sched = USER_SCHED.lock();
+            if let Some(ref mut proc) = sched.slots[slot_idx] {
+                proc.signals.blocked_mask |= cfg.mask | signal::sig_bit(sig);
+            }
+        });
+
+        frame.user_rip = cfg.handler;
+        frame.user_rsp = ret_addr_rsp;
+        frame.rdi = sig as u64;
+        frame.rsi = 0;
+        frame.rdx = frame_vaddr;
+        frame.user_rflags &= !1;
+        return;
+    }
+}
+
+pub fn sys_kill_current(target_pid: isize, sig: u32) -> i64 {
+    if sig > signal::MAX_SIGNAL {
+        return -22;
+    }
+    without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        let my_tgid = sched
+            .current_slot
+            .and_then(|idx| sched.slots[idx].as_ref().map(|p| p.tgid))
+            .unwrap_or(0);
+        let dest_tgid = if target_pid <= 0 {
+            my_tgid
+        } else {
+            target_pid as usize
+        };
+        let mut delivered = false;
+        for proc in sched.slots.iter_mut().flatten() {
+            if proc.tgid == dest_tgid {
+                if sig != 0 {
+                    proc.signals.raise(sig);
+                }
+                delivered = true;
+                break;
+            }
+        }
+        if delivered {
+            0
+        } else {
+            -3 // ESRCH
+        }
+    })
+}
+
+pub fn sys_thr_kill_current(tid: i64, sig: u32) -> i64 {
+    if sig > signal::MAX_SIGNAL {
+        return -22;
+    }
+    without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        let my_tgid = sched
+            .current_slot
+            .and_then(|idx| sched.slots[idx].as_ref().map(|p| p.tgid))
+            .unwrap_or(0);
+        let target_pid = if tid <= 0 {
+            sched
+                .current_slot
+                .and_then(|idx| sched.slots[idx].as_ref().map(|p| p.pid))
+                .unwrap_or(0)
+        } else {
+            tid as usize
+        };
+        for proc in sched.slots.iter_mut().flatten() {
+            if proc.pid == target_pid && proc.tgid == my_tgid {
+                if sig != 0 {
+                    proc.signals.raise(sig);
+                }
+                return 0;
+            }
+        }
+        -3 // ESRCH
+    })
+}
+
+pub fn sys_thr_new_current(
+    param_ptr: u64,
+    param_size: usize,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> i64 {
+    if active_count() >= MAX_USER_PROCS {
+        return -11; // EAGAIN
+    }
+    let expected_sz = core::mem::size_of::<ThrParam>();
+    if param_size < expected_sz || param_size > 256 || param_ptr == 0 {
+        return -22;
+    }
+
+    let caller_info = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        let idx = sched.current_slot?;
+        let p = sched.slots[idx].as_ref()?;
+        Some((
+            p.tgid,
+            p.parent_pid,
+            p.abi,
+            p.name.clone(),
+            p.pml4,
+            p.weight,
+            p.entry_point,
+            p.pages_mapped,
+            p.bytes_loaded,
+            p.brk_base,
+            p.brk_current,
+            p.mmap_next,
+            p.shm_attach_next,
+            p.vmas.clone(),
+            p.fds.clone(),
+            p.signals.clone_for_fork(),
+        ))
+    });
+
+    let Some((
+        tgid,
+        parent_pid,
+        abi,
+        parent_name,
+        pml4,
+        weight,
+        entry_point,
+        pages_mapped,
+        bytes_loaded,
+        brk_base,
+        brk_current,
+        mmap_next,
+        shm_attach_next,
+        vmas,
+        mut thread_fds,
+        thread_signals,
+    )) = caller_info
+    else {
+        return -22;
+    };
+
+    let mut raw = alloc::vec![0u8; expected_sz];
+    if syscall::copy_from_user_bytes_in(mapping, Some(allocator), pml4, param_ptr, &mut raw)
+        .is_err()
+    {
+        return -14;
+    }
+    let param: ThrParam = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const ThrParam) };
+
+    if param.start_func == 0 || param.start_func >= USER_ADDR_LIMIT {
+        return -22;
+    }
+    if param.stack_base == 0 || param.stack_size < 64 {
+        return -22;
+    }
+    let Some(stack_top) = param.stack_base.checked_add(param.stack_size) else {
+        return -22;
+    };
+    if stack_top > USER_ADDR_LIMIT {
+        return -14;
+    }
+    let entry_rsp = (stack_top & !0xF).saturating_sub(8);
+    if syscall::copy_to_user_bytes_in(mapping, Some(allocator), pml4, entry_rsp, &0u64.to_le_bytes())
+        .is_err()
+    {
+        return -14;
+    }
+
+    for slot in &mut thread_fds {
+        match slot {
+            Some(FdEntry::PipeRead { pipe_id }) => ipc::retain_pipe_end(*pipe_id, false),
+            Some(FdEntry::PipeWrite { pipe_id }) => ipc::retain_pipe_end(*pipe_id, true),
+            Some(FdEntry::Socket(_)) | Some(FdEntry::Kqueue { .. }) => *slot = None,
+            _ => {}
+        }
+    }
+
+    let selectors = crate::arch::gdt::selectors();
+    let ctx = UserCpuContext {
+        rip: param.start_func,
+        rsp: entry_rsp,
+        rdi: param.arg,
+        cs: selectors.user_code.0 as u64,
+        ss: selectors.user_data.0 as u64,
+        rflags: 0x0202,
+        ..UserCpuContext::default()
+    };
+
+    let tid_res = without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        let Some(empty_idx) = sched.slots.iter().position(|s| s.is_none()) else {
+            return None;
+        };
+        let tid = sched.alloc_tid();
+        let start_vr = sched.min_runnable_vruntime();
+        sched.slots[empty_idx] = Some(UserProcessSlot {
+            pid: tid,
+            tgid,
+            is_thread: true,
+            parent_pid,
+            abi,
+            name: format!("{}[thr:{}]", parent_name, tid),
+            pml4,
+            ctx,
+            fpu_state: FxSaveArea::new_clean(),
+            fs_base: param.tls_base,
+            gs_base: 0,
+            clear_child_tid: param.child_tid,
+            signals: thread_signals,
+            state: UserTaskState::Ready,
+            cpu_ms: 0,
+            vruntime_ms: start_vr,
+            weight,
+            preempt_count: 0,
+            lazy_faults: 0,
+            syscalls_served: 0,
+            entry_point,
+            pages_mapped,
+            bytes_loaded,
+            brk_base,
+            brk_current,
+            mmap_next,
+            shm_attach_next,
+            shm_attachments: Vec::new(),
+            owned_shm_ids: Vec::new(),
+            dynamic_bytes: 0,
+            vmas,
+            image: None,
+            fds: thread_fds.clone(),
+            port_rights: Vec::new(),
+            next_port_name: 1,
+            stdout_buf: String::new(),
+            has_gui_window: false,
+        });
+        Some(tid)
+    });
+
+    let Some(tid) = tid_res else {
+        close_fd_list(thread_fds);
+        return -11;
+    };
+
+    let tid_bytes = (tid as i64).to_le_bytes();
+    if param.child_tid != 0 {
+        let _ = syscall::copy_to_user_bytes_in(
+            mapping,
+            Some(allocator),
+            pml4,
+            param.child_tid,
+            &tid_bytes,
+        );
+    }
+    if param.parent_tid != 0 {
+        let _ = syscall::copy_to_user_bytes_in(
+            mapping,
+            Some(allocator),
+            pml4,
+            param.parent_tid,
+            &tid_bytes,
+        );
+    }
+
+    0
+}
+
+pub fn clear_current_tid_on_exit(
+    state_ptr: u64,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> i64 {
+    let info = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        let idx = sched.current_slot?;
+        let proc = sched.slots[idx].as_ref()?;
+        let target = if state_ptr != 0 {
+            state_ptr
+        } else {
+            proc.clear_child_tid
+        };
+        Some((proc.pml4, target))
+    });
+    let Some((pml4, addr)) = info else {
+        return 0;
+    };
+    if addr != 0 {
+        let _ = syscall::copy_to_user_bytes_in(
+            mapping,
+            Some(allocator),
+            pml4,
+            addr,
+            &1i64.to_le_bytes(),
+        );
+        wake_umtx_waiters(pml4, addr, usize::MAX);
+    }
+    0
+}
+
+fn wake_umtx_waiters(pml4: u64, addr: u64, max_wake: usize) -> i64 {
+    let mut woken = 0usize;
+    without_interrupts(|| {
+        let mut sched = USER_SCHED.lock();
+        let min_vr = sched.min_runnable_vruntime();
+        for slot in &mut sched.slots {
+            if woken >= max_wake {
+                break;
+            }
+            if let Some(ref mut proc) = slot {
+                if let UserTaskState::Waiting(WaitReason::UmtxWait {
+                    pml4: w_pml4,
+                    addr: w_addr,
+                    ..
+                }) = proc.state
+                {
+                    if w_pml4 == pml4 && w_addr == addr {
+                        proc.vruntime_ms = proc
+                            .vruntime_ms
+                            .max(min_vr.saturating_sub(DEFAULT_QUANTUM_MS));
+                        proc.ctx.rax =
+                            freebsd::apply_abi_syscall_result(proc.abi, 0, &mut proc.ctx.rflags);
+                        proc.state = UserTaskState::Ready;
+                        woken += 1;
+                    }
+                }
+            }
+        }
+    });
+    woken as i64
+}
+
+pub fn sys_umtx_op_current(
+    obj_ptr: u64,
+    op: u32,
+    val: u64,
+    uaddr1: u64,
+    uaddr2: u64,
+    mapping: &PhysicalMemoryMapping,
+    allocator: &mut PhysicalFrameAllocator<'_>,
+) -> Result<i64, WaitReason> {
+    if obj_ptr == 0 {
+        return Ok(-14);
+    }
+    let pml4 = without_interrupts(|| {
+        let sched = USER_SCHED.lock();
+        sched
+            .current_slot
+            .and_then(|idx| sched.slots[idx].as_ref().map(|p| p.pml4))
+            .unwrap_or(0)
+    });
+    if pml4 == 0 {
+        return Ok(-22);
+    }
+
+    match op {
+        UMTX_OP_WAKE | UMTX_OP_WAKE_PRIVATE => {
+            let max_wake = if val == 0 { 1 } else { val as usize };
+            Ok(wake_umtx_waiters(pml4, obj_ptr, max_wake))
+        }
+        UMTX_OP_WAIT | UMTX_OP_WAIT_UINT | UMTX_OP_WAIT_UINT_PRIVATE => {
+            let is_u64 = op == UMTX_OP_WAIT;
+            let sz = if is_u64 { 8 } else { 4 };
+            let mut raw = [0u8; 8];
+            if syscall::copy_from_user_bytes_in(mapping, Some(allocator), pml4, obj_ptr, &mut raw[..sz])
+                .is_err()
+            {
+                return Ok(-14);
+            }
+            let cur = if is_u64 {
+                u64::from_le_bytes(raw)
+            } else {
+                u32::from_le_bytes(raw[0..4].try_into().unwrap()) as u64
+            };
+            let expected = if is_u64 { val } else { val & 0xFFFF_FFFF };
+            if cur != expected {
+                return Ok(0);
+            }
+
+            let wait_ms = if uaddr1 as usize >= core::mem::size_of::<freebsd::TimeSpec>() && uaddr2 != 0 {
+                let mut ts_raw = [0u8; core::mem::size_of::<freebsd::TimeSpec>()];
+                if syscall::copy_from_user_bytes_in(mapping, Some(allocator), pml4, uaddr2, &mut ts_raw)
+                    .is_err()
+                {
+                    return Ok(-14);
+                }
+                let ts: freebsd::TimeSpec = unsafe {
+                    core::ptr::read_unaligned(ts_raw.as_ptr() as *const freebsd::TimeSpec)
+                };
+                ((ts.tv_sec.max(0) as u64).saturating_mul(1000))
+                    .saturating_add((ts.tv_nsec.max(0) as u64) / 1_000_000)
+                    .clamp(1, 30_000)
+            } else {
+                10_000
+            };
+
+            Err(WaitReason::UmtxWait {
+                pml4,
+                addr: obj_ptr,
+                val: expected,
+                is_u64,
+                deadline_ms: timer::uptime_ms().saturating_add(wait_ms),
+            })
+        }
+        _ => Ok(-22),
     }
 }
 

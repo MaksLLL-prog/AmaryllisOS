@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use crate::task::preempt::PreemptMutex;
 
 use crate::drivers::ahci::{self, AhciBlockDevice};
+use crate::drivers::nvme::{self, NvmeBlockDevice};
 use crate::drivers::virtio_blk::{self, VirtioBlockDevice};
 use crate::storage::block::{BlockDevice, BlockDeviceError};
 use crate::storage::cache::{CacheBackendKind, CachedBlockDevice};
@@ -14,6 +15,7 @@ use crate::storage::ide::IdeBlockDevice;
 pub enum SystemBlockDevice {
     Virtio(VirtioBlockDevice),
     Ahci(AhciBlockDevice),
+    Nvme(NvmeBlockDevice),
     Ide(IdeBlockDevice),
 }
 
@@ -22,6 +24,7 @@ impl BlockDevice for SystemBlockDevice {
         match self {
             Self::Virtio(d) => d.sector_size(),
             Self::Ahci(d) => d.sector_size(),
+            Self::Nvme(d) => d.sector_size(),
             Self::Ide(d) => d.sector_size(),
         }
     }
@@ -30,6 +33,7 @@ impl BlockDevice for SystemBlockDevice {
         match self {
             Self::Virtio(d) => d.sector_count(),
             Self::Ahci(d) => d.sector_count(),
+            Self::Nvme(d) => d.sector_count(),
             Self::Ide(d) => d.sector_count(),
         }
     }
@@ -38,6 +42,7 @@ impl BlockDevice for SystemBlockDevice {
         match self {
             Self::Virtio(d) => d.max_transfer_sectors(),
             Self::Ahci(d) => d.max_transfer_sectors(),
+            Self::Nvme(d) => d.max_transfer_sectors(),
             Self::Ide(d) => d.max_transfer_sectors(),
         }
     }
@@ -46,6 +51,7 @@ impl BlockDevice for SystemBlockDevice {
         match self {
             Self::Virtio(d) => d.read_sector(lba, buffer),
             Self::Ahci(d) => d.read_sector(lba, buffer),
+            Self::Nvme(d) => d.read_sector(lba, buffer),
             Self::Ide(d) => d.read_sector(lba, buffer),
         }
     }
@@ -54,6 +60,7 @@ impl BlockDevice for SystemBlockDevice {
         match self {
             Self::Virtio(d) => d.write_sector(lba, buffer),
             Self::Ahci(d) => d.write_sector(lba, buffer),
+            Self::Nvme(d) => d.write_sector(lba, buffer),
             Self::Ide(d) => d.write_sector(lba, buffer),
         }
     }
@@ -67,6 +74,7 @@ impl BlockDevice for SystemBlockDevice {
         match self {
             Self::Virtio(d) => d.read_sectors(start_lba, sector_count, buffer),
             Self::Ahci(d) => d.read_sectors(start_lba, sector_count, buffer),
+            Self::Nvme(d) => d.read_sectors(start_lba, sector_count, buffer),
             Self::Ide(d) => d.read_sectors(start_lba, sector_count, buffer),
         }
     }
@@ -80,6 +88,7 @@ impl BlockDevice for SystemBlockDevice {
         match self {
             Self::Virtio(d) => d.write_sectors(start_lba, sector_count, buffer),
             Self::Ahci(d) => d.write_sectors(start_lba, sector_count, buffer),
+            Self::Nvme(d) => d.write_sectors(start_lba, sector_count, buffer),
             Self::Ide(d) => d.write_sectors(start_lba, sector_count, buffer),
         }
     }
@@ -88,6 +97,7 @@ impl BlockDevice for SystemBlockDevice {
         match self {
             Self::Virtio(d) => d.flush(),
             Self::Ahci(d) => d.flush(),
+            Self::Nvme(d) => d.flush(),
             Self::Ide(d) => d.flush(),
         }
     }
@@ -101,6 +111,10 @@ pub enum MountedBackend {
     AhciSata {
         port: u8,
         max_dma_sectors: usize,
+    },
+    Nvme {
+        max_dma_sectors: usize,
+        lba_size: u32,
     },
     IdeAta {
         controller: usize,
@@ -741,6 +755,7 @@ fn split_mount_target(abs_path: &str) -> DiskSubPath<'_> {
 enum ProbeTarget {
     Virtio,
     Ahci(u8),
+    Nvme,
     Ide(usize, bool, bool),
 }
 
@@ -779,6 +794,22 @@ fn open_probe_target(
                 MountedBackend::AhciSata {
                     port,
                     max_dma_sectors: max_dma,
+                },
+                None,
+            ))
+        }
+        ProbeTarget::Nvme => {
+            let snap = nvme::snapshot();
+            if !snap.initialized || snap.sector_count_512 == 0 {
+                return None;
+            }
+            let dev = SystemBlockDevice::Nvme(NvmeBlockDevice);
+            let max_dma = dev.max_transfer_sectors();
+            Some((
+                CachedBlockDevice::new(dev, CacheBackendKind::Nvme),
+                MountedBackend::Nvme {
+                    max_dma_sectors: max_dma,
+                    lba_size: snap.lba_size,
                 },
                 None,
             ))
@@ -915,6 +946,11 @@ impl KernelVfs {
             }
         }
 
+        let n_snap = nvme::snapshot();
+        if n_snap.initialized && n_snap.sector_count_512 > 0 {
+            candidates.push(ProbeTarget::Nvme);
+        }
+
         let count = crate::storage::ide::controller_count();
         for controller_index in 0..count {
             for secondary in [false, true] {
@@ -930,7 +966,7 @@ impl KernelVfs {
             return Err(VfsError::NoDisk);
         }
 
-        // Pass 1: Prefer writable FAT32 volumes across fastest DMA controllers first (VirtIO -> AHCI -> IDE).
+        // Pass 1: Prefer writable FAT32 volumes across fastest DMA controllers first (VirtIO -> AHCI -> NVMe -> IDE).
         for &target in &candidates {
             let Some((cached, backend, slot)) = open_probe_target(target) else {
                 continue;
@@ -964,6 +1000,10 @@ impl KernelVfs {
             .active_port
             .ok_or(VfsError::NoDisk)?;
         self.mount_probe_target(ProbeTarget::Ahci(port))
+    }
+
+    pub fn mount_nvme(&mut self) -> Result<(), VfsError> {
+        self.mount_probe_target(ProbeTarget::Nvme)
     }
 
     pub fn mount_slot(

@@ -32,6 +32,7 @@ pub enum CacheBackendKind {
     VirtioBlk = 1,
     AhciSata = 2,
     IdeAtaPio = 3,
+    Nvme = 4,
 }
 
 impl CacheBackendKind {
@@ -41,6 +42,7 @@ impl CacheBackendKind {
             Self::VirtioBlk => "VirtIO-Blk DMA",
             Self::AhciSata => "AHCI SATA DMA",
             Self::IdeAtaPio => "ATA PIO (Multi-sector)",
+            Self::Nvme => "NVMe PCI DMA (FreeBSD KPI)",
         }
     }
 
@@ -49,6 +51,7 @@ impl CacheBackendKind {
             1 => Self::VirtioBlk,
             2 => Self::AhciSata,
             3 => Self::IdeAtaPio,
+            4 => Self::Nvme,
             _ => Self::None,
         }
     }

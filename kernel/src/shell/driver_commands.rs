@@ -542,3 +542,141 @@ pub fn cmd_ipc(console: &mut Console<'_>) {
         console.write(&line, GRAY);
     }
 }
+
+pub fn cmd_nvme(console: &mut Console<'_>, arguments: &str) {
+    let snap = crate::drivers::nvme::snapshot();
+    console.write("\nNVMe PCI Express Storage (FreeBSD Driver KPI):\n", GREEN);
+    if !snap.present {
+        console.write(
+            "  Not detected on PCI (use QEMU -drive file=disk.img,if=none,id=nvm -device nvme,serial=amaryllis,drive=nvm).\n",
+            YELLOW,
+        );
+        return;
+    }
+
+    let irq_str = match (snap.irq_gsi, snap.irq_vector) {
+        (Some(gsi), Some(vec)) => alloc::format!("IRQ{} -> GSI {} / IDT 0x{:02x}", snap.irq_line, gsi, vec),
+        _ => alloc::format!("IRQ{} (unrouted)", snap.irq_line),
+    };
+    let line = alloc::format!(
+        "  Initialized: {}  PCI {:02}:{:02}.{} ({:04X}:{:04X})  {}\n  BAR0 phys=0x{:x} virt=0x{:x}  VS=0x{:08x}  MQES={} DSTRD={}B\n  Model: {}  Serial: {}  NSID={}  LBA={}B  512B_Sectors={} ({} MiB)\n  DMA Reads: {}  Writes: {}  Batches: {}  MaxDMA: {} sectors  IRQs: {}\n",
+        snap.initialized,
+        snap.bus,
+        snap.device,
+        snap.function,
+        snap.vendor_id,
+        snap.device_id,
+        irq_str,
+        snap.bar0_phys,
+        snap.bar0_virt,
+        snap.version,
+        snap.max_queue_entries,
+        snap.dstrd_bytes,
+        snap.model_str(),
+        snap.serial_str(),
+        snap.nsid,
+        snap.lba_size,
+        snap.sector_count_512,
+        (snap.sector_count_512 * 512) / (1024 * 1024),
+        snap.reads,
+        snap.writes,
+        snap.dma_batches,
+        snap.max_dma_sectors,
+        crate::drivers::nvme::irq_count(),
+    );
+    console.write(&line, WHITE);
+
+    let trimmed = arguments.trim();
+    if let Some(rest) = trimmed.strip_prefix("read ") {
+        if let Ok(lba) = rest.trim().parse::<u64>() {
+            let mut sec = [0u8; 512];
+            match crate::drivers::nvme::read_sector_dma(lba, &mut sec) {
+                Ok(()) => {
+                    console.write("  NVMe DMA Read OK (first 32 bytes): ", GREEN);
+                    for b in &sec[..32] {
+                        console.write(&alloc::format!("{:02x} ", b), WHITE);
+                    }
+                    console.write("\n", WHITE);
+                }
+                Err(e) => {
+                    console.write(&alloc::format!("  NVMe DMA Read Error: {:?}\n", e), RED);
+                }
+            }
+        }
+    }
+}
+
+pub fn cmd_kpi(console: &mut Console<'_>) {
+    console.write("\nFreeBSD Driver KPI Subsystem:\n", GREEN);
+
+    let devs = crate::freebsd_kpi::snapshot_devices();
+    console.write("  Newbus Devices:\n", YELLOW);
+    if devs.is_empty() {
+        console.write("    (no Newbus KPI devices attached; attach NVMe in QEMU to exercise full stack)\n", GRAY);
+    } else {
+        for d in &devs {
+            let line = alloc::format!(
+                "    dev#{} {}{} [{}] drv={} PCI {:02}:{:02}.{} {:04x}:{:04x} BAR0=0x{:x} ({})\n",
+                d.id,
+                d.name,
+                d.unit,
+                d.state.as_str(),
+                if d.driver_name.is_empty() { "-" } else { d.driver_name },
+                d.bus,
+                d.device,
+                d.function,
+                d.vendor_id,
+                d.device_id,
+                d.bar0_phys,
+                d.desc_str(),
+            );
+            console.write(&line, WHITE);
+        }
+    }
+
+    let routes = crate::freebsd_kpi::pci_res::snapshot_intr_routes();
+    console.write("  KPI IOAPIC IRQ Routes:\n", YELLOW);
+    if routes.is_empty() {
+        console.write("    (none)\n", GRAY);
+    } else {
+        for r in &routes {
+            let line = alloc::format!(
+                "    slot#{} {} IRQ{} -> GSI {} IDT 0x{:02x} calls={}\n",
+                r.slot, r.name, r.irq_line, r.gsi, r.vector, r.calls
+            );
+            console.write(&line, WHITE);
+        }
+    }
+
+    let (allocs, active_pages, sync_ops, tags) =
+        crate::freebsd_kpi::bus_dma::snapshot_dma_stats();
+    let dma_line = alloc::format!(
+        "  bus_dma: allocs={} active_pages={} sync_ops={} taskq_exec={}\n",
+        allocs,
+        active_pages,
+        sync_ops,
+        crate::freebsd_kpi::KPI_TASKQUEUE.executed_count(),
+    );
+    console.write(&dma_line, WHITE);
+    for t in &tags {
+        let line = alloc::format!(
+            "    tag '{}' align={} maxsize={} segs={} pages={}\n",
+            t.name, t.alignment, t.maxsize, t.nsegments, t.allocated_pages
+        );
+        console.write(&line, GRAY);
+    }
+
+    let report = crate::freebsd_kpi::validation_report();
+    console.write("  Legacy Reference Validation (e1000 / AHCI):\n", YELLOW);
+    for entry in &report.entries {
+        console.write(
+            if entry.passed { "    [PASS] " } else { "    [FAIL] " },
+            if entry.passed { GREEN } else { RED },
+        );
+        console.write(entry.target, WHITE);
+        console.write(": ", GRAY);
+        console.write(&entry.summary, GRAY);
+        console.write("\n", WHITE);
+    }
+}
+

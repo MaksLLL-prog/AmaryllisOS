@@ -1,5 +1,6 @@
 pub mod demo;
 pub mod elf;
+pub mod freebsd;
 pub mod ipc;
 pub mod runner;
 pub mod sched;

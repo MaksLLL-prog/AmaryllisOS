@@ -280,6 +280,61 @@ unsafe fn write_config_u16(
     }
 }
 
+pub fn read_cfg_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        read_config_u32(bus, device, function, offset)
+    })
+}
+
+pub fn write_cfg_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        write_config_u32(bus, device, function, offset, value)
+    });
+}
+
+pub fn read_cfg_u16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        read_config_u16(bus, device, function, offset)
+    })
+}
+
+pub fn write_cfg_u16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        write_config_u16(bus, device, function, offset, value)
+    });
+}
+
+pub fn read_cfg_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
+    let shift = ((offset & 3) as u32) * 8;
+    ((read_cfg_u32(bus, device, function, offset & !3) >> shift) & 0xFF) as u8
+}
+
+pub fn enable_bus_device(
+    bus: u8,
+    device: u8,
+    function: u8,
+    io: bool,
+    mem: bool,
+    bus_master: bool,
+) -> u8 {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let mut cmd = read_config_u16(bus, device, function, 0x04);
+        if io {
+            cmd |= 1 << 0;
+        }
+        if mem {
+            cmd |= 1 << 1;
+        }
+        if bus_master {
+            cmd |= 1 << 2;
+        }
+        cmd &= !(1 << 10);
+        write_config_u16(bus, device, function, 0x04, cmd);
+        let irq_reg = read_config_u32(bus, device, function, 0x3C);
+        (irq_reg & 0xFF) as u8
+    })
+}
+
 // ============================================================
 // BAR SIZING
 // ============================================================
@@ -715,6 +770,7 @@ use crate::hardware::{
     PciAhciDescriptor,
     PciAudioDescriptor,
     PciNetworkDescriptor,
+    PciNvmeDescriptor,
     PciVirtioBlkDescriptor,
 };
 
@@ -937,6 +993,52 @@ fn inspect_virtio_blk_device(device: &PciDevice) -> Option<PciVirtioBlkDescripto
     })
 }
 
+fn inspect_nvme_device(device: &PciDevice) -> Option<PciNvmeDescriptor> {
+    // Mass Storage (0x01), Non-Volatile Memory (0x08), NVM Express (0x02)
+    if !(device.class_code == 0x01
+        && device.subclass == 0x08
+        && device.programming_interface == 0x02)
+    {
+        return None;
+    }
+
+    let mut bar0_phys = 0u64;
+    let mut bar0_size = 0u64;
+    for i in 0..device.bar_count {
+        let bar = device.bars[i];
+        if !bar.valid || bar.base == 0 {
+            continue;
+        }
+        if matches!(bar.kind, PciBarKind::Memory32 | PciBarKind::Memory64) {
+            if bar.index == 0 || bar0_phys == 0 {
+                bar0_phys = bar.base;
+                bar0_size = if bar.size_known && bar.size > 0 {
+                    bar.size
+                } else {
+                    0x4000
+                };
+            }
+        }
+    }
+
+    if bar0_phys == 0 {
+        return None;
+    }
+
+    let irq_line = enable_pci_device(device, false, true, true);
+    Some(PciNvmeDescriptor {
+        bus: device.bus,
+        device: device.device,
+        function: device.function,
+        vendor_id: device.vendor_id,
+        device_id: device.device_id,
+        irq_line,
+        bar0_phys,
+        bar0_size,
+        valid: true,
+    })
+}
+
 pub fn scan(console: &mut Console<'_>) -> HardwareDiscovery {
     // Используем заранее выделенную статическую память.
     // Не создаём большой PciInventory на стеке.
@@ -1052,6 +1154,12 @@ for index in 0..inventory.count {
             discovery.virtio_blk = vblk_info;
         }
     }
+
+    if !discovery.nvme.valid {
+        if let Some(nvme_info) = inspect_nvme_device(device) {
+            discovery.nvme = nvme_info;
+        }
+    }
 }
 
 console.write("\nIDE Controller Summary:\n", GREEN);
@@ -1120,6 +1228,16 @@ if discovery.virtio_blk.valid {
     console.write("DETECTED\n", GREEN);
 } else {
     console.write("  VirtIO-Blk PCI:    ", GRAY);
+    console.write("NOT FOUND\n", YELLOW);
+}
+
+if discovery.nvme.valid {
+    console.write("  NVMe Controller:   ", GRAY);
+    console.write("DETECTED (BAR0 ", GREEN);
+    write_hex64(console, discovery.nvme.bar0_phys);
+    console.write(")\n", GREEN);
+} else {
+    console.write("  NVMe Controller:   ", GRAY);
     console.write("NOT FOUND\n", YELLOW);
 }
 
@@ -1462,5 +1580,19 @@ pub fn get_device(index: usize) -> Option<PciDevice> {
         } else {
             None
         }
+    }
+}
+
+pub fn find_pci_device(bus: u8, device: u8, function: u8) -> Option<PciDevice> {
+    let inventory_ptr = core::ptr::addr_of!(PCI_INVENTORY);
+    unsafe {
+        let inventory = &*inventory_ptr;
+        for index in 0..inventory.count {
+            let d = inventory.devices[index];
+            if d.bus == bus && d.device == device && d.function == function {
+                return Some(d);
+            }
+        }
+        None
     }
 }

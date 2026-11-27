@@ -3,7 +3,7 @@ use alloc::string::String;
 use alloc::vec;
 use core::arch::{asm, global_asm};
 use core::ptr::{addr_of, copy_nonoverlapping};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::registers::model_specific::Msr;
@@ -18,6 +18,7 @@ use crate::memory::PhysicalFrameAllocator;
 use crate::storage::vfs::{self, VfsError, VfsNodeKind};
 use crate::task::kthread::{self, NetJobRequest};
 
+use super::freebsd::{self, ProcessAbi};
 use super::ipc;
 use super::sched::{
     self, FdEntry, FxSaveArea, NetWaitKind, OpenSocket, UserCpuContext, UserTaskState, WaitReason,
@@ -103,6 +104,7 @@ const IA32_EFER_MSR: u32 = 0xC000_0080;
 const IA32_STAR_MSR: u32 = 0xC000_0081;
 const IA32_LSTAR_MSR: u32 = 0xC000_0082;
 const IA32_FMASK_MSR: u32 = 0xC000_0084;
+const IA32_FS_BASE_MSR: u32 = 0xC000_0100;
 
 const EFER_SCE: u64 = 1 << 0;
 const EFER_NXE: u64 = 1 << 11;
@@ -129,6 +131,7 @@ static mut ACTIVE_USER_PML4: u64 = 0;
 static SYSCALL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static NXE_SUPPORTED_AND_ENABLED: AtomicBool = AtomicBool::new(false);
 static USER_EXECUTION_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ACTIVE_ABI: AtomicU8 = AtomicU8::new(0);
 
 static mut ACTIVE_CONSOLE_PTR: *mut Console<'static> = core::ptr::null_mut();
 static mut ACTIVE_MAPPING_PTR: *const PhysicalMemoryMapping = core::ptr::null();
@@ -239,11 +242,7 @@ global_asm!(
     "pop r9",
     "pop rcx",
     "pop r11",
-    "push rax",
-    "mov ax, 0x1B",
-    "mov ds, ax",
-    "mov es, ax",
-    "pop rax",
+
     "pop rsp",
     "swapgs",
     "sysretq",
@@ -604,6 +603,8 @@ pub unsafe fn run_user_quantum(
     mapping: &PhysicalMemoryMapping,
     allocator: &mut PhysicalFrameAllocator<'_>,
     pid: usize,
+    abi: ProcessAbi,
+    fs_base: u64,
     user_pml4: u64,
     ctx: &UserCpuContext,
     user_fx: &mut FxSaveArea,
@@ -619,7 +620,9 @@ pub unsafe fn run_user_quantum(
     impl Drop for ScopeGuard {
         fn drop(&mut self) {
             USER_EXECUTION_ACTIVE.store(false, Ordering::Release);
+            ACTIVE_ABI.store(0, Ordering::Release);
             unsafe {
+                Msr::new(IA32_FS_BASE_MSR).write(0);
                 ACTIVE_CONSOLE_PTR = core::ptr::null_mut();
                 ACTIVE_MAPPING_PTR = core::ptr::null();
                 ACTIVE_ALLOCATOR_PTR = core::ptr::null_mut();
@@ -638,6 +641,8 @@ pub unsafe fn run_user_quantum(
         ACTIVE_ALLOCATOR_PTR =
             (allocator as *mut PhysicalFrameAllocator<'_>).cast::<PhysicalFrameAllocator<'static>>();
         ACTIVE_PID = pid;
+        ACTIVE_ABI.store(abi as u8, Ordering::Release);
+        Msr::new(IA32_FS_BASE_MSR).write(fs_base);
         SYSCALL_COUNT.store(0, Ordering::Release);
     }
 
@@ -652,6 +657,7 @@ pub unsafe fn run_user_quantum(
             asm!("fxsave64 [{}]", in(reg) kernel_fx.0.as_mut_ptr(), options(nostack));
             asm!("fxrstor64 [{}]", in(reg) user_fx.0.as_ptr(), options(nostack));
         }
+        crate::arch::percpu::ensure_kernel_gs_ready(SYSCALL_STACK_TOP);
         resume_user_context_asm(ctx as *const UserCpuContext);
         if has_fx {
             asm!("fxsave64 [{}]", in(reg) user_fx.0.as_mut_ptr(), options(nostack));
@@ -840,8 +846,7 @@ fn copy_to_user_bytes(
     Ok(())
 }
 
-#[allow(dead_code)]
-fn copy_str_from_user(
+pub(crate) fn copy_str_from_user_in(
     mapping: &PhysicalMemoryMapping,
     allocator: Option<&mut PhysicalFrameAllocator<'_>>,
     user_pml4: u64,
@@ -979,7 +984,7 @@ fn read_console_line(console: &mut Console<'_>, out: &mut [u8]) -> usize {
 }
 
 #[inline]
-fn build_resume_ctx_from_syscall(frame: &SyscallFrame, ret_val: i64) -> UserCpuContext {
+pub(crate) fn build_resume_ctx_from_syscall(frame: &SyscallFrame, ret_val: i64) -> UserCpuContext {
     let selectors = crate::arch::gdt::selectors();
     UserCpuContext {
         r15: frame.r15,
@@ -1002,6 +1007,450 @@ fn build_resume_ctx_from_syscall(frame: &SyscallFrame, ret_val: i64) -> UserCpuC
         rflags: frame.user_rflags,
         rsp: frame.user_rsp,
         ss: selectors.user_data.0 as u64,
+    }
+}
+
+pub(crate) fn handle_sys_write(
+    user_pml4: u64,
+    fd: u64,
+    buf_ptr: u64,
+    len: u64,
+    mut console_opt: Option<&mut Console<'static>>,
+    mapping_opt: Option<&PhysicalMemoryMapping>,
+    mut allocator_opt: Option<&mut PhysicalFrameAllocator<'static>>,
+) -> i64 {
+    let len = len as usize;
+    if len == 0 {
+        0
+    } else if fd == 1 || fd == 2 {
+        if let Some(mapping) = mapping_opt {
+            let capped = len.min(16 * 1024);
+            let mut written = 0usize;
+            let mut tmp = [0u8; 256];
+            let mut fault = false;
+
+            while written < capped {
+                let step = (capped - written).min(tmp.len());
+                if copy_from_user_bytes(
+                    mapping,
+                    allocator_opt.as_deref_mut(),
+                    user_pml4,
+                    buf_ptr + written as u64,
+                    &mut tmp[..step],
+                )
+                .is_err()
+                {
+                    fault = true;
+                    break;
+                }
+
+                if crate::graphics::wm::is_desktop_active() {
+                    sched::push_current_stdout(sanitize_user_text(&tmp[..step]));
+                } else if let Some(console) = console_opt.as_mut() {
+                    let color = if fd == 2 { RED } else { WHITE };
+                    write_user_bytes_to_console(console, &tmp[..step], color);
+                }
+                written += step;
+            }
+
+            if fault && written == 0 {
+                EFAULT
+            } else {
+                written as i64
+            }
+        } else {
+            EINVAL
+        }
+    } else if let Some(mapping) = mapping_opt {
+        enum WriteTarget {
+            Tcp(usize),
+            Pipe(usize),
+            File(String, u32, bool),
+            Err(i64),
+        }
+        let target = sched::with_current_fd_mut(fd as usize, |entry| match entry {
+            FdEntry::Socket(OpenSocket::Tcp { handle }) => WriteTarget::Tcp(*handle),
+            FdEntry::Socket(_) | FdEntry::PipeRead { .. } | FdEntry::Kqueue { .. } => {
+                WriteTarget::Err(EINVAL)
+            }
+            FdEntry::PipeWrite { pipe_id } => WriteTarget::Pipe(*pipe_id),
+            FdEntry::File {
+                abs_path,
+                offset,
+                writable,
+                append,
+                ..
+            } => {
+                if !*writable {
+                    WriteTarget::Err(EBADF)
+                } else {
+                    WriteTarget::File(abs_path.clone(), *offset, *append)
+                }
+            }
+            FdEntry::Dir { .. } => WriteTarget::Err(EISDIR),
+        });
+
+        match target {
+            Some(WriteTarget::Pipe(pipe_id)) => {
+                let capped = len.min(ipc::PIPE_BUF_SIZE);
+                let mut kbuf = vec![0u8; capped];
+                if copy_from_user_bytes(
+                    mapping,
+                    allocator_opt.as_deref_mut(),
+                    user_pml4,
+                    buf_ptr,
+                    &mut kbuf,
+                )
+                .is_err()
+                {
+                    EFAULT
+                } else {
+                    match ipc::write_pipe(pipe_id, &kbuf) {
+                        Ok(n) => n as i64,
+                        Err(e) => e,
+                    }
+                }
+            }
+            Some(WriteTarget::Tcp(handle)) => {
+                let capped = len.min(8192);
+                let mut kbuf = vec![0u8; capped];
+                if copy_from_user_bytes(
+                    mapping,
+                    allocator_opt.as_deref_mut(),
+                    user_pml4,
+                    buf_ptr,
+                    &mut kbuf,
+                )
+                .is_err()
+                {
+                    EFAULT
+                } else {
+                    unsafe {
+                        asm!("sti", options(nomem, nostack));
+                    }
+                    let res = crate::net::tcp::send_data(handle, &kbuf);
+                    unsafe {
+                        asm!("cli", options(nomem, nostack));
+                    }
+                    match res {
+                        Ok(n) => n as i64,
+                        Err(_) => EIO,
+                    }
+                }
+            }
+            Some(WriteTarget::File(abs_path, mut off, append)) => {
+                let capped = len.min(64 * 1024);
+                let mut kbuf = vec![0u8; capped];
+                if copy_from_user_bytes(
+                    mapping,
+                    allocator_opt.as_deref_mut(),
+                    user_pml4,
+                    buf_ptr,
+                    &mut kbuf,
+                )
+                .is_err()
+                {
+                    EFAULT
+                } else {
+                    let res = vfs::with_vfs(|s| {
+                        if append {
+                            if let Ok(st) = s.stat(&abs_path) {
+                                off = st.size;
+                            }
+                        }
+                        s.write_file_at(&abs_path, off, &kbuf)
+                    });
+                    match res {
+                        Ok(n) => {
+                            sched::with_current_fd_mut(fd as usize, |entry| {
+                                if let FdEntry::File { offset, .. } = entry {
+                                    *offset = off.saturating_add(n as u32);
+                                }
+                            });
+                            n as i64
+                        }
+                        Err(e) => vfs_err_to_errno(e),
+                    }
+                }
+            }
+            Some(WriteTarget::Err(e)) => e,
+            None => EBADF,
+        }
+    } else {
+        EINVAL
+    }
+}
+
+pub(crate) fn handle_sys_read(
+    frame: &SyscallFrame,
+    user_pml4: u64,
+    console_opt: Option<&mut Console<'static>>,
+    mapping_opt: Option<&PhysicalMemoryMapping>,
+    mut allocator_opt: Option<&mut PhysicalFrameAllocator<'static>>,
+) -> i64 {
+    let fd = frame.rdi;
+    let buf_ptr = frame.rsi;
+    let count = frame.rdx as usize;
+
+    if count == 0 {
+        0
+    } else if fd == 0 {
+        if let (Some(mapping), Some(console)) = (mapping_opt, console_opt) {
+            if crate::graphics::wm::is_desktop_active() {
+                EAGAIN
+            } else {
+                let mut kbuf = [0u8; 256];
+                let max_read = count.min(kbuf.len());
+                if validate_user_slice(
+                    mapping,
+                    allocator_opt.as_deref_mut(),
+                    user_pml4,
+                    buf_ptr,
+                    max_read,
+                    true,
+                )
+                .is_err()
+                {
+                    EFAULT
+                } else {
+                    let actual = read_console_line(console, &mut kbuf[..max_read]);
+                    if copy_to_user_bytes(
+                        mapping,
+                        allocator_opt.as_deref_mut(),
+                        user_pml4,
+                        buf_ptr,
+                        &kbuf[..actual],
+                    )
+                    .is_err()
+                    {
+                        EFAULT
+                    } else {
+                        actual as i64
+                    }
+                }
+            }
+        } else {
+            EINVAL
+        }
+    } else if let Some(mapping) = mapping_opt {
+        enum ReadTarget {
+            Sock(OpenSocket),
+            Pipe(usize),
+            File(String, u32),
+            Err(i64),
+        }
+        let target = sched::with_current_fd_mut(fd as usize, |entry| match entry {
+            FdEntry::Socket(sock) => ReadTarget::Sock(*sock),
+            FdEntry::PipeRead { pipe_id } => ReadTarget::Pipe(*pipe_id),
+            FdEntry::PipeWrite { .. } | FdEntry::Kqueue { .. } => ReadTarget::Err(EBADF),
+            FdEntry::File {
+                abs_path,
+                offset,
+                readable,
+                ..
+            } => {
+                if !*readable {
+                    ReadTarget::Err(EBADF)
+                } else {
+                    ReadTarget::File(abs_path.clone(), *offset)
+                }
+            }
+            FdEntry::Dir { .. } => ReadTarget::Err(EISDIR),
+        });
+
+        match target {
+            Some(ReadTarget::Pipe(pipe_id)) => {
+                let max_read = count.min(ipc::PIPE_BUF_SIZE);
+                if validate_user_slice(
+                    mapping,
+                    allocator_opt.as_deref_mut(),
+                    user_pml4,
+                    buf_ptr,
+                    max_read,
+                    true,
+                )
+                .is_err()
+                {
+                    EFAULT
+                } else {
+                    let mut kbuf = vec![0u8; max_read];
+                    match ipc::read_pipe(pipe_id, &mut kbuf) {
+                        Ok(n) => {
+                            if n > 0
+                                && copy_to_user_bytes(
+                                    mapping,
+                                    allocator_opt.as_deref_mut(),
+                                    user_pml4,
+                                    buf_ptr,
+                                    &kbuf[..n],
+                                )
+                                .is_err()
+                            {
+                                EFAULT
+                            } else {
+                                n as i64
+                            }
+                        }
+                        Err(-11) => {
+                            let ctx = build_resume_ctx_from_syscall(frame, 0);
+                            let deadline_ms = timer::uptime_ms().saturating_add(2000);
+                            unsafe {
+                                sched::suspend_current_from_syscall(
+                                    ctx,
+                                    UserTaskState::Waiting(WaitReason::PipeRead {
+                                        pipe_id,
+                                        buf_ptr,
+                                        cap: max_read,
+                                        deadline_ms,
+                                    }),
+                                );
+                            }
+                        }
+                        Err(e) => e,
+                    }
+                }
+            }
+            Some(ReadTarget::File(abs_path, off)) => {
+                let max_read = count.min(32 * 1024);
+                if validate_user_slice(
+                    mapping,
+                    allocator_opt.as_deref_mut(),
+                    user_pml4,
+                    buf_ptr,
+                    max_read,
+                    true,
+                )
+                .is_err()
+                {
+                    EFAULT
+                } else {
+                    let mut kbuf = vec![0u8; max_read];
+                    let res = vfs::with_vfs(|s| s.read_file_chunk(&abs_path, off, &mut kbuf));
+                    match res {
+                        Ok(n) => {
+                            if n > 0
+                                && copy_to_user_bytes(
+                                    mapping,
+                                    allocator_opt.as_deref_mut(),
+                                    user_pml4,
+                                    buf_ptr,
+                                    &kbuf[..n],
+                                )
+                                .is_err()
+                            {
+                                EFAULT
+                            } else {
+                                sched::with_current_fd_mut(fd as usize, |entry| {
+                                    if let FdEntry::File { offset, .. } = entry {
+                                        *offset = off.saturating_add(n as u32);
+                                    }
+                                });
+                                n as i64
+                            }
+                        }
+                        Err(VfsError::OffsetOutOfRange) => 0,
+                        Err(e) => vfs_err_to_errno(e),
+                    }
+                }
+            }
+            Some(ReadTarget::Sock(sock)) => {
+                let max_read = count.min(2048);
+                if validate_user_slice(
+                    mapping,
+                    allocator_opt.as_deref_mut(),
+                    user_pml4,
+                    buf_ptr,
+                    max_read,
+                    true,
+                )
+                .is_err()
+                {
+                    EFAULT
+                } else {
+                    let mut kbuf = vec![0u8; max_read];
+                    match sock {
+                        OpenSocket::Tcp { handle } => {
+                            unsafe {
+                                asm!("sti", options(nomem, nostack));
+                            }
+                            let res = crate::net::tcp::recv_data(handle, &mut kbuf);
+                            unsafe {
+                                asm!("cli", options(nomem, nostack));
+                            }
+                            match res {
+                                Ok(0) => EAGAIN,
+                                Ok(n) => {
+                                    if copy_to_user_bytes(
+                                        mapping,
+                                        allocator_opt.as_deref_mut(),
+                                        user_pml4,
+                                        buf_ptr,
+                                        &kbuf[..n],
+                                    )
+                                    .is_err()
+                                    {
+                                        EFAULT
+                                    } else {
+                                        n as i64
+                                    }
+                                }
+                                Err(_) => 0,
+                            }
+                        }
+                        OpenSocket::Udp { handle } => {
+                            unsafe {
+                                asm!("sti", options(nomem, nostack));
+                            }
+                            let pkt = crate::net::udp::recv_socket(handle, &mut kbuf);
+                            unsafe {
+                                asm!("cli", options(nomem, nostack));
+                            }
+                            if let Some((_ip, _port, n)) = pkt {
+                                if copy_to_user_bytes(
+                                    mapping,
+                                    allocator_opt.as_deref_mut(),
+                                    user_pml4,
+                                    buf_ptr,
+                                    &kbuf[..n],
+                                )
+                                .is_err()
+                                {
+                                    EFAULT
+                                } else {
+                                    n as i64
+                                }
+                            } else {
+                                EAGAIN
+                            }
+                        }
+                        OpenSocket::TcpUnconnected => -107,
+                    }
+                }
+            }
+            Some(ReadTarget::Err(e)) => e,
+            None => EBADF,
+        }
+    } else {
+        EINVAL
+    }
+}
+
+pub(crate) fn handle_sys_close(fd: u64) -> i64 {
+    if let Some(entry) = sched::take_current_fd(fd as usize) {
+        match entry {
+            FdEntry::Socket(sock) => match sock {
+                OpenSocket::Tcp { handle } => crate::net::tcp::close_socket(handle),
+                OpenSocket::Udp { handle } => crate::net::udp::free_socket(handle),
+                OpenSocket::TcpUnconnected => {}
+            },
+            FdEntry::PipeRead { pipe_id } => ipc::close_pipe_end(pipe_id, false),
+            FdEntry::PipeWrite { pipe_id } => ipc::close_pipe_end(pipe_id, true),
+            FdEntry::Kqueue { kq_id } => freebsd::kqueue::destroy_kqueue(kq_id),
+            FdEntry::File { .. } | FdEntry::Dir { .. } => {}
+        }
+        0
+    } else {
+        EBADF
     }
 }
 
@@ -1034,7 +1483,7 @@ extern "C" fn rust_syscall_dispatch(frame: &mut SyscallFrame) {
         }
     };
 
-    let mut console_opt = unsafe {
+    let console_opt = unsafe {
         if ACTIVE_CONSOLE_PTR.is_null() {
             None
         } else {
@@ -1049,6 +1498,33 @@ extern "C" fn rust_syscall_dispatch(frame: &mut SyscallFrame) {
             Some(&mut *ACTIVE_ALLOCATOR_PTR)
         }
     };
+
+    let abi = if ACTIVE_ABI.load(Ordering::Acquire) == ProcessAbi::FreeBsd as u8 {
+        ProcessAbi::FreeBsd
+    } else {
+        ProcessAbi::Amaryllis
+    };
+
+    if abi == ProcessAbi::FreeBsd {
+        let is_sigreturn = frame.rax == freebsd::SYS_FBSD_SIGRETURN;
+        let ret = freebsd::dispatch_freebsd_syscall(
+            frame,
+            user_pml4,
+            console_opt,
+            mapping_opt,
+            allocator_opt.as_deref_mut(),
+        );
+        if !(is_sigreturn && ret == 0) {
+            frame.rax = freebsd::apply_abi_syscall_result(abi, ret, &mut frame.user_rflags);
+        }
+        if let (Some(mapping), Some(allocator)) = (mapping_opt, allocator_opt) {
+            sched::deliver_pending_signal_on_syscall_return(frame, mapping, allocator);
+        }
+        unsafe {
+            switch_cr3_raw(user_pml4, flags_bits);
+        }
+        return;
+    }
 
     let syscall_num = frame.rax;
     let arg1 = frame.rdi;
@@ -1315,9 +1791,10 @@ extern "C" fn rust_syscall_dispatch(frame: &mut SyscallFrame) {
                 let entry_info = sched::with_current_fd_mut(fd, |entry| match entry {
                     FdEntry::File { abs_path, .. } => Ok((abs_path.clone(), false)),
                     FdEntry::Dir { abs_path, .. } => Ok((abs_path.clone(), true)),
-                    FdEntry::Socket(_) | FdEntry::PipeRead { .. } | FdEntry::PipeWrite { .. } => {
-                        Err(EINVAL)
-                    }
+                    FdEntry::Socket(_)
+                    | FdEntry::PipeRead { .. }
+                    | FdEntry::PipeWrite { .. }
+                    | FdEntry::Kqueue { .. } => Err(EINVAL),
                 });
                 match entry_info {
                     Some(Ok((path, _))) => match vfs::with_vfs(|s| s.stat(&path)) {
@@ -1383,9 +1860,10 @@ extern "C" fn rust_syscall_dispatch(frame: &mut SyscallFrame) {
                         Err(EINVAL)
                     }
                 }
-                FdEntry::Socket(_) | FdEntry::PipeRead { .. } | FdEntry::PipeWrite { .. } => {
-                    Err(EINVAL)
-                }
+                FdEntry::Socket(_)
+                | FdEntry::PipeRead { .. }
+                | FdEntry::PipeWrite { .. }
+                | FdEntry::Kqueue { .. } => Err(EINVAL),
             }) {
                 Some(Ok(pos)) => pos,
                 Some(Err(e)) => e,
@@ -1497,326 +1975,14 @@ extern "C" fn rust_syscall_dispatch(frame: &mut SyscallFrame) {
         }
 
         SYS_WRITE => {
-            let fd = arg1;
-            let buf_ptr = arg2;
-            let len = arg3 as usize;
-
-            if len == 0 {
-                0
-            } else if fd == 1 || fd == 2 {
-                if let Some(mapping) = mapping_opt {
-                    let capped = len.min(16 * 1024);
-                    let mut written = 0usize;
-                    let mut tmp = [0u8; 256];
-                    let mut fault = false;
-
-                    while written < capped {
-                        let step = (capped - written).min(tmp.len());
-                        if copy_from_user_bytes(
-                            mapping,
-                            allocator_opt.as_deref_mut(),
-                            user_pml4,
-                            buf_ptr + written as u64,
-                            &mut tmp[..step],
-                        )
-                        .is_err()
-                        {
-                            fault = true;
-                            break;
-                        }
-
-                        if crate::graphics::wm::is_desktop_active() {
-                            sched::push_current_stdout(sanitize_user_text(&tmp[..step]));
-                        } else if let Some(console) = console_opt.as_mut() {
-                            let color = if fd == 2 { RED } else { WHITE };
-                            write_user_bytes_to_console(console, &tmp[..step], color);
-                        }
-                        written += step;
-                    }
-
-                    if fault && written == 0 {
-                        EFAULT
-                    } else {
-                        written as i64
-                    }
-                } else {
-                    EINVAL
-                }
-            } else if let Some(mapping) = mapping_opt {
-                enum WriteTarget {
-                    Tcp(usize),
-                    Pipe(usize),
-                    File(String, u32, bool),
-                    Err(i64),
-                }
-                let target = sched::with_current_fd_mut(fd as usize, |entry| match entry {
-                    FdEntry::Socket(OpenSocket::Tcp { handle }) => WriteTarget::Tcp(*handle),
-                    FdEntry::Socket(_) | FdEntry::PipeRead { .. } => WriteTarget::Err(EINVAL),
-                    FdEntry::PipeWrite { pipe_id } => WriteTarget::Pipe(*pipe_id),
-                    FdEntry::File {
-                        abs_path,
-                        offset,
-                        writable,
-                        append,
-                        ..
-                    } => {
-                        if !*writable {
-                            WriteTarget::Err(EBADF)
-                        } else {
-                            WriteTarget::File(abs_path.clone(), *offset, *append)
-                        }
-                    }
-                    FdEntry::Dir { .. } => WriteTarget::Err(EISDIR),
-                });
-
-                match target {
-                    Some(WriteTarget::Pipe(pipe_id)) => {
-                        let capped = len.min(ipc::PIPE_BUF_SIZE);
-                        let mut kbuf = vec![0u8; capped];
-                        if copy_from_user_bytes(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, &mut kbuf).is_err() {
-                            EFAULT
-                        } else {
-                            match ipc::write_pipe(pipe_id, &kbuf) {
-                                Ok(n) => n as i64,
-                                Err(e) => e,
-                            }
-                        }
-                    }
-                    Some(WriteTarget::Tcp(handle)) => {
-                        let capped = len.min(8192);
-                        let mut kbuf = vec![0u8; capped];
-                        if copy_from_user_bytes(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, &mut kbuf).is_err() {
-                            EFAULT
-                        } else {
-                            unsafe { asm!("sti", options(nomem, nostack)); }
-                            let res = crate::net::tcp::send_data(handle, &kbuf);
-                            unsafe { asm!("cli", options(nomem, nostack)); }
-                            match res {
-                                Ok(n) => n as i64,
-                                Err(_) => EIO,
-                            }
-                        }
-                    }
-                    Some(WriteTarget::File(abs_path, mut off, append)) => {
-                        let capped = len.min(64 * 1024);
-                        let mut kbuf = vec![0u8; capped];
-                        if copy_from_user_bytes(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, &mut kbuf).is_err() {
-                            EFAULT
-                        } else {
-                            let res = vfs::with_vfs(|s| {
-                                if append {
-                                    if let Ok(st) = s.stat(&abs_path) {
-                                        off = st.size;
-                                    }
-                                }
-                                s.write_file_at(&abs_path, off, &kbuf)
-                            });
-                            match res {
-                                Ok(n) => {
-                                    sched::with_current_fd_mut(fd as usize, |entry| {
-                                        if let FdEntry::File { offset, .. } = entry {
-                                            *offset = off.saturating_add(n as u32);
-                                        }
-                                    });
-                                    n as i64
-                                }
-                                Err(e) => vfs_err_to_errno(e),
-                            }
-                        }
-                    }
-                    Some(WriteTarget::Err(e)) => e,
-                    None => EBADF,
-                }
-            } else {
-                EINVAL
-            }
+            handle_sys_write(user_pml4, arg1, arg2, arg3, console_opt, mapping_opt, allocator_opt)
         }
 
         SYS_READ => {
-            let fd = arg1;
-            let buf_ptr = arg2;
-            let count = arg3 as usize;
-
-            if count == 0 {
-                0
-            } else if fd == 0 {
-                if let (Some(mapping), Some(console)) = (mapping_opt, console_opt) {
-                    if crate::graphics::wm::is_desktop_active() {
-                        EAGAIN
-                    } else {
-                        let mut kbuf = [0u8; 256];
-                        let max_read = count.min(kbuf.len());
-                        if validate_user_slice(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, max_read, true).is_err() {
-                            EFAULT
-                        } else {
-                            let actual = read_console_line(console, &mut kbuf[..max_read]);
-                            if copy_to_user_bytes(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, &kbuf[..actual]).is_err() {
-                                EFAULT
-                            } else {
-                                actual as i64
-                            }
-                        }
-                    }
-                } else {
-                    EINVAL
-                }
-            } else if let Some(mapping) = mapping_opt {
-                enum ReadTarget {
-                    Sock(OpenSocket),
-                    Pipe(usize),
-                    File(String, u32),
-                    Err(i64),
-                }
-                let target = sched::with_current_fd_mut(fd as usize, |entry| match entry {
-                    FdEntry::Socket(sock) => ReadTarget::Sock(*sock),
-                    FdEntry::PipeRead { pipe_id } => ReadTarget::Pipe(*pipe_id),
-                    FdEntry::PipeWrite { .. } => ReadTarget::Err(EBADF),
-                    FdEntry::File {
-                        abs_path,
-                        offset,
-                        readable,
-                        ..
-                    } => {
-                        if !*readable {
-                            ReadTarget::Err(EBADF)
-                        } else {
-                            ReadTarget::File(abs_path.clone(), *offset)
-                        }
-                    }
-                    FdEntry::Dir { .. } => ReadTarget::Err(EISDIR),
-                });
-
-                match target {
-                    Some(ReadTarget::Pipe(pipe_id)) => {
-                        let max_read = count.min(ipc::PIPE_BUF_SIZE);
-                        if validate_user_slice(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, max_read, true).is_err() {
-                            EFAULT
-                        } else {
-                            let mut kbuf = vec![0u8; max_read];
-                            match ipc::read_pipe(pipe_id, &mut kbuf) {
-                                Ok(n) => {
-                                    if n > 0
-                                        && copy_to_user_bytes(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, &kbuf[..n])
-                                            .is_err()
-                                    {
-                                        EFAULT
-                                    } else {
-                                        n as i64
-                                    }
-                                }
-                                Err(-11) => {
-                                    let ctx = build_resume_ctx_from_syscall(frame, 0);
-                                    let deadline_ms = timer::uptime_ms().saturating_add(2000);
-                                    unsafe {
-                                        sched::suspend_current_from_syscall(
-                                            ctx,
-                                            UserTaskState::Waiting(WaitReason::PipeRead {
-                                                pipe_id,
-                                                buf_ptr,
-                                                cap: max_read,
-                                                deadline_ms,
-                                            }),
-                                        );
-                                    }
-                                }
-                                Err(e) => e,
-                            }
-                        }
-                    }
-                    Some(ReadTarget::File(abs_path, off)) => {
-                        let max_read = count.min(32 * 1024);
-                        if validate_user_slice(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, max_read, true).is_err() {
-                            EFAULT
-                        } else {
-                            let mut kbuf = vec![0u8; max_read];
-                            let res = vfs::with_vfs(|s| s.read_file_chunk(&abs_path, off, &mut kbuf));
-                            match res {
-                                Ok(n) => {
-                                    if n > 0
-                                        && copy_to_user_bytes(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, &kbuf[..n])
-                                            .is_err()
-                                    {
-                                        EFAULT
-                                    } else {
-                                        sched::with_current_fd_mut(fd as usize, |entry| {
-                                            if let FdEntry::File { offset, .. } = entry {
-                                                *offset = off.saturating_add(n as u32);
-                                            }
-                                        });
-                                        n as i64
-                                    }
-                                }
-                                Err(VfsError::OffsetOutOfRange) => 0, // EOF
-                                Err(e) => vfs_err_to_errno(e),
-                            }
-                        }
-                    }
-                    Some(ReadTarget::Sock(sock)) => {
-                        let max_read = count.min(2048);
-                        if validate_user_slice(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, max_read, true).is_err() {
-                            EFAULT
-                        } else {
-                            let mut kbuf = vec![0u8; max_read];
-                            match sock {
-                                OpenSocket::Tcp { handle } => {
-                                    unsafe { asm!("sti", options(nomem, nostack)); }
-                                    let res = crate::net::tcp::recv_data(handle, &mut kbuf);
-                                    unsafe { asm!("cli", options(nomem, nostack)); }
-                                    match res {
-                                        Ok(0) => EAGAIN,
-                                        Ok(n) => {
-                                            if copy_to_user_bytes(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, &kbuf[..n]).is_err() {
-                                                EFAULT
-                                            } else {
-                                                n as i64
-                                            }
-                                        }
-                                        Err(_) => 0,
-                                    }
-                                }
-                                OpenSocket::Udp { handle } => {
-                                    unsafe { asm!("sti", options(nomem, nostack)); }
-                                    let pkt = crate::net::udp::recv_socket(handle, &mut kbuf);
-                                    unsafe { asm!("cli", options(nomem, nostack)); }
-                                    if let Some((_ip, _port, n)) = pkt {
-                                        if copy_to_user_bytes(mapping, allocator_opt.as_deref_mut(), user_pml4, buf_ptr, &kbuf[..n]).is_err() {
-                                            EFAULT
-                                        } else {
-                                            n as i64
-                                        }
-                                    } else {
-                                        EAGAIN
-                                    }
-                                }
-                                OpenSocket::TcpUnconnected => -107,
-                            }
-                        }
-                    }
-                    Some(ReadTarget::Err(e)) => e,
-                    None => EBADF,
-                }
-            } else {
-                EINVAL
-            }
+            handle_sys_read(frame, user_pml4, console_opt, mapping_opt, allocator_opt)
         }
 
-        SYS_CLOSE => {
-            if let Some(entry) = sched::take_current_fd(arg1 as usize) {
-                match entry {
-                    FdEntry::Socket(sock) => match sock {
-                        OpenSocket::Tcp { handle } => crate::net::tcp::close_socket(handle),
-                        OpenSocket::Udp { handle } => crate::net::udp::free_socket(handle),
-                        OpenSocket::TcpUnconnected => {}
-                    },
-                    FdEntry::PipeRead { pipe_id } => ipc::close_pipe_end(pipe_id, false),
-                    FdEntry::PipeWrite { pipe_id } => ipc::close_pipe_end(pipe_id, true),
-                    FdEntry::File { .. } | FdEntry::Dir { .. } => {}
-                }
-                0
-            } else {
-                EBADF
-            }
-        }
+        SYS_CLOSE => handle_sys_close(arg1),
 
         SYS_SOCKET => {
             let domain = arg1;
@@ -2529,7 +2695,7 @@ extern "C" fn rust_syscall_dispatch(frame: &mut SyscallFrame) {
         _ => ENOSYS,
     };
 
-    frame.rax = ret as u64;
+    frame.rax = freebsd::apply_abi_syscall_result(abi, ret, &mut frame.user_rflags);
 
     unsafe {
         switch_cr3_raw(user_pml4, flags_bits);

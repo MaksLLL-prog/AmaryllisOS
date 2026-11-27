@@ -14,6 +14,25 @@ use pmm::region::PmmRegion;
 
 pub const FRAME_SIZE: u64 = 4096;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+static PMM_TOTAL_FRAMES_HINT: AtomicUsize = AtomicUsize::new(0);
+static PMM_FREE_FRAMES_HINT: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+pub fn record_pmm_stats_hint(allocated: usize, free: usize) {
+    PMM_TOTAL_FRAMES_HINT.store(allocated.saturating_add(free), Ordering::Relaxed);
+    PMM_FREE_FRAMES_HINT.store(free, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn pmm_stats_hint() -> (usize, usize) {
+    (
+        PMM_TOTAL_FRAMES_HINT.load(Ordering::Relaxed),
+        PMM_FREE_FRAMES_HINT.load(Ordering::Relaxed),
+    )
+}
+
 pub mod vmm;
 pub mod heap;
 pub mod address_space;
@@ -158,27 +177,25 @@ impl<'a> PhysicalFrameAllocator<'a> {
     // --------------------------------------------------------
 
     pub fn allocate_frame(&mut self) -> Option<u64> {
-        match &mut self.backend {
-            AllocatorBackend::Bootstrap(allocator) => {
-                allocator.allocate_frame()
-            }
-
-            AllocatorBackend::Dynamic(allocator) => {
-                allocator.allocate_frame()
-            }
+        let res = match &mut self.backend {
+            AllocatorBackend::Bootstrap(allocator) => allocator.allocate_frame(),
+            AllocatorBackend::Dynamic(allocator) => allocator.allocate_frame(),
+        };
+        if res.is_some() {
+            record_pmm_stats_hint(self.allocated_frames(), self.free_frames());
         }
+        res
     }
 
     pub fn deallocate_frame(&mut self, frame: u64) -> bool {
-        match &mut self.backend {
-            AllocatorBackend::Bootstrap(allocator) => {
-                allocator.deallocate_frame(frame)
-            }
-
-            AllocatorBackend::Dynamic(allocator) => {
-                allocator.deallocate_frame(frame)
-            }
+        let ok = match &mut self.backend {
+            AllocatorBackend::Bootstrap(allocator) => allocator.deallocate_frame(frame),
+            AllocatorBackend::Dynamic(allocator) => allocator.deallocate_frame(frame),
+        };
+        if ok {
+            record_pmm_stats_hint(self.allocated_frames(), self.free_frames());
         }
+        ok
     }
 
     pub fn owns_frame(&self, frame: u64) -> bool {
@@ -417,6 +434,7 @@ impl<'a> PhysicalFrameAllocator<'a> {
 
         // Commit: replace Bootstrap only after all checks pass.
         self.backend = AllocatorBackend::Dynamic(dynamic);
+        record_pmm_stats_hint(self.allocated_frames(), self.free_frames());
 
         true
     }

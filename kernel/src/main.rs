@@ -19,6 +19,7 @@ mod net;
 mod audio;
 mod arch;
 mod userland;
+mod freebsd_kpi;
 mod klog;
 mod serial;
 
@@ -5881,7 +5882,7 @@ fn alloc_error(layout: Layout) -> ! {
     use core::fmt::Write;
     let mut l1 = serial::FixedBuf::<96>::new();
     let mut l2 = serial::FixedBuf::<96>::new();
-    let _ = write!(l1, "size={} align={}", layout.size(), layout.align());
+    let _ = write!(l1, "size={} align={} free={} maxblk={}", layout.size(), layout.align(), memory::heap::GLOBAL_ALLOCATOR.free_bytes(), memory::heap::GLOBAL_ALLOCATOR.largest_free_block());
     let _ = write!(l2, "cpu={}", arch::percpu::current_cpu_id());
     serial::panic_banner("KERNEL ALLOC ERROR", l1.as_str(), l2.as_str());
     halt_forever();

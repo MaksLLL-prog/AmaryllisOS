@@ -224,6 +224,7 @@ pub fn cmd_mount(console: &mut Console<'_>, arguments: &str) {
 
     let res = match target {
         "auto" => vfs::with_vfs(|v| v.mount_auto()),
+        "nvme" => vfs::with_vfs(|v| v.mount_nvme()),
         "virtio" => vfs::with_vfs(|v| v.mount_virtio()),
         "ahci" => vfs::with_vfs(|v| v.mount_ahci()),
         "pm" | "0" => vfs::with_vfs(|v| v.mount_slot(0, false, false)),
@@ -231,7 +232,7 @@ pub fn cmd_mount(console: &mut Console<'_>, arguments: &str) {
         "sm" | "2" => vfs::with_vfs(|v| v.mount_slot(0, true, false)),
         "ss" | "3" => vfs::with_vfs(|v| v.mount_slot(0, true, true)),
         _ => {
-            console.write("Usage: mount [auto|virtio|ahci|pm|ps|sm|ss]\n", YELLOW);
+            console.write("Usage: mount [auto|nvme|virtio|ahci|pm|ps|sm|ss]\n", YELLOW);
             return;
         }
     };
@@ -360,6 +361,14 @@ pub fn cmd_diskinfo(console: &mut Console<'_>) {
                     console.write("AHCI SATA DMA Port ", GREEN);
                     write_decimal(console, port as u64);
                     console.write(" (max ", GRAY);
+                    write_decimal(console, max_dma_sectors as u64);
+                    console.write(" sectors/batch)\n", GRAY);
+                }
+                Some(MountedBackend::Nvme { max_dma_sectors, lba_size }) => {
+                    console.write("  Backend:     ", GRAY);
+                    console.write("NVMe PCI Express DMA (FreeBSD KPI, ", GREEN);
+                    write_decimal(console, lba_size as u64);
+                    console.write("B LBA, max ", GRAY);
                     write_decimal(console, max_dma_sectors as u64);
                     console.write(" sectors/batch)\n", GRAY);
                 }

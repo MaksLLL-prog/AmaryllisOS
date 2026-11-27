@@ -422,6 +422,13 @@ pub fn init_io_services(discovery: &HardwareDiscovery) {
         None
     };
 
+    let nvme_snap = crate::drivers::nvme::snapshot();
+    let nvme_route = if nvme_snap.initialized {
+        nvme_snap.irq_gsi.zip(nvme_snap.irq_vector)
+    } else {
+        None
+    };
+
     let mut reg = IOREGISTRY.lock();
     reg.clear();
 
@@ -501,6 +508,7 @@ pub fn init_io_services(discovery: &HardwareDiscovery) {
             "Intel AC'97" => (audio_route, "kiokit_audio"),
             "VirtIO-Blk" => (virtio_route, "kiokit_blk"),
             "AHCI SATA" => (ahci_route, "kiokit_blk"),
+            "NVMe" => (nvme_route, "kiokit_blk"),
             _ => (None, ""),
         };
 
@@ -547,7 +555,7 @@ pub fn init_io_services(discovery: &HardwareDiscovery) {
         "iokit",
         format_args!(
             "IORegistry built ({} nodes); IOAPIC IRQ routes net={:?} audio={:?} blk={:?}",
-            reg.count, net_route, audio_route, virtio_route.or(ahci_route)
+            reg.count, net_route, audio_route, virtio_route.or(ahci_route).or(nvme_route)
         ),
     );
 }

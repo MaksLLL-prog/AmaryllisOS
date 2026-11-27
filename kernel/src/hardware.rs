@@ -202,12 +202,40 @@ impl PciVirtioBlkDescriptor {
 }
 
 #[derive(Clone, Copy)]
+pub struct PciNvmeDescriptor {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub irq_line: u8,
+    pub bar0_phys: u64,
+    pub bar0_size: u64,
+    pub valid: bool,
+}
+
+impl PciNvmeDescriptor {
+    pub const EMPTY: Self = Self {
+        bus: 0,
+        device: 0,
+        function: 0,
+        vendor_id: 0,
+        device_id: 0,
+        irq_line: 0,
+        bar0_phys: 0,
+        bar0_size: 0,
+        valid: false,
+    };
+}
+
+#[derive(Clone, Copy)]
 pub struct HardwareDiscovery {
     pub ide_controllers: IdeControllerDiscoveryList,
     pub network: PciNetworkDescriptor,
     pub audio: PciAudioDescriptor,
     pub ahci: PciAhciDescriptor,
     pub virtio_blk: PciVirtioBlkDescriptor,
+    pub nvme: PciNvmeDescriptor,
 }
 
 impl HardwareDiscovery {
@@ -217,5 +245,6 @@ impl HardwareDiscovery {
         audio: PciAudioDescriptor::EMPTY,
         ahci: PciAhciDescriptor::EMPTY,
         virtio_blk: PciVirtioBlkDescriptor::EMPTY,
+        nvme: PciNvmeDescriptor::EMPTY,
     };
 }

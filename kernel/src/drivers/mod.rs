@@ -2,6 +2,7 @@ pub mod ac97;
 pub mod ahci;
 pub mod e1000;
 pub mod iokit;
+pub mod nvme;
 pub mod registry;
 pub mod virtio_blk;
 
@@ -466,6 +467,86 @@ pub fn init_all(
             "Use QEMU -drive if=virtio",
         );
     }
+
+    // 11. NVMe Controller (FreeBSD Driver KPI)
+    if discovery.nvme.valid {
+        let nvme_bus = DeviceBus::Pci {
+            bus: discovery.nvme.bus,
+            device: discovery.nvme.device,
+            function: discovery.nvme.function,
+            vendor_id: discovery.nvme.vendor_id,
+            device_id: discovery.nvme.device_id,
+        };
+        match nvme::init(&discovery.nvme, mapping, allocator) {
+            Ok(snap) => {
+                let mut details = FixedStr::<64>::new();
+                let _ = write!(
+                    details,
+                    "{} {}B sect={}",
+                    snap.model_str(),
+                    snap.lba_size,
+                    snap.sector_count_512
+                );
+                registry::register_device(
+                    "NVMe",
+                    "FreeBSD KPI NVMe DMA",
+                    DeviceClass::Storage,
+                    nvme_bus,
+                    DriverStatus::Active,
+                    Some(discovery.nvme.irq_line),
+                    0,
+                    discovery.nvme.bar0_phys,
+                    details.as_str(),
+                );
+                console.write("  [ OK ] ", GREEN);
+                console.write("NVMe (FreeBSD KPI) initialized (", WHITE);
+                console.write(details.as_str(), GRAY);
+                console.write(")\n", WHITE);
+            }
+            Err(err) => {
+                registry::register_device(
+                    "NVMe",
+                    "FreeBSD KPI NVMe DMA",
+                    DeviceClass::Storage,
+                    nvme_bus,
+                    DriverStatus::Failed,
+                    Some(discovery.nvme.irq_line),
+                    0,
+                    discovery.nvme.bar0_phys,
+                    err,
+                );
+                console.write("  [WARN] NVMe (FreeBSD KPI): ", YELLOW);
+                console.write(err, WHITE);
+                console.write("\n", WHITE);
+            }
+        }
+    } else {
+        registry::register_device(
+            "NVMe",
+            "FreeBSD KPI NVMe DMA",
+            DeviceClass::Storage,
+            DeviceBus::System,
+            DriverStatus::NotPresent,
+            None,
+            0,
+            0,
+            "Use QEMU -device nvme,serial=amaryllis",
+        );
+    }
+
+    crate::freebsd_kpi::taskqueue::ensure_taskqueue_worker();
+    let kpi_report =
+        crate::freebsd_kpi::validate_against_legacy_drivers(discovery, mapping, allocator);
+    let kpi_ok = kpi_report.entries.iter().all(|e| e.passed);
+    console.write(
+        if kpi_ok { "  [ OK ] " } else { "  [WARN] " },
+        if kpi_ok { GREEN } else { YELLOW },
+    );
+    console.write("FreeBSD Driver KPI cross-check (", WHITE);
+    let mut kpi_buf = FixedStr::<16>::new();
+    let _ = write!(kpi_buf, "{} checks", kpi_report.entries.len());
+    console.write(kpi_buf.as_str(), GRAY);
+    console.write(")\n", WHITE);
 
     iokit::init_io_services(discovery);
     let io_st = iokit::stats();

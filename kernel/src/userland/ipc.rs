@@ -307,6 +307,19 @@ pub fn write_pipe(pipe_id: usize, data: &[u8]) -> Result<usize, i64> {
     })
 }
 
+pub fn pipe_status(pipe_id: usize) -> Option<(usize, usize, usize, usize)> {
+    without_interrupts(|| {
+        let table = PIPES.lock();
+        let slot = table.slots.get(pipe_id)?;
+        if !slot.in_use {
+            return None;
+        }
+        let readable = slot.len;
+        let writable = PIPE_BUF_SIZE.saturating_sub(slot.len);
+        Some((readable, writable, slot.readers, slot.writers))
+    })
+}
+
 pub fn create_or_open_shm(
     name: &str,
     requested_size: usize,

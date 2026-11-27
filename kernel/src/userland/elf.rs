@@ -8,6 +8,11 @@ use crate::memory::vmm::{is_shared_kernel_entry, PhysicalMemoryMapping, PAGE_SIZ
 use crate::memory::PhysicalFrameAllocator;
 use crate::storage::vfs::{self, VfsError, VfsNodeKind};
 
+use super::freebsd::{
+    self, ProcessAbi, AT_ENTRY, AT_EXECPATH, AT_NCPUS, AT_NULL, AT_OSRELDATE, AT_PAGESZ,
+    AT_PHDR, AT_PHENT, AT_PHNUM, AT_STACKPROT, ELFOSABI_FREEBSD, PT_NOTE, PT_PHDR,
+};
+
 pub const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 pub const ELFCLASS64: u8 = 2;
 pub const ELFDATA2LSB: u8 = 1;
@@ -83,6 +88,7 @@ pub struct ElfInspection {
     pub e_type: u16,
     pub e_machine: u16,
     pub ph_num: u16,
+    pub abi: ProcessAbi,
     pub segments: Vec<ElfSegmentSummary>,
 }
 
@@ -92,6 +98,12 @@ pub struct LoadedElfImage {
     pub brk_base: u64,
     pub initial_argc: u64,
     pub initial_argv: u64,
+    pub abi: ProcessAbi,
+    pub auxv_ptr: u64,
+    pub phdr_vaddr: u64,
+    pub ph_ent: u16,
+    pub ph_num: u16,
+    pub osreldate: u32,
     pub mapped_pages: Vec<(u64, u64)>,
     pub load_regions: Vec<(u64, u64, bool, bool)>,
     pub load_segment_count: usize,
@@ -267,8 +279,84 @@ fn parse_header_and_phdrs(path: &str) -> Result<(u32, Elf64Header, Vec<Elf64Prog
     Ok((stat.size, header, phdrs))
 }
 
+fn detect_elf_abi(
+    path: &str,
+    file_size: u32,
+    header: &Elf64Header,
+    phdrs: &[Elf64ProgramHeader],
+) -> (ProcessAbi, u32) {
+    let mut abi = if header.e_ident[7] == ELFOSABI_FREEBSD {
+        ProcessAbi::FreeBsd
+    } else {
+        ProcessAbi::Amaryllis
+    };
+    let mut osreldate = freebsd::sysctl::FREEBSD_OSRELDATE;
+
+    for ph in phdrs {
+        if ph.p_type != PT_NOTE || ph.p_filesz < 16 || ph.p_filesz > 1024 {
+            continue;
+        }
+        let Some(end) = ph.p_offset.checked_add(ph.p_filesz) else {
+            continue;
+        };
+        if end > file_size as u64 {
+            continue;
+        }
+        let mut buf = alloc::vec![0u8; ph.p_filesz as usize];
+        if read_exact_vfs(path, ph.p_offset as u32, &mut buf).is_err() {
+            continue;
+        }
+        let mut pos = 0usize;
+        while pos + 12 <= buf.len() {
+            let namesz = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            let descsz = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let ntype = u32::from_le_bytes(buf[pos + 8..pos + 12].try_into().unwrap());
+            let name_off = pos + 12;
+            let name_aligned = (namesz + 3) & !3;
+            let desc_off = name_off + name_aligned;
+            let desc_aligned = (descsz + 3) & !3;
+            if desc_off + descsz > buf.len() {
+                break;
+            }
+            let name_slice = &buf[name_off..name_off + namesz];
+            if name_slice == b"FreeBSD\0" || name_slice == b"FreeBSD" {
+                abi = ProcessAbi::FreeBsd;
+                if ntype == 1 && descsz >= 4 {
+                    osreldate =
+                        u32::from_le_bytes(buf[desc_off..desc_off + 4].try_into().unwrap());
+                }
+            }
+            let step = 12 + name_aligned + desc_aligned;
+            if step == 0 {
+                break;
+            }
+            pos += step;
+        }
+    }
+
+    (abi, osreldate)
+}
+
+fn find_phdr_vaddr(header: &Elf64Header, phdrs: &[Elf64ProgramHeader]) -> u64 {
+    for ph in phdrs {
+        if ph.p_type == PT_PHDR && ph.p_vaddr != 0 {
+            return ph.p_vaddr;
+        }
+    }
+    for ph in phdrs {
+        if ph.p_type == PT_LOAD
+            && header.e_phoff >= ph.p_offset
+            && header.e_phoff < ph.p_offset.saturating_add(ph.p_filesz)
+        {
+            return ph.p_vaddr.saturating_add(header.e_phoff - ph.p_offset);
+        }
+    }
+    0
+}
+
 pub fn inspect_elf(path: &str) -> Result<ElfInspection, ElfError> {
     let (file_size, header, phdrs) = parse_header_and_phdrs(path)?;
+    let (abi, _osreldate) = detect_elf_abi(path, file_size, &header, &phdrs);
 
     let segments = phdrs
         .into_iter()
@@ -289,6 +377,7 @@ pub fn inspect_elf(path: &str) -> Result<ElfInspection, ElfError> {
         e_type: header.e_type,
         e_machine: header.e_machine,
         ph_num: header.e_phnum,
+        abi,
         segments,
     })
 }
@@ -312,6 +401,8 @@ pub fn load_elf_into_address_space_with_args(
     nxe_enabled: bool,
 ) -> Result<LoadedElfImage, ElfError> {
     let (file_size, header, phdrs) = parse_header_and_phdrs(path)?;
+    let (abi, osreldate) = detect_elf_abi(path, file_size, &header, &phdrs);
+    let phdr_vaddr = find_phdr_vaddr(&header, &phdrs);
 
     let mut image = LoadedElfImage {
         entry_point: header.e_entry,
@@ -319,6 +410,12 @@ pub fn load_elf_into_address_space_with_args(
         brk_base: 0x0200_0000,
         initial_argc: 0,
         initial_argv: 0,
+        abi,
+        auxv_ptr: 0,
+        phdr_vaddr,
+        ph_ent: header.e_phentsize,
+        ph_num: header.e_phnum,
+        osreldate,
         mapped_pages: Vec::new(),
         load_regions: Vec::new(),
         load_segment_count: 0,
@@ -540,8 +637,20 @@ fn load_segments_and_stack(
 
     image.brk_base = max_seg_end;
 
-    // Populate SysV x86_64 initial stack with argc + argv strings/pointers (capped at 16 args / 2 KiB)
+    // Populate SysV / FreeBSD x86_64 initial stack with strings, argc, argv, envp=NULL, and auxv (when FreeBSD)
     let mut sp = USER_STACK_TOP - 16;
+
+    let execpath_ptr = if image.abi == ProcessAbi::FreeBsd {
+        let ep_bytes = path.as_bytes();
+        let take = ep_bytes.len().min(220);
+        sp -= (take + 1) as u64;
+        write_stack_bytes(pml4, mapping, sp, &ep_bytes[..take])?;
+        write_stack_bytes(pml4, mapping, sp + take as u64, &[0])?;
+        sp
+    } else {
+        0
+    };
+
     let capped_args = args.iter().take(16);
     let mut arg_ptrs: Vec<u64> = Vec::new();
     let mut str_budget = 2048usize;
@@ -568,9 +677,24 @@ fn load_segments_and_stack(
         arg_ptrs.push(sp);
     }
 
-    // Align down to 16 bytes, then push [argc, argv[0].., NULL, envp=NULL]
+    let mut auxv_pairs: Vec<(u64, u64)> = Vec::new();
+    if image.abi == ProcessAbi::FreeBsd {
+        let ncpus = crate::arch::acpi::snapshot().cpu_count.max(1) as u64;
+        auxv_pairs.push((AT_PHDR, image.phdr_vaddr));
+        auxv_pairs.push((AT_PHENT, image.ph_ent as u64));
+        auxv_pairs.push((AT_PHNUM, image.ph_num as u64));
+        auxv_pairs.push((AT_PAGESZ, PAGE_SIZE));
+        auxv_pairs.push((AT_ENTRY, image.entry_point));
+        auxv_pairs.push((AT_EXECPATH, execpath_ptr));
+        auxv_pairs.push((AT_OSRELDATE, image.osreldate as u64));
+        auxv_pairs.push((AT_NCPUS, ncpus));
+        auxv_pairs.push((AT_STACKPROT, (PF_R | PF_W) as u64));
+        auxv_pairs.push((AT_NULL, 0));
+    }
+
+    // Align down to 16 bytes, then reserve [argc, argv[0].., NULL, envp=NULL, auxv...]
     sp &= !0xF;
-    let pointer_qwords = 1 + arg_ptrs.len() + 1 + 1;
+    let pointer_qwords = 1 + arg_ptrs.len() + 1 + 1 + auxv_pairs.len() * 2;
     let total_table_bytes = (pointer_qwords * 8) as u64;
     sp -= total_table_bytes;
     sp &= !0xF;
@@ -595,9 +719,17 @@ fn load_segments_and_stack(
         &0u64.to_le_bytes(),
     )?;
 
+    let auxv_base = argv_ptr + ((arg_ptrs.len() + 2) as u64) * 8;
+    for (i, &(key, val)) in auxv_pairs.iter().enumerate() {
+        let entry_off = auxv_base + (i as u64) * 16;
+        write_stack_bytes(pml4, mapping, entry_off, &key.to_le_bytes())?;
+        write_stack_bytes(pml4, mapping, entry_off + 8, &val.to_le_bytes())?;
+    }
+
     image.user_rsp = sp;
     image.initial_argc = argc;
     image.initial_argv = argv_ptr;
+    image.auxv_ptr = if auxv_pairs.is_empty() { 0 } else { auxv_base };
     Ok(())
 }
 

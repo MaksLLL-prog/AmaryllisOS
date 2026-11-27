@@ -19,7 +19,9 @@ const CODE_FILE_OFFSET: usize = 0x80;
 struct MiniElfBuilder {
     code: Vec<u8>,
     data: Vec<u8>,
-    lea_patches: Vec<(usize, usize)>, // (disp32_offset_in_code, offset_in_data)
+    lea_patches: Vec<(usize, usize)>,      // (disp32_offset_in_code, offset_in_data)
+    code_lea_patches: Vec<(usize, usize)>, // (disp32_offset_in_code, target_offset_in_code)
+    os_abi: u8,
 }
 
 impl MiniElfBuilder {
@@ -28,6 +30,18 @@ impl MiniElfBuilder {
             code: Vec::new(),
             data: Vec::new(),
             lea_patches: Vec::new(),
+            code_lea_patches: Vec::new(),
+            os_abi: 0,
+        }
+    }
+
+    fn new_with_abi(os_abi: u8) -> Self {
+        Self {
+            code: Vec::new(),
+            data: Vec::new(),
+            lea_patches: Vec::new(),
+            code_lea_patches: Vec::new(),
+            os_abi,
         }
     }
 
@@ -122,11 +136,19 @@ impl MiniElfBuilder {
             self.code[disp_off..disp_off + 4].copy_from_slice(&disp.to_le_bytes());
         }
 
+        for (disp_off, code_off) in self.code_lea_patches {
+            let next_rip = (CODE_FILE_OFFSET + disp_off + 4) as i64;
+            let target = (CODE_FILE_OFFSET + code_off) as i64;
+            let disp = (target - next_rip) as i32;
+            self.code[disp_off..disp_off + 4].copy_from_slice(&disp.to_le_bytes());
+        }
+
         let mut e_ident = [0u8; 16];
         e_ident[0..4].copy_from_slice(&ELF_MAGIC);
         e_ident[4] = ELFCLASS64;
         e_ident[5] = ELFDATA2LSB;
         e_ident[6] = 1; // EV_CURRENT
+        e_ident[7] = self.os_abi;
 
         let ehdr = Elf64Header {
             e_ident,
@@ -946,5 +968,295 @@ pub fn build_mach_ipc_demo_elf() -> Vec<u8> {
 
     b.build()
 }
+
+/// FreeBSD ABI (`ELFOSABI_FREEBSD = 9`) verification ELF (`/freebsd_demo.elf`):
+/// 1) Parses initial FreeBSD stack + Auxiliary Vector (`AT_PAGESZ = 6`)
+/// 2) Verifies `RFLAGS.CF = 1` + positive `RAX = 9` (`FBSD_EBADF`) on `close(999)`
+/// 3) Queries `hw.ncpu` (`[6, 3]`) and `kern.ostype` (`[1, 1]`) via `SYS_FBSD_SYSCTL (202)`
+/// 4) Tests `kqueue` + `kevent` (`EVFILT_TIMER` 30ms & `EVFILT_PROC` `NOTE_EXIT` across `fork()`)
+/// 5) Installs `SIGUSR1` handler via `sigaction (416)`, fires `kill (37)`, returns via `sigreturn (417)`
+pub fn build_freebsd_demo_elf() -> Vec<u8> {
+    let mut b = MiniElfBuilder::new_with_abi(super::freebsd::ELFOSABI_FREEBSD);
+
+    let sig_flag_off = b.data.len();
+    b.data.extend_from_slice(&0u64.to_le_bytes());
+
+    let emit_fbsd_write_lit = |b: &mut MiniElfBuilder, msg: &[u8]| {
+        let (off, len) = b.add_string(msg);
+        b.emit_mov_eax(4); // SYS_FBSD_WRITE
+        b.emit_mov_edi(1); // stdout
+        b.emit_lea_rsi_data(off);
+        b.emit_mov_edx(len);
+        b.emit_syscall();
+    };
+
+    let emit_fbsd_print_rax_ln = |b: &mut MiniElfBuilder| {
+        b.emit(&[0x48, 0x83, 0xEC, 32]); // sub rsp, 32
+        b.emit(&[0x48, 0x8D, 0x74, 0x24, 32]); // lea rsi, [rsp + 32]
+        b.emit(&[0x48, 0xFF, 0xCE]); // dec rsi
+        b.emit(&[0xC6, 0x06, 0x0A]); // mov byte ptr [rsi], '\n'
+        b.emit(&[0x41, 0xB8, 0x01, 0x00, 0x00, 0x00]); // mov r8d, 1
+        b.emit(&[0xB9, 0x0A, 0x00, 0x00, 0x00]); // mov ecx, 10
+        let loop_top = b.code.len();
+        b.emit(&[0x31, 0xD2]); // xor edx, edx
+        b.emit(&[0x48, 0xF7, 0xF1]); // div rcx
+        b.emit(&[0x80, 0xC2, 0x30]); // add dl, '0'
+        b.emit(&[0x48, 0xFF, 0xCE]); // dec rsi
+        b.emit(&[0x88, 0x16]); // mov [rsi], dl
+        b.emit(&[0x49, 0xFF, 0xC0]); // inc r8
+        b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+        let next_ip = b.code.len() + 2;
+        let rel8 = (loop_top as isize - next_ip as isize) as i8 as u8;
+        b.emit(&[0x75, rel8]);
+        b.emit(&[0x4C, 0x89, 0xC2]); // mov rdx, r8
+        b.emit_mov_eax(4); // SYS_FBSD_WRITE
+        b.emit_mov_edi(1);
+        b.emit_syscall();
+        b.emit(&[0x48, 0x83, 0xC4, 32]); // add rsp, 32
+    };
+
+    let emit_fbsd_exit = |b: &mut MiniElfBuilder, code: u32| {
+        b.emit_mov_eax(1); // SYS_FBSD_EXIT
+        b.emit_mov_edi(code);
+        b.emit_syscall();
+    };
+
+    // Save FreeBSD initial stack pointer (rdi) into r15
+    b.emit(&[0x49, 0x89, 0xE7]); // mov r15, rsp
+
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo] ELFOSABI_FREEBSD (9) started, argc=");
+    b.emit(&[0x49, 0x8B, 0x07]); // mov rax, [r15]
+    emit_fbsd_print_rax_ln(&mut b);
+
+    // Walk stack: rbx = r15 + 8 + (argc * 8) + 8(argv_null) + 8(envp_null) -> auxv
+    b.emit(&[0x49, 0x8B, 0x07]); // mov rax, [r15] (argc)
+    b.emit(&[0x49, 0x8D, 0x5C, 0xC7, 0x18]); // lea rbx, [r15 + rax*8 + 24]
+    let aux_loop = b.code.len();
+    b.emit(&[0x48, 0x8B, 0x03]); // mov rax, [rbx]
+    b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax (AT_NULL?)
+    let jz_aux_done = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]);
+    b.emit(&[0x48, 0x83, 0xF8, 6]); // cmp rax, AT_PAGESZ (6)
+    let je_pagesz = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]);
+    b.emit(&[0x48, 0x83, 0xC3, 16]); // add rbx, 16
+    let j_aux = b.code.len() + 5;
+    let rel_aux = (aux_loop as isize - j_aux as isize) as i32;
+    b.emit(&[0xE9]);
+    b.emit(&rel_aux.to_le_bytes());
+
+    let pagesz_found = b.code.len();
+    let d_ps = (pagesz_found as isize - (je_pagesz + 6) as isize) as i32;
+    b.code[je_pagesz + 2..je_pagesz + 6].copy_from_slice(&d_ps.to_le_bytes());
+    b.emit(&[0x4C, 0x8B, 0x73, 8]); // mov r14, [rbx + 8]
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo] auxv[AT_PAGESZ]=");
+    b.emit(&[0x4C, 0x89, 0xF0]); // mov rax, r14
+    emit_fbsd_print_rax_ln(&mut b);
+
+    let aux_done = b.code.len();
+    let d_ad = (aux_done as isize - (jz_aux_done + 6) as isize) as i32;
+    b.code[jz_aux_done + 2..jz_aux_done + 6].copy_from_slice(&d_ad.to_le_bytes());
+
+    // 2) RFLAGS.CF + positive errno test: SYS_FBSD_CLOSE(999)
+    b.emit_mov_eax(6); // SYS_FBSD_CLOSE
+    b.emit_mov_edi(999);
+    b.emit_syscall();
+    let jc_ok = b.code.len();
+    b.emit(&[0x0F, 0x82, 0, 0, 0, 0]); // jc cf_is_set
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo] FAIL: expected CF=1 on close(999)\n");
+    emit_fbsd_exit(&mut b, 1);
+
+    let cf_is_set = b.code.len();
+    let d_cf = (cf_is_set as isize - (jc_ok + 6) as isize) as i32;
+    b.code[jc_ok + 2..jc_ok + 6].copy_from_slice(&d_cf.to_le_bytes());
+    b.emit(&[0x48, 0x83, 0xF8, 9]); // cmp rax, 9 (FBSD_EBADF)
+    let je_ebadf = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]);
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo] FAIL: errno != 9\n");
+    emit_fbsd_exit(&mut b, 2);
+
+    let ebadf_ok = b.code.len();
+    let d_eb = (ebadf_ok as isize - (je_ebadf + 6) as isize) as i32;
+    b.code[je_ebadf + 2..je_ebadf + 6].copy_from_slice(&d_eb.to_le_bytes());
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo] RFLAGS.CF=1 & errno=9 (EBADF) PASS!\n");
+
+    // 3) SYS_FBSD_SYSCTL (202): hw.ncpu [6, 3] & kern.ostype [1, 1]
+    b.emit(&[0x48, 0x83, 0xEC, 64]); // sub rsp, 64
+    b.emit(&[0xC7, 0x04, 0x24, 6, 0, 0, 0]); // [rsp] = CTL_HW (6)
+    b.emit(&[0xC7, 0x44, 0x24, 4, 3, 0, 0, 0]); // [rsp+4] = HW_NCPU (3)
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 8, 4, 0, 0, 0]); // [rsp+8] = oldlen (4)
+    b.emit_mov_eax(202); // SYS_FBSD_SYSCTL
+    b.emit(&[0x48, 0x89, 0xE7]); // rdi = &mib
+    b.emit(&[0xBE, 2, 0, 0, 0]); // rsi = 2
+    b.emit(&[0x48, 0x8D, 0x54, 0x24, 16]); // rdx = oldp ([rsp+16])
+    b.emit(&[0x4C, 0x8D, 0x54, 0x24, 8]); // r10 = oldlenp ([rsp+8])
+    b.emit(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+    b.emit(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    b.emit_syscall();
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo] sysctl hw.ncpu=");
+    b.emit(&[0x8B, 0x44, 0x24, 16]); // mov eax, [rsp+16]
+    emit_fbsd_print_rax_ln(&mut b);
+
+    // kern.ostype [1, 1]
+    b.emit(&[0xC7, 0x04, 0x24, 1, 0, 0, 0]); // CTL_KERN (1)
+    b.emit(&[0xC7, 0x44, 0x24, 4, 1, 0, 0, 0]); // KERN_OSTYPE (1)
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 8, 16, 0, 0, 0]); // oldlen = 16
+    b.emit_mov_eax(202);
+    b.emit(&[0x48, 0x89, 0xE7]);
+    b.emit(&[0xBE, 2, 0, 0, 0]);
+    b.emit(&[0x48, 0x8D, 0x54, 0x24, 16]);
+    b.emit(&[0x4C, 0x8D, 0x54, 0x24, 8]);
+    b.emit(&[0x45, 0x31, 0xC0]);
+    b.emit(&[0x45, 0x31, 0xC9]);
+    b.emit_syscall();
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo] sysctl kern.ostype=");
+    b.emit_mov_eax(4);
+    b.emit_mov_edi(1);
+    b.emit(&[0x48, 0x8D, 0x74, 0x24, 16]); // rsi = oldp
+    b.emit_mov_edx(7); // "FreeBSD"
+    b.emit_syscall();
+    emit_fbsd_write_lit(&mut b, b"\n");
+    b.emit(&[0x48, 0x83, 0xC4, 64]); // add rsp, 64
+
+    // 4) kqueue (362) + EVFILT_TIMER + fork() + EVFILT_PROC
+    b.emit_mov_eax(362); // SYS_FBSD_KQUEUE
+    b.emit_syscall();
+    b.emit(&[0x49, 0x89, 0xC4]); // mov r12, rax (kq_fd)
+
+    b.emit(&[0x48, 0x83, 0xEC, 80]); // sub rsp, 80 (change@rsp, event@rsp+32, timespec@rsp+64)
+    // Build KEvent at [rsp..rsp+32]: EVFILT_TIMER(-7 = 0xFFF9), EV_ADD|EV_ONESHOT(0x0011), data=25ms
+    b.emit(&[0x48, 0xC7, 0x04, 0x24, 1, 0, 0, 0]); // ident = 1
+    b.emit(&[0x66, 0xC7, 0x44, 0x24, 8, 0xF9, 0xFF]); // filter = -7 (EVFILT_TIMER)
+    b.emit(&[0x66, 0xC7, 0x44, 0x24, 10, 0x11, 0x00]); // flags = EV_ADD | EV_ONESHOT
+    b.emit(&[0xC7, 0x44, 0x24, 12, 0x02, 0, 0, 0]); // fflags = NOTE_MSECONDS
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 16, 25, 0, 0, 0]); // data = 25 ms
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 24, 0x34, 0x12, 0, 0]); // udata = 0x1234
+
+    // SYS_FBSD_KEVENT(kq=r12, rsp, 1, rsp+32, 1, 0)
+    b.emit_mov_eax(363);
+    b.emit(&[0x4C, 0x89, 0xE7]); // rdi = r12
+    b.emit(&[0x48, 0x89, 0xE6]); // rsi = rsp
+    b.emit_mov_edx(1);
+    b.emit(&[0x4C, 0x8D, 0x54, 0x24, 32]); // r10 = rsp+32
+    b.emit(&[0x41, 0xB8, 1, 0, 0, 0]); // r8d = 1
+    b.emit(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    b.emit_syscall();
+    b.emit(&[0x48, 0x83, 0xF8, 1]); // cmp rax, 1
+    let je_tmr = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]);
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo] FAIL: kqueue EVFILT_TIMER\n");
+    b.emit(&[0x48, 0x83, 0xC4, 80]);
+    emit_fbsd_exit(&mut b, 3);
+
+    let tmr_ok = b.code.len();
+    let d_tm = (tmr_ok as isize - (je_tmr + 6) as isize) as i32;
+    b.code[je_tmr + 2..je_tmr + 6].copy_from_slice(&d_tm.to_le_bytes());
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo] kqueue EVFILT_TIMER (25ms) fired PASS!\n");
+
+    // fork() + EVFILT_PROC
+    b.emit_mov_eax(2); // SYS_FBSD_FORK
+    b.emit_syscall();
+    b.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+    let jz_child = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]); // je child_proc
+
+    // Parent path: r13 = child_pid
+    b.emit(&[0x49, 0x89, 0xC5]); // mov r13, rax
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo parent] fork() returned child_pid\n");
+    b.emit(&[0x4C, 0x89, 0x2C, 0x24]); // mov [rsp], r13 (ident = child_pid)
+    b.emit(&[0x66, 0xC7, 0x44, 0x24, 8, 0xFB, 0xFF]); // filter = -5 (EVFILT_PROC)
+    b.emit(&[0x66, 0xC7, 0x44, 0x24, 10, 0x11, 0x00]); // flags = EV_ADD | EV_ONESHOT
+    b.emit(&[0xC7, 0x44, 0x24, 12, 0, 0, 0, 0x80]); // fflags = NOTE_EXIT (0x80000000)
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 16, 0, 0, 0, 0]); // data = 0
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 24, 0, 0, 0, 0]); // udata = 0
+
+    b.emit_mov_eax(363); // SYS_FBSD_KEVENT
+    b.emit(&[0x4C, 0x89, 0xE7]); // rdi = kq
+    b.emit(&[0x48, 0x89, 0xE6]); // rsi = rsp
+    b.emit_mov_edx(1);
+    b.emit(&[0x4C, 0x8D, 0x54, 0x24, 32]); // r10 = rsp+32
+    b.emit(&[0x41, 0xB8, 1, 0, 0, 0]); // r8d = 1
+    b.emit(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    b.emit_syscall();
+
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo parent] kqueue EVFILT_PROC NOTE_EXIT status=");
+    b.emit(&[0x48, 0x8B, 0x44, 0x24, 48]); // mov rax, [rsp + 32 + 16] (event.data)
+    emit_fbsd_print_rax_ln(&mut b);
+
+    // Reap child via SYS_FBSD_WAIT4(r13, 0, 0, 0) & close kq
+    b.emit_mov_eax(7);
+    b.emit(&[0x4C, 0x89, 0xEF]); // rdi = r13
+    b.emit(&[0x31, 0xF6]); // xor esi, esi
+    b.emit_mov_edx(0);
+    b.emit(&[0x45, 0x31, 0xD2]); // xor r10d, r10d
+    b.emit_syscall();
+
+    b.emit_mov_eax(6); // close(kq)
+    b.emit(&[0x4C, 0x89, 0xE7]);
+    b.emit_syscall();
+
+    // 5) FreeBSD Signal test: sigaction(SIGUSR1=30, &act, NULL) + kill(pid, 30) + sigreturn(417)
+    // Put handler address into [rsp..rsp+8], zero [rsp+8..rsp+32]
+    b.emit(&[0x48, 0x8D, 0x05]); // lea rax, [rip + disp32] -> handler
+    let h_disp = b.code.len();
+    b.emit(&[0, 0, 0, 0]);
+    b.emit(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 8, 0, 0, 0, 0]);
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 16, 0, 0, 0, 0]);
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 24, 0, 0, 0, 0]);
+
+    b.emit_mov_eax(416); // SYS_FBSD_SIGACTION
+    b.emit_mov_edi(30); // SIGUSR1
+    b.emit(&[0x48, 0x89, 0xE6]); // rsi = rsp
+    b.emit_mov_edx(0);
+    b.emit_syscall();
+
+    b.emit(&[0x49, 0xC7, 0x47, 64, 0, 0, 0, 0]); // mov qword ptr [r15 + 64], 0
+    b.emit_mov_eax(20); // SYS_FBSD_GETPID
+    b.emit_syscall();
+    b.emit(&[0x48, 0x89, 0xC7]); // rdi = pid
+    b.emit(&[0xBE, 30, 0, 0, 0]); // esi = SIGUSR1
+    b.emit_mov_eax(37); // SYS_FBSD_KILL
+    b.emit_syscall();
+
+    // After return from SIGUSR1 handler via USER_SIGTRAMP_ADDR -> sigreturn(417), check [r15 + 64] == 1
+    b.emit(&[0x49, 0x83, 0x7F, 64, 1]); // cmp qword ptr [r15 + 64], 1
+    let je_sig = b.code.len();
+    b.emit(&[0x0F, 0x84, 0, 0, 0, 0]);
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo] FAIL: SIGUSR1 handler did not run!\n");
+    b.emit(&[0x48, 0x83, 0xC4, 80]);
+    emit_fbsd_exit(&mut b, 4);
+
+    let sig_ok = b.code.len();
+    let d_sig = (sig_ok as isize - (je_sig + 6) as isize) as i32;
+    b.code[je_sig + 2..je_sig + 6].copy_from_slice(&d_sig.to_le_bytes());
+
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo] sigaction(SIGUSR1) + kill + sigreturn PASS!\n");
+    b.emit(&[0x48, 0x83, 0xC4, 80]);
+    emit_fbsd_exit(&mut b, 0);
+
+    // Child process body
+    let child_lbl = b.code.len();
+    let d_ch = (child_lbl as isize - (jz_child + 6) as isize) as i32;
+    b.code[jz_child + 2..jz_child + 6].copy_from_slice(&d_ch.to_le_bytes());
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 64, 0, 0, 0, 0]); // tv_sec = 0
+    b.emit(&[0x48, 0xC7, 0x44, 0x24, 72, 0x00, 0x2D, 0x31, 0x01]); // tv_nsec = 20_000_000 (20ms)
+    b.emit_mov_eax(240); // SYS_FBSD_NANOSLEEP
+    b.emit(&[0x48, 0x8D, 0x7C, 0x24, 64]); // rdi = &timespec
+    b.emit(&[0x31, 0xF6]); // xor esi, esi
+    b.emit_syscall();
+    emit_fbsd_write_lit(&mut b, b"[freebsd_demo child] exiting with code 77\n");
+    b.emit(&[0x48, 0x83, 0xC4, 80]);
+    emit_fbsd_exit(&mut b, 77);
+
+    // SIGUSR1 handler function: sets [r15 + 64] = 1 and returns (via USER_SIGTRAMP_ADDR)
+    let handler_lbl = b.code.len();
+    b.code_lea_patches.push((h_disp, handler_lbl));
+    b.emit(&[0x49, 0xC7, 0x47, 64, 1, 0, 0, 0]); // mov qword ptr [r15 + 64], 1
+    b.emit(&[0xC3]); // ret -> USER_SIGTRAMP_ADDR -> SYS_FBSD_SIGRETURN(417)
+
+    b.build()
+}
+
 
 
