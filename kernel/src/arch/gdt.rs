@@ -17,10 +17,10 @@ use super::percpu::MAX_SMP_CPUS;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
-const DOUBLE_FAULT_STACK_SIZE: usize = 20 * 1024;
-const RING0_TRAP_STACK_SIZE: usize = 32 * 1024;
-const AP_DF_STACK_SIZE: usize = 16 * 1024;
-const AP_RING0_STACK_SIZE: usize = 24 * 1024;
+const DOUBLE_FAULT_STACK_SIZE: usize = 64 * 1024;
+const RING0_TRAP_STACK_SIZE: usize = 256 * 1024;
+const AP_DF_STACK_SIZE: usize = 32 * 1024;
+const AP_RING0_STACK_SIZE: usize = 128 * 1024;
 
 #[repr(align(16))]
 struct AlignedStack<const N: usize>([u8; N]);

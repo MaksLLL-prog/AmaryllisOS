@@ -1,6 +1,6 @@
 use crate::audio;
 use crate::console::Console;
-use crate::drivers::ac97;
+use crate::drivers;
 use crate::graphics::Color;
 
 const WHITE: Color = (235, 235, 240);
@@ -29,25 +29,31 @@ pub fn cmd_soundinfo(console: &mut Console<'_>, arguments: &str) {
         }
     }
 
-    let st = ac97::stats();
+    let st = drivers::audio_stats();
     console.write("\nAudio Subsystem Information:\n", GREEN);
     console.write("  Driver:        ", GRAY);
-    console.write("Intel AC'97 (ICH 8086:2415)\n", WHITE);
+    console.write(st.driver_name, WHITE);
+    console.write("\n", WHITE);
 
     console.write("  Status:        ", GRAY);
     if !st.initialized {
-        console.write("NOT PRESENT (start QEMU with -device AC97)\n", YELLOW);
+        console.write("NOT PRESENT (use -device AC97 or -device intel-hda -device hda-duplex)\n", YELLOW);
         return;
     }
     console.write("ACTIVE\n", GREEN);
 
-    console.write("  NAMBAR I/O:    ", GRAY);
-    write_hex16(console, st.nambar);
-    console.write("\n", WHITE);
+    if st.mmio_phys != 0 {
+        console.write("  MMIO Base:     ", GRAY);
+        console.write(&alloc::format!("0x{:X}\n", st.mmio_phys), WHITE);
+    } else {
+        console.write("  NAMBAR I/O:    ", GRAY);
+        write_hex16(console, st.nambar);
+        console.write("\n", WHITE);
 
-    console.write("  NABMBAR I/O:   ", GRAY);
-    write_hex16(console, st.nabmbar);
-    console.write("\n", WHITE);
+        console.write("  NABMBAR I/O:   ", GRAY);
+        write_hex16(console, st.nabmbar);
+        console.write("\n", WHITE);
+    }
 
     console.write("  IRQ Line:      ", GRAY);
     write_decimal(console, st.irq_line as u64);
@@ -55,7 +61,7 @@ pub fn cmd_soundinfo(console: &mut Console<'_>, arguments: &str) {
 
     console.write("  VRA Support:   ", GRAY);
     console.write(
-        if st.vra_supported { "YES\n" } else { "NO (fixed 48000 Hz)\n" },
+        if st.vra_supported { "YES\n" } else { "Fixed / 48000 Hz\n" },
         WHITE,
     );
 
@@ -90,7 +96,11 @@ pub fn cmd_beep(console: &mut Console<'_>, arguments: &str) {
     console.write(" ms)... ", WHITE);
 
     match audio::play_tone(freq, dur) {
-        Ok(true) => console.write("[AC'97]\n", GREEN),
+        Ok(true) => {
+            console.write("[", GREEN);
+            console.write(drivers::audio_driver_label(), GREEN);
+            console.write("]\n", GREEN);
+        }
         Ok(false) => console.write("[PC Speaker fallback]\n", YELLOW),
         Err(err) => {
             console.write("error: ", RED);

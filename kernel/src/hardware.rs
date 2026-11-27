@@ -229,22 +229,175 @@ impl PciNvmeDescriptor {
 }
 
 #[derive(Clone, Copy)]
+pub struct PciXhciDescriptor {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub irq_line: u8,
+    pub mmio_base: u64,
+    pub mmio_size: u64,
+    pub valid: bool,
+}
+
+impl PciXhciDescriptor {
+    pub const EMPTY: Self = Self {
+        bus: 0,
+        device: 0,
+        function: 0,
+        vendor_id: 0,
+        device_id: 0,
+        irq_line: 0,
+        mmio_base: 0,
+        mmio_size: 0,
+        valid: false,
+    };
+}
+
+#[derive(Clone, Copy)]
+pub struct PciHdaDescriptor {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub irq_line: u8,
+    pub mmio_base: u64,
+    pub mmio_size: u64,
+    pub valid: bool,
+}
+
+impl PciHdaDescriptor {
+    pub const EMPTY: Self = Self {
+        bus: 0,
+        device: 0,
+        function: 0,
+        vendor_id: 0,
+        device_id: 0,
+        irq_line: 0,
+        mmio_base: 0,
+        mmio_size: 0,
+        valid: false,
+    };
+}
+
+#[derive(Clone, Copy)]
+pub struct PciRealtekNetDescriptor {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub irq_line: u8,
+    pub mmio_base: u64,
+    pub mmio_size: u64,
+    pub io_base: u16,
+    pub is_rtl8139: bool,
+    pub valid: bool,
+}
+
+impl PciRealtekNetDescriptor {
+    pub const EMPTY: Self = Self {
+        bus: 0,
+        device: 0,
+        function: 0,
+        vendor_id: 0,
+        device_id: 0,
+        irq_line: 0,
+        mmio_base: 0,
+        mmio_size: 0,
+        io_base: 0,
+        is_rtl8139: false,
+        valid: false,
+    };
+}
+
+#[derive(Clone, Copy)]
+pub struct PciSdhciDescriptor {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub irq_line: u8,
+    pub bar0_phys: u64,
+    pub bar0_size: u64,
+    pub prog_if: u8,
+    pub valid: bool,
+}
+
+impl PciSdhciDescriptor {
+    pub const EMPTY: Self = Self {
+        bus: 0,
+        device: 0,
+        function: 0,
+        vendor_id: 0,
+        device_id: 0,
+        irq_line: 0,
+        bar0_phys: 0,
+        bar0_size: 0,
+        prog_if: 0,
+        valid: false,
+    };
+}
+
+#[derive(Clone, Copy)]
+pub struct PciDisplayDescriptor {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub subclass: u8,
+    pub lfb_phys: u64,
+    pub lfb_size: u64,
+    pub mmio_phys: u64,
+    pub valid: bool,
+}
+
+impl PciDisplayDescriptor {
+    pub const EMPTY: Self = Self {
+        bus: 0,
+        device: 0,
+        function: 0,
+        vendor_id: 0,
+        device_id: 0,
+        subclass: 0,
+        lfb_phys: 0,
+        lfb_size: 0,
+        mmio_phys: 0,
+        valid: false,
+    };
+}
+
+#[derive(Clone, Copy)]
 pub struct HardwareDiscovery {
     pub ide_controllers: IdeControllerDiscoveryList,
     pub network: PciNetworkDescriptor,
+    pub realtek_net: PciRealtekNetDescriptor,
     pub audio: PciAudioDescriptor,
+    pub hda: PciHdaDescriptor,
     pub ahci: PciAhciDescriptor,
     pub virtio_blk: PciVirtioBlkDescriptor,
     pub nvme: PciNvmeDescriptor,
+    pub xhci: PciXhciDescriptor,
+    pub sdhci: PciSdhciDescriptor,
+    pub display: PciDisplayDescriptor,
 }
 
 impl HardwareDiscovery {
     pub const EMPTY: Self = Self {
         ide_controllers: IdeControllerDiscoveryList::EMPTY,
         network: PciNetworkDescriptor::EMPTY,
+        realtek_net: PciRealtekNetDescriptor::EMPTY,
         audio: PciAudioDescriptor::EMPTY,
+        hda: PciHdaDescriptor::EMPTY,
         ahci: PciAhciDescriptor::EMPTY,
         virtio_blk: PciVirtioBlkDescriptor::EMPTY,
         nvme: PciNvmeDescriptor::EMPTY,
+        xhci: PciXhciDescriptor::EMPTY,
+        sdhci: PciSdhciDescriptor::EMPTY,
+        display: PciDisplayDescriptor::EMPTY,
     };
 }

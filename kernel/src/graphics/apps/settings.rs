@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 
 use crate::audio::mixer::{self, BuiltinTrack};
-use crate::drivers::{ac97, e1000};
+use crate::drivers;
 use crate::graphics::icons::LucideIcon;
 use crate::graphics::personalization::{
     self, cc_idx, AccentPreset, DockPosition, MonoFontFamily, ProfileEntry,
@@ -1492,10 +1492,10 @@ impl SettingsApp {
 
     fn draw_sound(&self, canvas: &mut Canvas<'_>, main: Rect, clip: Rect) {
         let pal = theme::palette();
-        let st = ac97::stats();
+        let st = drivers::audio_stats();
         let snap = mixer::snapshot();
 
-        canvas.draw_text_scaled_clipped(main.x, main.y, "Sound & AC'97 Mixer", pal.text_primary, 320, true, clip);
+        canvas.draw_text_scaled_clipped(main.x, main.y, "Sound & Audio Mixer", pal.text_primary, 320, true, clip);
 
         let card = Rect::new(main.x, main.y + 32, main.w, 84);
         canvas.fill_rounded_rect(card, 9, pal.surface_card);
@@ -1503,14 +1503,19 @@ impl SettingsApp {
         canvas.draw_text_bold_clipped(
             card.x + 12,
             card.y + 10,
-            if st.initialized { "Intel ICH AC'97 Controller — Active" } else { "Intel AC'97 Not Detected" },
+            if st.initialized { st.driver_name } else { "Hardware Audio Not Detected" },
             if st.initialized { ACCENT_MINT } else { ACCENT_ERR },
             card,
         );
+        let io_line = if st.mmio_phys != 0 {
+            format!("MMIO: 0x{:x}  IRQ: {}  Buffers: {}", st.mmio_phys, st.irq_line, st.buffers_played)
+        } else {
+            format!("NAMBAR: 0x{:04x}  NABMBAR: 0x{:04x}  IRQ: {}", st.nambar, st.nabmbar, st.irq_line)
+        };
         canvas.draw_text_clipped(
             card.x + 12,
             card.y + 34,
-            &format!("NAMBAR: 0x{:04x}  NABMBAR: 0x{:04x}  IRQ: {}", st.nambar, st.nabmbar, st.irq_line),
+            &io_line,
             pal.text_primary,
             1,
             card,
@@ -1556,27 +1561,28 @@ impl SettingsApp {
 
     fn draw_network(&self, canvas: &mut Canvas<'_>, main: Rect, clip: Rect) {
         let pal = theme::palette();
-        let nic = e1000::stats();
+        let nic = drivers::net_stats();
         let ns = net::NET_STATE.lock();
         let (ip, mask, gw, dns, dhcp_ok) = (ns.ip, ns.netmask, ns.gateway, ns.dns, ns.dhcp_configured);
         drop(ns);
 
-        canvas.draw_text_scaled_clipped(main.x, main.y, "Network & Intel e1000", pal.text_primary, 320, true, clip);
+        canvas.draw_text_scaled_clipped(main.x, main.y, "Network Interface", pal.text_primary, 320, true, clip);
 
         let card = Rect::new(main.x, main.y + 32, main.w, 144);
         canvas.fill_rounded_rect(card, 9, pal.surface_card);
         canvas.stroke_rounded_rect(card, 9, pal.surface_border, 180);
 
+        let title_buf = if nic.initialized && nic.link_up {
+            format!("{} — Link UP", nic.driver_name)
+        } else if nic.initialized {
+            format!("{} — Link DOWN", nic.driver_name)
+        } else {
+            String::from("Network Controller Not Found")
+        };
         canvas.draw_text_bold_clipped(
             card.x + 12,
             card.y + 10,
-            if nic.initialized && nic.link_up {
-                "Intel 82540EM (e1000) — Link UP"
-            } else if nic.initialized {
-                "Intel 82540EM (e1000) — Link DOWN"
-            } else {
-                "Intel e1000 Controller Not Found"
-            },
+            &title_buf,
             if nic.link_up { ACCENT_MINT } else { ACCENT_WARN },
             card,
         );

@@ -1,3 +1,5 @@
+use alloc::vec;
+use alloc::vec::Vec;
 use core::ptr::read_unaligned;
 use spin::Mutex;
 use x86_64::structures::paging::PageTableFlags;
@@ -12,6 +14,9 @@ pub const MAX_ACPI_TABLES: usize = 32;
 pub const MAX_MADT_CPUS: usize = 64;
 pub const MAX_MADT_IOAPICS: usize = 8;
 pub const MAX_MADT_ISOS: usize = 24;
+pub const MAX_ACPI_AML_BYTES: usize = 256 * 1024;
+pub const MAX_ACPI_SSDT_TABLES: usize = 4;
+pub const MAX_ACPI_SSDT_BYTES: usize = 64 * 1024;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -139,10 +144,20 @@ pub struct AcpiPlatformInfo {
     pub isos: [MadtIsoEntry; MAX_MADT_ISOS],
     pub iso_count: usize,
     pub fadt_sci_irq: u16,
+    pub fadt_pm_profile: u8,
+    pub fadt_pm1a_evt: u32,
+    pub fadt_pm1b_evt: u32,
     pub fadt_pm1a_cnt: u32,
     pub fadt_pm1b_cnt: u32,
     pub fadt_pm_tmr: u32,
+    pub fadt_gpe0_blk: u32,
+    pub fadt_gpe0_len: u8,
     pub fadt_century_reg: u8,
+    pub dsdt_phys: u64,
+    pub dsdt_len: u32,
+    pub ssdt_count: usize,
+    pub s5_slp_typa: Option<u8>,
+    pub s5_slp_typb: Option<u8>,
     pub mcfg_ecam_base: u64,
     pub mcfg_start_bus: u8,
     pub mcfg_end_bus: u8,
@@ -169,10 +184,20 @@ impl AcpiPlatformInfo {
         isos: [MadtIsoEntry::EMPTY; MAX_MADT_ISOS],
         iso_count: 0,
         fadt_sci_irq: 0,
+        fadt_pm_profile: 0,
+        fadt_pm1a_evt: 0,
+        fadt_pm1b_evt: 0,
         fadt_pm1a_cnt: 0,
         fadt_pm1b_cnt: 0,
         fadt_pm_tmr: 0,
+        fadt_gpe0_blk: 0,
+        fadt_gpe0_len: 0,
         fadt_century_reg: 0,
+        dsdt_phys: 0,
+        dsdt_len: 0,
+        ssdt_count: 0,
+        s5_slp_typa: None,
+        s5_slp_typb: None,
         mcfg_ecam_base: 0,
         mcfg_start_bus: 0,
         mcfg_end_bus: 0,
@@ -184,7 +209,22 @@ impl AcpiPlatformInfo {
     }
 }
 
+struct AcpiAmlStore {
+    dsdt: Vec<u8>,
+    ssdts: Vec<Vec<u8>>,
+}
+
+impl AcpiAmlStore {
+    const fn empty() -> Self {
+        Self {
+            dsdt: Vec::new(),
+            ssdts: Vec::new(),
+        }
+    }
+}
+
 static ACPI_INFO: Mutex<AcpiPlatformInfo> = Mutex::new(AcpiPlatformInfo::EMPTY);
+static ACPI_AML_TABLES: Mutex<AcpiAmlStore> = Mutex::new(AcpiAmlStore::empty());
 
 struct AcpiReader<'m, 'a, 'r> {
     mapping: &'m PhysicalMemoryMapping,
@@ -457,15 +497,30 @@ fn parse_madt(reader: &mut AcpiReader<'_, '_, '_>, phys: u64, len: usize, info: 
 
 fn parse_fadt(reader: &mut AcpiReader<'_, '_, '_>, phys: u64, len: usize, info: &mut AcpiPlatformInfo) {
     // ACPI Fixed ACPI Description Table offsets from start of table:
-    // 46: SCI_INT (u16), 64: PM1a_CNT_BLK (u32), 68: PM1b_CNT_BLK (u32), 76: PM_TMR_BLK (u32), 108: CENTURY (u8)
-    if len >= 80 {
+    // 40: DSDT (u32), 45: Preferred_PM_Profile (u8), 46: SCI_INT (u16),
+    // 56: PM1a_EVT_BLK, 60: PM1b_EVT_BLK, 64: PM1a_CNT_BLK, 68: PM1b_CNT_BLK,
+    // 76: PM_TMR_BLK, 80: GPE0_BLK, 92: GPE0_BLK_LEN, 108: CENTURY, 140: X_DSDT (u64)
+    if len >= 96 {
+        let dsdt32 = reader.read_unaligned::<u32>(phys + 40).unwrap_or(0) as u64;
+        info.dsdt_phys = dsdt32;
+        info.fadt_pm_profile = reader.read_unaligned::<u8>(phys + 45).unwrap_or(0);
         info.fadt_sci_irq = reader.read_unaligned::<u16>(phys + 46).unwrap_or(0);
+        info.fadt_pm1a_evt = reader.read_unaligned::<u32>(phys + 56).unwrap_or(0);
+        info.fadt_pm1b_evt = reader.read_unaligned::<u32>(phys + 60).unwrap_or(0);
         info.fadt_pm1a_cnt = reader.read_unaligned::<u32>(phys + 64).unwrap_or(0);
         info.fadt_pm1b_cnt = reader.read_unaligned::<u32>(phys + 68).unwrap_or(0);
         info.fadt_pm_tmr = reader.read_unaligned::<u32>(phys + 76).unwrap_or(0);
+        info.fadt_gpe0_blk = reader.read_unaligned::<u32>(phys + 80).unwrap_or(0);
+        info.fadt_gpe0_len = reader.read_unaligned::<u8>(phys + 92).unwrap_or(0);
     }
     if len >= 109 {
         info.fadt_century_reg = reader.read_unaligned::<u8>(phys + 108).unwrap_or(0);
+    }
+    if len >= 148 {
+        let x_dsdt = reader.read_unaligned::<u64>(phys + 140).unwrap_or(0);
+        if x_dsdt != 0 {
+            info.dsdt_phys = x_dsdt;
+        }
     }
 }
 
@@ -527,6 +582,8 @@ pub fn init(
     info.root_sdt_phys = root_sdt_phys;
     info.using_xsdt = using_xsdt;
 
+    let mut aml_store = AcpiAmlStore::empty();
+
     if let Some(root_hdr) = reader.read_unaligned::<SdtHeader>(root_sdt_phys) {
         let hdr_sz = core::mem::size_of::<SdtHeader>();
         let root_len = root_hdr.length as usize;
@@ -568,6 +625,16 @@ pub fn init(
                         b"FACP" => parse_fadt(&mut reader, table_phys, tlen, &mut info),
                         b"MCFG" => parse_mcfg(&mut reader, table_phys, tlen, &mut info),
                         b"HPET" => parse_hpet(&mut reader, table_phys, tlen, &mut info),
+                        b"SSDT" => {
+                            if aml_store.ssdts.len() < MAX_ACPI_SSDT_TABLES && tlen > hdr_sz {
+                                let copy_len = tlen.min(MAX_ACPI_SSDT_BYTES);
+                                let mut buf = vec![0u8; copy_len];
+                                if reader.read_bytes(table_phys, &mut buf) {
+                                    aml_store.ssdts.push(buf);
+                                    info.ssdt_count += 1;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -575,9 +642,46 @@ pub fn init(
         }
     }
 
+    if info.dsdt_phys != 0 {
+        if let Some(dsdt_hdr) = reader.read_unaligned::<SdtHeader>(info.dsdt_phys) {
+            let hdr_sz = core::mem::size_of::<SdtHeader>();
+            let dlen = dsdt_hdr.length as usize;
+            if &dsdt_hdr.signature == b"DSDT" && dlen >= hdr_sz && dlen <= MAX_ACPI_AML_BYTES {
+                let chk_ok = reader.verify_checksum(info.dsdt_phys, dlen);
+                info.dsdt_len = dsdt_hdr.length;
+                if info.table_count < MAX_ACPI_TABLES {
+                    info.tables[info.table_count] = AcpiTableSummary {
+                        signature: dsdt_hdr.signature,
+                        phys_addr: info.dsdt_phys,
+                        length: dsdt_hdr.length,
+                        revision: dsdt_hdr.revision,
+                        checksum_ok: chk_ok,
+                    };
+                    info.table_count += 1;
+                }
+                let mut buf = vec![0u8; dlen];
+                if reader.read_bytes(info.dsdt_phys, &mut buf) {
+                    aml_store.dsdt = buf;
+                }
+            }
+        }
+    }
+
     drop(reader);
+    *ACPI_AML_TABLES.lock() = aml_store;
     *ACPI_INFO.lock() = info;
     info
+}
+
+pub fn copy_aml_tables() -> (Vec<u8>, Vec<Vec<u8>>) {
+    let store = ACPI_AML_TABLES.lock();
+    (store.dsdt.clone(), store.ssdts.clone())
+}
+
+pub fn set_s5_sleep_types(slp_typa: u8, slp_typb: u8) {
+    let mut info = ACPI_INFO.lock();
+    info.s5_slp_typa = Some(slp_typa & 0x07);
+    info.s5_slp_typb = Some(slp_typb & 0x07);
 }
 
 pub fn snapshot() -> AcpiPlatformInfo {
@@ -626,16 +730,20 @@ pub fn system_shutdown() -> ! {
             x86_64::instructions::port::Port::new(0x4004);
         vbox_pm.write(0x3400);
 
-        // 3. ACPI FADT PM1a / PM1b SLP_EN (bit 13 = 0x2000, SLP_TYP5 = 0 / 5)
+        // 3. ACPI FADT PM1a / PM1b SLP_EN using AML-discovered _S5_ SLP_TYPa/b first
+        let slp_a = ((info.s5_slp_typa.unwrap_or(5) as u16) & 0x07) << 10;
+        let slp_b = ((info.s5_slp_typb.unwrap_or(info.s5_slp_typa.unwrap_or(5)) as u16) & 0x07) << 10;
         if info.fadt_pm1a_cnt > 0 && info.fadt_pm1a_cnt <= 0xFFFF {
             let mut pm1a: x86_64::instructions::port::Port<u16> =
                 x86_64::instructions::port::Port::new(info.fadt_pm1a_cnt as u16);
+            pm1a.write(0x2000 | slp_a);
             pm1a.write(0x2000);
             pm1a.write(0x2000 | (5 << 10));
         }
         if info.fadt_pm1b_cnt > 0 && info.fadt_pm1b_cnt <= 0xFFFF {
             let mut pm1b: x86_64::instructions::port::Port<u16> =
                 x86_64::instructions::port::Port::new(info.fadt_pm1b_cnt as u16);
+            pm1b.write(0x2000 | slp_b);
             pm1b.write(0x2000);
             pm1b.write(0x2000 | (5 << 10));
         }

@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -391,7 +392,7 @@ impl UserProcessSlot {
 }
 
 struct UserScheduler {
-    slots: [Option<UserProcessSlot>; MAX_USER_PROCS],
+    slots: [Option<Box<UserProcessSlot>>; MAX_USER_PROCS],
     current_slot: Option<usize>,
     rr_cursor: usize,
     next_tid: usize,
@@ -692,7 +693,7 @@ pub fn register_process(
         let mut sched = USER_SCHED.lock();
         let start_vr = sched.min_runnable_vruntime();
         if let Some(empty_idx) = sched.slots.iter().position(|s| s.is_none()) {
-            sched.slots[empty_idx] = Some(UserProcessSlot {
+            sched.slots[empty_idx] = Some(Box::new(UserProcessSlot {
                 pid,
                 tgid: pid,
                 is_thread: false,
@@ -730,7 +731,7 @@ pub fn register_process(
                 next_port_name: 1,
                 stdout_buf: String::new(),
                 has_gui_window: false,
-            });
+            }));
             Ok(())
         } else {
             Err(image)
@@ -1000,27 +1001,7 @@ pub fn try_resolve_user_page_fault(
         Some((idx, proc.pid, proc.pml4, vma))
     });
 
-    let Some((slot_idx, pid, pml4, vma_opt)) = info else {
-        crate::serial::log_fmt("pf_dbg", format_args!("no current_slot for cr2=0x{:x} err=0x{:x}", cr2, error_code));
-        return FaultResolveOutcome::NotHandled;
-    };
-    let page_vaddr = cr2 & !(PAGE_SIZE - 1);
-    if (error_code & 0x3) == 0x3 && (error_code & 0x10) == 0 {
-        if let Ok(virt) = VirtAddr::try_new(page_vaddr) {
-            if let Some(trans) = mapping.translate_virtual_address_in(pml4, virt) {
-                if trans.flags.contains(PageTableFlags::USER_ACCESSIBLE) && trans.flags.contains(COW_FLAG) {
-                    if let Ok(copied) = mapping.resolve_cow_fault_in(pml4, page_vaddr, allocator) {
-                        if copied {
-                            klog::record_pf_cow_copy();
-                        }
-                        return FaultResolveOutcome::Resolved;
-                    }
-                }
-            }
-        }
-    }
-    let Some(vma) = vma_opt else {
-        crate::serial::log_fmt("pf_dbg", format_args!("PID={} no VMA for cr2=0x{:x} err=0x{:x}", pid, cr2, error_code));
+    let Some((slot_idx, pid, pml4, Some(vma))) = info else {
         return FaultResolveOutcome::NotHandled;
     };
 
@@ -1037,6 +1018,8 @@ pub fn try_resolve_user_page_fault(
         return FaultResolveOutcome::GuardPageHit;
     }
 
+    let page_vaddr = cr2 & !(PAGE_SIZE - 1);
+
     // Present protection fault (bit 0 == 1): handle Copy-on-Write write faults on writable private VMAs.
     if (error_code & 0x1) != 0 {
         if (error_code & 0x2) != 0
@@ -1044,16 +1027,11 @@ pub fn try_resolve_user_page_fault(
             && vma.writable
             && vma.kind != VmRegionKind::SharedMem
         {
-            match mapping.resolve_cow_fault_in(pml4, page_vaddr, allocator) {
-                Ok(copied) => {
-                    if copied {
-                        klog::record_pf_cow_copy();
-                    }
-                    return FaultResolveOutcome::Resolved;
+            if let Ok(copied) = mapping.resolve_cow_fault_in(pml4, page_vaddr, allocator) {
+                if copied {
+                    klog::record_pf_cow_copy();
                 }
-                Err(e) => {
-                    crate::serial::log_fmt("cow_err", format_args!("resolve_cow_fault_in failed: {:?} pml4=0x{:x} page=0x{:x}", e, pml4, page_vaddr));
-                }
+                return FaultResolveOutcome::Resolved;
             }
         }
         return FaultResolveOutcome::NotHandled;
@@ -1841,12 +1819,12 @@ pub fn poll_wait_queues(
                         let sched = USER_SCHED.lock();
                         sched.slots[slot_idx]
                             .as_ref()
-                            .map(|p| p.fds.clone())
-                            .unwrap_or([const { None }; MAX_PROC_FDS])
+                            .map(|p| Box::new(p.fds.clone()))
+                            .unwrap_or_else(|| Box::new([const { None }; MAX_PROC_FDS]))
                     });
                     match kqueue::poll_events(
                         kq_id,
-                        &owner_fds,
+                        owner_fds.as_slice(),
                         nevents,
                         now_ms,
                         &|target| is_process_alive(target),
@@ -1997,15 +1975,11 @@ fn ensure_sigtramp_mapped_for_slot(
         return true;
     }
 
-    let tramp_virt = VirtAddr::new(USER_SIGTRAMP_ADDR);
-    if mapping.translate_virtual_address_in(pml4, tramp_virt).is_some() {
-        without_interrupts(|| {
-            let mut sched = USER_SCHED.lock();
-            let tgid = sched.slots[slot_idx].as_ref().map(|p| p.tgid).unwrap_or(0);
-            if let Some(ref mut proc) = sched.slots[slot_idx] {
-                proc.signals.sigtramp_mapped = true;
-            }
-            if let Some(img) = img_opt.take() {
+    let restore_img = |slot_idx: usize, img_opt: Option<LoadedElfImage>| {
+        if let Some(img) = img_opt {
+            without_interrupts(|| {
+                let mut sched = USER_SCHED.lock();
+                let tgid = sched.slots[slot_idx].as_ref().map(|p| p.tgid).unwrap_or(0);
                 if let Some(ref mut proc) = sched.slots[slot_idx] {
                     if !proc.is_thread {
                         proc.image = Some(img);
@@ -2022,24 +1996,35 @@ fn ensure_sigtramp_mapped_for_slot(
                 } else if let Some(ref mut proc) = sched.slots[slot_idx] {
                     proc.image = Some(img);
                 }
-            }
-        });
-        return true;
-    }
+            });
+        }
+    };
 
-    let Some(frame) = allocator.allocate_frame() else {
-        if let Some(img) = img_opt {
+    let tramp_virt = VirtAddr::new(USER_SIGTRAMP_ADDR);
+    if let Some(trans) = mapping.translate_virtual_address_in(pml4, tramp_virt) {
+        let valid_rx = trans.flags.contains(PageTableFlags::USER_ACCESSIBLE)
+            && !trans.flags.contains(PageTableFlags::NO_EXECUTE);
+        if valid_rx {
             without_interrupts(|| {
                 let mut sched = USER_SCHED.lock();
                 if let Some(ref mut proc) = sched.slots[slot_idx] {
-                    proc.image = Some(img);
+                    proc.signals.sigtramp_mapped = true;
                 }
             });
+            restore_img(slot_idx, img_opt.take());
+            return true;
         }
+        restore_img(slot_idx, img_opt.take());
+        return false;
+    }
+
+    let Some(frame) = allocator.allocate_frame() else {
+        restore_img(slot_idx, img_opt.take());
         return false;
     };
     let Some(hhdm) = mapping.translate_frame(frame) else {
         let _ = allocator.deallocate_frame(frame);
+        restore_img(slot_idx, img_opt.take());
         return false;
     };
     unsafe {
@@ -2057,14 +2042,7 @@ fn ensure_sigtramp_mapped_for_slot(
         .is_err()
     {
         let _ = allocator.deallocate_frame(frame);
-        if let Some(img) = img_opt {
-            without_interrupts(|| {
-                let mut sched = USER_SCHED.lock();
-                if let Some(ref mut proc) = sched.slots[slot_idx] {
-                    proc.image = Some(img);
-                }
-            });
-        }
+        restore_img(slot_idx, img_opt.take());
         return false;
     }
 
@@ -2307,8 +2285,11 @@ fn dispatch_one_quantum(
     true
 }
 
-fn close_fd_list(fds: [Option<FdEntry>; MAX_PROC_FDS]) {
-    for entry in fds.into_iter().flatten() {
+fn close_fd_list(fds: &mut [Option<FdEntry>]) {
+    for slot in fds.iter_mut() {
+        let Some(entry) = slot.take() else {
+            continue;
+        };
         match entry {
             FdEntry::Socket(sock) => match sock {
                 OpenSocket::Tcp { handle } => crate::net::tcp::close_socket(handle),
@@ -2355,6 +2336,18 @@ fn cleanup_process_ipc_and_windows(
     }
 }
 
+struct DeferredCleanup {
+    tgid: usize,
+    destroy_aspace: bool,
+    pml4: u64,
+    img_opt: Option<LoadedElfImage>,
+    fds: [Option<FdEntry>; MAX_PROC_FDS],
+    had_gui: bool,
+    shm_atts: Vec<ShmAttachment>,
+    owned_shms: Vec<u64>,
+    port_rights: Vec<PortRightEntry>,
+}
+
 fn collect_finished_and_stdout(
     mapping: &PhysicalMemoryMapping,
     allocator: &mut PhysicalFrameAllocator<'_>,
@@ -2362,17 +2355,7 @@ fn collect_finished_and_stdout(
     let mut stdouts = Vec::new();
     let mut finished = Vec::new();
     let mut proc_exit_notes: Vec<(usize, i64)> = Vec::new();
-    let mut deferred_cleanups: Vec<(
-        usize,
-        bool,
-        u64,
-        Option<LoadedElfImage>,
-        [Option<FdEntry>; MAX_PROC_FDS],
-        bool,
-        Vec<ShmAttachment>,
-        Vec<u64>,
-        Vec<PortRightEntry>,
-    )> = Vec::new();
+    let mut deferred_cleanups: Vec<Box<DeferredCleanup>> = Vec::new();
 
     without_interrupts(|| {
         let mut sched = USER_SCHED.lock();
@@ -2395,13 +2378,13 @@ fn collect_finished_and_stdout(
             let Some((is_clean_exit, raw_code)) = exit_outcome else {
                 continue;
             };
-            let proc_owned = sched.slots[idx].take().unwrap();
+            let mut proc_owned = sched.slots[idx].take().unwrap();
             let siblings_remain = sched.count_tgid(proc_owned.tgid) > 0;
 
-            let mut img_to_free = proc_owned.image;
-            let mut shms_to_free = proc_owned.shm_attachments;
-            let mut owned_shms_to_free = proc_owned.owned_shm_ids;
-            let mut ports_to_free = proc_owned.port_rights;
+            let mut img_to_free = proc_owned.image.take();
+            let mut shms_to_free = core::mem::take(&mut proc_owned.shm_attachments);
+            let mut owned_shms_to_free = core::mem::take(&mut proc_owned.owned_shm_ids);
+            let mut ports_to_free = core::mem::take(&mut proc_owned.port_rights);
             let mut had_gui_to_free = proc_owned.has_gui_window;
 
             if siblings_remain {
@@ -2437,17 +2420,18 @@ fn collect_finished_and_stdout(
                 proc_exit_notes.push((proc_owned.tgid, report_code));
             }
 
-            deferred_cleanups.push((
-                proc_owned.tgid,
-                !siblings_remain,
-                proc_owned.pml4,
-                img_to_free,
-                proc_owned.fds,
-                had_gui_to_free,
-                shms_to_free,
-                owned_shms_to_free,
-                ports_to_free,
-            ));
+            let fds_owned = core::mem::replace(&mut proc_owned.fds, [const { None }; MAX_PROC_FDS]);
+            deferred_cleanups.push(Box::new(DeferredCleanup {
+                tgid: proc_owned.tgid,
+                destroy_aspace: !siblings_remain,
+                pml4: proc_owned.pml4,
+                img_opt: img_to_free,
+                fds: fds_owned,
+                had_gui: had_gui_to_free,
+                shm_atts: shms_to_free,
+                owned_shms: owned_shms_to_free,
+                port_rights: ports_to_free,
+            }));
 
             if !siblings_remain {
                 let outcome = match proc_owned.state {
@@ -2495,38 +2479,27 @@ fn collect_finished_and_stdout(
         kqueue::notify_process_exit(pid, code);
     }
 
-    for (
-        tgid,
-        destroy_aspace,
-        pml4,
-        img_opt,
-        fds,
-        had_gui,
-        shm_atts,
-        owned_shms,
-        port_rights,
-    ) in deferred_cleanups
-    {
-        close_fd_list(fds);
-        if destroy_aspace {
+    for mut item in deferred_cleanups {
+        close_fd_list(&mut item.fds);
+        if item.destroy_aspace {
             cleanup_process_ipc_and_windows(
-                tgid,
-                pml4,
-                had_gui,
-                shm_atts,
-                owned_shms,
-                port_rights,
+                item.tgid,
+                item.pml4,
+                item.had_gui,
+                core::mem::take(&mut item.shm_atts),
+                core::mem::take(&mut item.owned_shms),
+                core::mem::take(&mut item.port_rights),
                 mapping,
                 allocator,
             );
-            if let Some(mut img) = img_opt {
-                elf::cleanup_loaded_image(&mut img, pml4, mapping, allocator);
+            if let Some(mut img) = item.img_opt.take() {
+                elf::cleanup_loaded_image(&mut img, item.pml4, mapping, allocator);
             }
             let mut pm = PROCESS_MANAGER.lock();
             unsafe {
-                let _ = pm.terminate_process(tgid, mapping, allocator);
+                let _ = pm.terminate_process(item.tgid, mapping, allocator);
             }
-            let _ = pm.reap_process(tgid);
+            let _ = pm.reap_process(item.tgid);
         }
     }
 
@@ -2699,13 +2672,13 @@ pub fn kill_user_process(
     let tgid = proc.tgid;
     kqueue::notify_process_exit(tgid, -9);
 
-    for extra in extras {
-        close_fd_list(extra.fds);
+    for mut extra in extras {
+        close_fd_list(&mut extra.fds);
         if proc.image.is_none() {
             proc.image = extra.image;
         }
     }
-    close_fd_list(proc.fds);
+    close_fd_list(&mut proc.fds);
     cleanup_process_ipc_and_windows(
         tgid,
         proc.pml4,
@@ -2804,6 +2777,40 @@ pub fn dump_console_fault_tag(console: &mut Console<'_>, ok: bool) {
     console.write(if ok { "OK\n" } else { "LEAK\n" }, if ok { GREEN } else { RED });
 }
 
+struct ForkSnapshot {
+    parent_pid: usize,
+    parent_abi: ProcessAbi,
+    parent_name: String,
+    parent_pml4: u64,
+    parent_fpu: FxSaveArea,
+    parent_fs_base: u64,
+    parent_gs_base: u64,
+    child_signals: SignalState,
+    parent_weight: u32,
+    entry_point: u64,
+    bytes_loaded: u64,
+    brk_base: u64,
+    brk_current: u64,
+    mmap_next: u64,
+    shm_attach_next: u64,
+    shm_attachments: Vec<ShmAttachment>,
+    dynamic_bytes: usize,
+    vmas: Vec<VmRegion>,
+    child_fds: [Option<FdEntry>; MAX_PROC_FDS],
+    parent_port_rights: Vec<PortRightEntry>,
+    next_port_name: u32,
+    user_rsp: u64,
+    initial_argc: u64,
+    initial_argv: u64,
+    auxv_ptr: u64,
+    phdr_vaddr: u64,
+    ph_ent: u16,
+    ph_num: u16,
+    osreldate: u32,
+    load_regions: Vec<(u64, u64, bool, bool)>,
+    load_segment_count: usize,
+}
+
 pub fn fork_current_process(
     parent_ctx: UserCpuContext,
     mapping: &PhysicalMemoryMapping,
@@ -2826,77 +2833,48 @@ pub fn fork_current_process(
                 .find(|s| s.tgid == tgid && s.image.is_some())
                 .and_then(|s| s.image.as_ref())
         })?;
-        Some((
-            tgid,
-            p.abi,
-            p.name.clone(),
-            p.pml4,
-            p.fpu_state,
-            p.fs_base,
-            p.gs_base,
-            p.signals.clone_for_fork(),
-            p.weight,
-            p.entry_point,
-            p.bytes_loaded,
-            p.brk_base,
-            p.brk_current,
-            p.mmap_next,
-            p.shm_attach_next,
-            p.shm_attachments.clone(),
-            p.dynamic_bytes,
-            p.vmas.clone(),
-            p.fds.clone(),
-            p.port_rights.clone(),
-            p.next_port_name,
-            img.user_rsp,
-            img.initial_argc,
-            img.initial_argv,
-            img.auxv_ptr,
-            img.phdr_vaddr,
-            img.ph_ent,
-            img.ph_num,
-            img.osreldate,
-            img.load_regions.clone(),
-            img.load_segment_count,
-        ))
+        Some(Box::new(ForkSnapshot {
+            parent_pid: tgid,
+            parent_abi: p.abi,
+            parent_name: p.name.clone(),
+            parent_pml4: p.pml4,
+            parent_fpu: p.fpu_state,
+            parent_fs_base: p.fs_base,
+            parent_gs_base: p.gs_base,
+            child_signals: p.signals.clone_for_fork(),
+            parent_weight: p.weight,
+            entry_point: p.entry_point,
+            bytes_loaded: p.bytes_loaded,
+            brk_base: p.brk_base,
+            brk_current: p.brk_current,
+            mmap_next: p.mmap_next,
+            shm_attach_next: p.shm_attach_next,
+            shm_attachments: p.shm_attachments.clone(),
+            dynamic_bytes: p.dynamic_bytes,
+            vmas: p.vmas.clone(),
+            child_fds: p.fds.clone(),
+            parent_port_rights: p.port_rights.clone(),
+            next_port_name: p.next_port_name,
+            user_rsp: img.user_rsp,
+            initial_argc: img.initial_argc,
+            initial_argv: img.initial_argv,
+            auxv_ptr: img.auxv_ptr,
+            phdr_vaddr: img.phdr_vaddr,
+            ph_ent: img.ph_ent,
+            ph_num: img.ph_num,
+            osreldate: img.osreldate,
+            load_regions: img.load_regions.clone(),
+            load_segment_count: img.load_segment_count,
+        }))
     });
 
-    let Some((
-        parent_pid,
-        parent_abi,
-        parent_name,
-        parent_pml4,
-        parent_fpu,
-        parent_fs_base,
-        parent_gs_base,
-        child_signals,
-        parent_weight,
-        entry_point,
-        bytes_loaded,
-        brk_base,
-        brk_current,
-        mmap_next,
-        shm_attach_next,
-        shm_attachments,
-        dynamic_bytes,
-        vmas,
-        mut child_fds,
-        parent_port_rights,
-        next_port_name,
-        user_rsp,
-        initial_argc,
-        initial_argv,
-        auxv_ptr,
-        phdr_vaddr,
-        ph_ent,
-        ph_num,
-        osreldate,
-        load_regions,
-        load_segment_count,
-    )) = snapshot
-    else {
+    let Some(mut snap) = snapshot else {
         return -22;
     };
+
+    let parent_pid = snap.parent_pid;
+    let parent_abi = snap.parent_abi;
+    let parent_pml4 = snap.parent_pml4;
 
     let child_pid = {
         let mut pm = PROCESS_MANAGER.lock();
@@ -2916,7 +2894,8 @@ pub fn fork_current_process(
         pml4
     };
 
-    let shm_ranges: Vec<(u64, u64)> = shm_attachments
+    let shm_ranges: Vec<(u64, u64)> = snap
+        .shm_attachments
         .iter()
         .map(|a| (a.vaddr, a.vaddr + (a.page_count as u64) * PAGE_SIZE))
         .collect();
@@ -2935,16 +2914,17 @@ pub fn fork_current_process(
         };
 
     // Re-attach shared memory regions directly without CoW duplication
-    let mut attached_shms: Vec<ShmAttachment> = Vec::with_capacity(shm_attachments.len());
+    let mut attached_shms: Vec<ShmAttachment> = Vec::with_capacity(snap.shm_attachments.len());
     let mut shm_pages_mapped = 0usize;
     let mut shm_failed = false;
 
-    for att in &shm_attachments {
+    for att in &snap.shm_attachments {
         let Some(frames) = ipc::retain_shm_frames(att.shm_id) else {
             shm_failed = true;
             break;
         };
-        let writable = vmas
+        let writable = snap
+            .vmas
             .iter()
             .find(|r| r.kind == VmRegionKind::SharedMem && r.start == att.vaddr)
             .map(|r| r.writable)
@@ -3007,7 +2987,7 @@ pub fn fork_current_process(
     }
 
     // Inherit file descriptors: pipes retain refcount, sockets & kqueues are per-process and cleared
-    for slot in &mut child_fds {
+    for slot in &mut snap.child_fds {
         match slot {
             Some(FdEntry::PipeRead { pipe_id }) => ipc::retain_pipe_end(*pipe_id, false),
             Some(FdEntry::PipeWrite { pipe_id }) => ipc::retain_pipe_end(*pipe_id, true),
@@ -3018,7 +2998,7 @@ pub fn fork_current_process(
 
     // Inherit Mach IPC rights: Receive stays parent-only; Send (and also_send from allocate) is inherited
     let mut child_port_rights = Vec::new();
-    for entry in &parent_port_rights {
+    for entry in &snap.parent_port_rights {
         match entry.right {
             PortRightKind::Receive => {
                 if entry.also_send && ipc::mach_retain_right(entry.port_id, PortRightKind::Send, false)
@@ -3052,77 +3032,80 @@ pub fn fork_current_process(
 
     let pages_mapped = cloned_pages.len() + shm_pages_mapped;
     let child_image = LoadedElfImage {
-        entry_point,
-        user_rsp,
-        brk_base,
-        initial_argc,
-        initial_argv,
+        entry_point: snap.entry_point,
+        user_rsp: snap.user_rsp,
+        brk_base: snap.brk_base,
+        initial_argc: snap.initial_argc,
+        initial_argv: snap.initial_argv,
         abi: parent_abi,
-        auxv_ptr,
-        phdr_vaddr,
-        ph_ent,
-        ph_num,
-        osreldate,
+        auxv_ptr: snap.auxv_ptr,
+        phdr_vaddr: snap.phdr_vaddr,
+        ph_ent: snap.ph_ent,
+        ph_num: snap.ph_num,
+        osreldate: snap.osreldate,
         mapped_pages: cloned_pages,
-        load_regions,
-        load_segment_count,
-        total_bytes_loaded: bytes_loaded,
+        load_regions: snap.load_regions,
+        load_segment_count: snap.load_segment_count,
+        total_bytes_loaded: snap.bytes_loaded,
     };
+
+    let mut child_slot = Box::new(UserProcessSlot {
+        pid: child_pid,
+        tgid: child_pid,
+        is_thread: false,
+        parent_pid,
+        abi: parent_abi,
+        name: format!("{}[fork]", snap.parent_name),
+        pml4: child_pml4,
+        ctx: child_ctx,
+        fpu_state: snap.parent_fpu,
+        fs_base: snap.parent_fs_base,
+        gs_base: snap.parent_gs_base,
+        clear_child_tid: 0,
+        signals: snap.child_signals,
+        state: UserTaskState::Ready,
+        cpu_ms: 0,
+        vruntime_ms: 0,
+        weight: snap.parent_weight,
+        preempt_count: 0,
+        lazy_faults: 0,
+        syscalls_served: 0,
+        entry_point: snap.entry_point,
+        pages_mapped,
+        bytes_loaded: snap.bytes_loaded,
+        brk_base: snap.brk_base,
+        brk_current: snap.brk_current,
+        mmap_next: snap.mmap_next,
+        shm_attach_next: snap.shm_attach_next,
+        shm_attachments: attached_shms,
+        owned_shm_ids: Vec::new(),
+        dynamic_bytes: snap.dynamic_bytes,
+        vmas: snap.vmas,
+        image: Some(child_image),
+        fds: snap.child_fds,
+        port_rights: child_port_rights,
+        next_port_name: snap.next_port_name,
+        stdout_buf: String::new(),
+        has_gui_window: false,
+    });
 
     let inserted = without_interrupts(|| {
         let mut sched = USER_SCHED.lock();
         let start_vr = sched.min_runnable_vruntime();
         let Some(empty_idx) = sched.slots.iter().position(|s| s.is_none()) else {
-            return Err(child_image);
+            return Err(child_slot);
         };
-        sched.slots[empty_idx] = Some(UserProcessSlot {
-            pid: child_pid,
-            tgid: child_pid,
-            is_thread: false,
-            parent_pid,
-            abi: parent_abi,
-            name: format!("{}[fork]", parent_name),
-            pml4: child_pml4,
-            ctx: child_ctx,
-            fpu_state: parent_fpu,
-            fs_base: parent_fs_base,
-            gs_base: parent_gs_base,
-            clear_child_tid: 0,
-            signals: child_signals,
-            state: UserTaskState::Ready,
-            cpu_ms: 0,
-            vruntime_ms: start_vr,
-            weight: parent_weight,
-            preempt_count: 0,
-            lazy_faults: 0,
-            syscalls_served: 0,
-            entry_point,
-            pages_mapped,
-            bytes_loaded,
-            brk_base,
-            brk_current,
-            mmap_next,
-            shm_attach_next,
-            shm_attachments: attached_shms.clone(),
-            owned_shm_ids: Vec::new(),
-            dynamic_bytes,
-            vmas,
-            image: Some(child_image),
-            fds: child_fds.clone(),
-            port_rights: child_port_rights.clone(),
-            next_port_name,
-            stdout_buf: String::new(),
-            has_gui_window: false,
-        });
+        child_slot.vruntime_ms = start_vr;
+        sched.slots[empty_idx] = Some(child_slot);
         Ok(())
     });
 
-    if let Err(mut returned_img) = inserted {
-        for pr in child_port_rights {
+    if let Err(mut returned_slot) = inserted {
+        for pr in returned_slot.port_rights.drain(..) {
             ipc::mach_release_port_id_right(pr.port_id, pr.right, pr.also_send, allocator);
         }
-        close_fd_list(child_fds);
-        for att in attached_shms {
+        close_fd_list(&mut returned_slot.fds);
+        for att in returned_slot.shm_attachments.drain(..) {
             for i in 0..att.page_count {
                 if let Ok(virt) = VirtAddr::try_new(att.vaddr + (i as u64) * PAGE_SIZE) {
                     let _ = mapping.unmap_page_in(child_pml4, virt);
@@ -3130,7 +3113,9 @@ pub fn fork_current_process(
             }
             ipc::release_shm(att.shm_id, allocator);
         }
-        elf::cleanup_loaded_image(&mut returned_img, child_pml4, mapping, allocator);
+        if let Some(mut returned_img) = returned_slot.image.take() {
+            elf::cleanup_loaded_image(&mut returned_img, child_pml4, mapping, allocator);
+        }
         let mut pm = PROCESS_MANAGER.lock();
         unsafe {
             let _ = pm.terminate_process(child_pid, mapping, allocator);
@@ -3892,7 +3877,7 @@ pub fn sys_kevent_current(
         let Some(FdEntry::Kqueue { kq_id }) = proc.fds[fd - FD_OFFSET] else {
             return None;
         };
-        Some((idx, proc.pml4, kq_id, proc.fds.clone()))
+        Some((idx, proc.pml4, kq_id, Box::new(proc.fds.clone())))
     });
 
     let Some((_slot_idx, pml4, kq_id, owner_fds)) = caller else {
@@ -3949,7 +3934,7 @@ pub fn sys_kevent_current(
 
     match kqueue::poll_events(
         kq_id,
-        &owner_fds,
+        owner_fds.as_slice(),
         capped_ev,
         now_ms,
         &|target| is_process_alive(target),
@@ -4340,6 +4325,25 @@ pub fn sys_thr_kill_current(tid: i64, sig: u32) -> i64 {
     })
 }
 
+struct ThrCallerInfo {
+    tgid: usize,
+    parent_pid: usize,
+    abi: ProcessAbi,
+    parent_name: String,
+    pml4: u64,
+    weight: u32,
+    entry_point: u64,
+    pages_mapped: usize,
+    bytes_loaded: u64,
+    brk_base: u64,
+    brk_current: u64,
+    mmap_next: u64,
+    shm_attach_next: u64,
+    vmas: Vec<VmRegion>,
+    thread_fds: [Option<FdEntry>; MAX_PROC_FDS],
+    thread_signals: SignalState,
+}
+
 pub fn sys_thr_new_current(
     param_ptr: u64,
     param_size: usize,
@@ -4358,47 +4362,30 @@ pub fn sys_thr_new_current(
         let sched = USER_SCHED.lock();
         let idx = sched.current_slot?;
         let p = sched.slots[idx].as_ref()?;
-        Some((
-            p.tgid,
-            p.parent_pid,
-            p.abi,
-            p.name.clone(),
-            p.pml4,
-            p.weight,
-            p.entry_point,
-            p.pages_mapped,
-            p.bytes_loaded,
-            p.brk_base,
-            p.brk_current,
-            p.mmap_next,
-            p.shm_attach_next,
-            p.vmas.clone(),
-            p.fds.clone(),
-            p.signals.clone_for_fork(),
-        ))
+        Some(Box::new(ThrCallerInfo {
+            tgid: p.tgid,
+            parent_pid: p.parent_pid,
+            abi: p.abi,
+            parent_name: p.name.clone(),
+            pml4: p.pml4,
+            weight: p.weight,
+            entry_point: p.entry_point,
+            pages_mapped: p.pages_mapped,
+            bytes_loaded: p.bytes_loaded,
+            brk_base: p.brk_base,
+            brk_current: p.brk_current,
+            mmap_next: p.mmap_next,
+            shm_attach_next: p.shm_attach_next,
+            vmas: p.vmas.clone(),
+            thread_fds: p.fds.clone(),
+            thread_signals: p.signals.clone_for_fork(),
+        }))
     });
 
-    let Some((
-        tgid,
-        parent_pid,
-        abi,
-        parent_name,
-        pml4,
-        weight,
-        entry_point,
-        pages_mapped,
-        bytes_loaded,
-        brk_base,
-        brk_current,
-        mmap_next,
-        shm_attach_next,
-        vmas,
-        mut thread_fds,
-        thread_signals,
-    )) = caller_info
-    else {
+    let Some(mut info) = caller_info else {
         return -22;
     };
+    let pml4 = info.pml4;
 
     let mut raw = alloc::vec![0u8; expected_sz];
     if syscall::copy_from_user_bytes_in(mapping, Some(allocator), pml4, param_ptr, &mut raw)
@@ -4427,7 +4414,7 @@ pub fn sys_thr_new_current(
         return -14;
     }
 
-    for slot in &mut thread_fds {
+    for slot in &mut info.thread_fds {
         match slot {
             Some(FdEntry::PipeRead { pipe_id }) => ipc::retain_pipe_end(*pipe_id, false),
             Some(FdEntry::PipeWrite { pipe_id }) => ipc::retain_pipe_end(*pipe_id, true),
@@ -4447,58 +4434,66 @@ pub fn sys_thr_new_current(
         ..UserCpuContext::default()
     };
 
-    let tid_res = without_interrupts(|| {
+    let mut thread_slot = Box::new(UserProcessSlot {
+        pid: 0,
+        tgid: info.tgid,
+        is_thread: true,
+        parent_pid: info.parent_pid,
+        abi: info.abi,
+        name: String::new(),
+        pml4,
+        ctx,
+        fpu_state: FxSaveArea::new_clean(),
+        fs_base: param.tls_base,
+        gs_base: 0,
+        clear_child_tid: param.child_tid,
+        signals: info.thread_signals,
+        state: UserTaskState::Ready,
+        cpu_ms: 0,
+        vruntime_ms: 0,
+        weight: info.weight,
+        preempt_count: 0,
+        lazy_faults: 0,
+        syscalls_served: 0,
+        entry_point: info.entry_point,
+        pages_mapped: info.pages_mapped,
+        bytes_loaded: info.bytes_loaded,
+        brk_base: info.brk_base,
+        brk_current: info.brk_current,
+        mmap_next: info.mmap_next,
+        shm_attach_next: info.shm_attach_next,
+        shm_attachments: Vec::new(),
+        owned_shm_ids: Vec::new(),
+        dynamic_bytes: 0,
+        vmas: info.vmas,
+        image: None,
+        fds: info.thread_fds,
+        port_rights: Vec::new(),
+        next_port_name: 1,
+        stdout_buf: String::new(),
+        has_gui_window: false,
+    });
+
+    let tid_res: Result<usize, Box<UserProcessSlot>> = without_interrupts(|| {
         let mut sched = USER_SCHED.lock();
         let Some(empty_idx) = sched.slots.iter().position(|s| s.is_none()) else {
-            return None;
+            return Err(thread_slot);
         };
         let tid = sched.alloc_tid();
         let start_vr = sched.min_runnable_vruntime();
-        sched.slots[empty_idx] = Some(UserProcessSlot {
-            pid: tid,
-            tgid,
-            is_thread: true,
-            parent_pid,
-            abi,
-            name: format!("{}[thr:{}]", parent_name, tid),
-            pml4,
-            ctx,
-            fpu_state: FxSaveArea::new_clean(),
-            fs_base: param.tls_base,
-            gs_base: 0,
-            clear_child_tid: param.child_tid,
-            signals: thread_signals,
-            state: UserTaskState::Ready,
-            cpu_ms: 0,
-            vruntime_ms: start_vr,
-            weight,
-            preempt_count: 0,
-            lazy_faults: 0,
-            syscalls_served: 0,
-            entry_point,
-            pages_mapped,
-            bytes_loaded,
-            brk_base,
-            brk_current,
-            mmap_next,
-            shm_attach_next,
-            shm_attachments: Vec::new(),
-            owned_shm_ids: Vec::new(),
-            dynamic_bytes: 0,
-            vmas,
-            image: None,
-            fds: thread_fds.clone(),
-            port_rights: Vec::new(),
-            next_port_name: 1,
-            stdout_buf: String::new(),
-            has_gui_window: false,
-        });
-        Some(tid)
+        thread_slot.pid = tid;
+        thread_slot.name = format!("{}[thr:{}]", info.parent_name, tid);
+        thread_slot.vruntime_ms = start_vr;
+        sched.slots[empty_idx] = Some(thread_slot);
+        Ok(tid)
     });
 
-    let Some(tid) = tid_res else {
-        close_fd_list(thread_fds);
-        return -11;
+    let tid = match tid_res {
+        Ok(tid) => tid,
+        Err(mut returned_slot) => {
+            close_fd_list(&mut returned_slot.fds);
+            return -11;
+        }
     };
 
     let tid_bytes = (tid as i64).to_le_bytes();

@@ -1,3 +1,4 @@
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::instructions::interrupts::without_interrupts;
@@ -59,40 +60,21 @@ struct KNote {
     user_triggered: bool,
 }
 
-#[derive(Clone, Copy)]
 struct KQueueInstance {
-    id: usize,
-    notes: [Option<KNote>; MAX_FILTERS_PER_KQ],
-}
-
-impl KQueueInstance {
-    const fn empty(id: usize) -> Self {
-        Self {
-            id,
-            notes: [None; MAX_FILTERS_PER_KQ],
-        }
-    }
+    notes: Vec<KNote>,
 }
 
 struct KQueueTable {
     next_id: usize,
-    slots: [Option<KQueueInstance>; MAX_KQUEUES],
+    instances: BTreeMap<usize, KQueueInstance>,
 }
 
 impl KQueueTable {
     const fn new() -> Self {
         Self {
             next_id: 1,
-            slots: [None; MAX_KQUEUES],
+            instances: BTreeMap::new(),
         }
-    }
-
-    fn get(&self, kq_id: usize) -> Option<&KQueueInstance> {
-        self.slots.iter().flatten().find(|k| k.id == kq_id)
-    }
-
-    fn get_mut(&mut self, kq_id: usize) -> Option<&mut KQueueInstance> {
-        self.slots.iter_mut().flatten().find(|k| k.id == kq_id)
     }
 }
 
@@ -101,35 +83,29 @@ static KQUEUES: Mutex<KQueueTable> = Mutex::new(KQueueTable::new());
 pub fn create_kqueue() -> Result<usize, i64> {
     without_interrupts(|| {
         let mut table = KQUEUES.lock();
-        let Some(slot_idx) = table.slots.iter().position(|s| s.is_none()) else {
+        if table.instances.len() >= MAX_KQUEUES {
             return Err(-24); // EMFILE
-        };
+        }
         let id = table.next_id;
         table.next_id = table.next_id.saturating_add(1).max(1);
-        table.slots[slot_idx] = Some(KQueueInstance::empty(id));
+        table.instances.insert(id, KQueueInstance { notes: Vec::new() });
         Ok(id)
     })
 }
 
 pub fn destroy_kqueue(kq_id: usize) {
     without_interrupts(|| {
-        let mut table = KQUEUES.lock();
-        for slot in &mut table.slots {
-            if slot.as_ref().map(|k| k.id == kq_id).unwrap_or(false) {
-                *slot = None;
-                break;
-            }
-        }
+        KQUEUES.lock().instances.remove(&kq_id);
     });
 }
 
 pub fn has_ready_note(kq_id: usize, now_ms: u64) -> bool {
     without_interrupts(|| {
         let table = KQUEUES.lock();
-        let Some(kq) = table.get(kq_id) else {
+        let Some(kq) = table.instances.get(&kq_id) else {
             return true;
         };
-        kq.notes.iter().flatten().any(|note| {
+        kq.notes.iter().any(|note| {
             if !note.enabled {
                 return false;
             }
@@ -147,8 +123,8 @@ pub fn has_ready_note(kq_id: usize, now_ms: u64) -> bool {
 pub fn notify_process_exit(pid: usize, exit_code: i64) {
     without_interrupts(|| {
         let mut table = KQUEUES.lock();
-        for kq in table.slots.iter_mut().flatten() {
-            for note in kq.notes.iter_mut().flatten() {
+        for kq in table.instances.values_mut() {
+            for note in &mut kq.notes {
                 if note.filter == EVFILT_PROC && note.ident == pid as u64 {
                     note.proc_exited = true;
                     note.proc_exit_code = exit_code;
@@ -161,16 +137,19 @@ pub fn notify_process_exit(pid: usize, exit_code: i64) {
 pub fn apply_changes(kq_id: usize, changes: &[KEvent], now_ms: u64) -> Result<(), i64> {
     without_interrupts(|| {
         let mut table = KQUEUES.lock();
-        let Some(kq) = table.get_mut(kq_id) else {
+        let Some(kq) = table.instances.get_mut(&kq_id) else {
             return Err(-9); // EBADF
         };
 
         for ch in changes {
-            let pos = kq.notes.iter().position(|n| n.as_ref().map(|x| x.ident == ch.ident && x.filter == ch.filter).unwrap_or(false));
+            let pos = kq
+                .notes
+                .iter()
+                .position(|n| n.ident == ch.ident && n.filter == ch.filter);
 
             if (ch.flags & EV_DELETE) != 0 {
                 if let Some(idx) = pos {
-                    kq.notes[idx] = None;
+                    kq.notes.swap_remove(idx);
                 }
                 continue;
             }
@@ -201,14 +180,14 @@ pub fn apply_changes(kq_id: usize, changes: &[KEvent], now_ms: u64) -> Result<()
                     user_triggered: (ch.fflags & NOTE_TRIGGER) != 0,
                 };
                 if let Some(idx) = pos {
-                    kq.notes[idx] = Some(note);
-                } else if let Some(free_idx) = kq.notes.iter().position(|n| n.is_none()) {
-                    kq.notes[free_idx] = Some(note);
+                    kq.notes[idx] = note;
+                } else if kq.notes.len() < MAX_FILTERS_PER_KQ {
+                    kq.notes.push(note);
                 } else {
                     return Err(-12); // ENOMEM
                 }
             } else if let Some(idx) = pos {
-                let Some(ref mut note) = kq.notes[idx] else { continue; };
+                let note = &mut kq.notes[idx];
                 if (ch.flags & EV_ENABLE) != 0 {
                     note.enabled = true;
                 }
@@ -297,15 +276,14 @@ pub fn poll_events(
 
     without_interrupts(|| {
         let mut table = KQUEUES.lock();
-        let Some(kq) = table.get_mut(kq_id) else {
+        let Some(kq) = table.instances.get_mut(&kq_id) else {
             return Err(-9);
         };
 
         let mut ready = Vec::new();
         let mut remove_indices = Vec::new();
 
-        for (idx, note_slot) in kq.notes.iter_mut().enumerate() {
-            let Some(ref mut note) = note_slot else { continue; };
+        for (idx, note) in kq.notes.iter_mut().enumerate() {
             if ready.len() >= max_events {
                 break;
             }
@@ -399,7 +377,7 @@ pub fn poll_events(
         }
 
         for idx in remove_indices.into_iter().rev() {
-            kq.notes[idx] = None;
+            kq.notes.swap_remove(idx);
         }
 
         Ok(ready)

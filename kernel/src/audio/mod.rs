@@ -3,8 +3,7 @@ pub mod wav;
 
 use core::arch::asm;
 
-use crate::drivers::ac97::{self, AC97_DRIVER};
-use crate::drivers::registry::AudioDevice;
+use crate::drivers;
 use crate::interrupts::timer;
 
 // 64-entry quarter/full sine wave LUT scaled to [-18000, +18000] (no floating point in no_std).
@@ -33,15 +32,12 @@ pub fn play_tone(freq_hz: u32, duration_ms: u32) -> Result<bool, &'static str> {
     let freq = freq_hz.clamp(60, 12_000);
     let dur = duration_ms.clamp(20, 5_000);
 
-    if !ac97::is_ready() {
+    if !drivers::audio_is_ready() {
         pc_speaker_beep(freq, dur);
         return Ok(false);
     }
 
-    let rate = {
-        let mut dev = AC97_DRIVER.lock();
-        dev.begin_playback(44100)
-    };
+    let rate = drivers::audio_begin_playback(44100);
 
     let total_frames = ((rate as u64) * (dur as u64) / 1000) as usize;
     let fade_frames = ((rate as u64) * 10 / 1000).max(1) as usize;
@@ -72,22 +68,19 @@ pub fn play_tone(freq_hz: u32, duration_ms: u32) -> Result<bool, &'static str> {
             pcm_buf[i * 2 + 1] = val;
         }
 
-        {
-            let mut dev = AC97_DRIVER.lock();
-            dev.queue_pcm_s16le(&pcm_buf[..chunk_frames * 2])?;
-        }
+        drivers::audio_queue_pcm_s16le(&pcm_buf[..chunk_frames * 2])?;
         frame_idx += chunk_frames;
     }
 
-    AC97_DRIVER.lock().finish_playback();
+    drivers::audio_finish_playback();
     Ok(true)
 }
 
 pub fn set_volume(percent: u8) -> Result<(), &'static str> {
-    if !ac97::is_ready() {
-        return Err("Intel AC'97 driver is not active");
+    if !drivers::audio_is_ready() {
+        return Err("No active hardware audio driver (AC'97/HDA)");
     }
-    AC97_DRIVER.lock().set_volume(percent);
+    drivers::audio_set_volume(percent);
     Ok(())
 }
 

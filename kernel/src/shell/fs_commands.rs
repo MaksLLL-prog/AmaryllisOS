@@ -227,12 +227,14 @@ pub fn cmd_mount(console: &mut Console<'_>, arguments: &str) {
         "nvme" => vfs::with_vfs(|v| v.mount_nvme()),
         "virtio" => vfs::with_vfs(|v| v.mount_virtio()),
         "ahci" => vfs::with_vfs(|v| v.mount_ahci()),
+        "usb" => vfs::with_vfs(|v| v.mount_usb()),
+        "sd" | "sdhci" => vfs::with_vfs(|v| v.mount_sd()),
         "pm" | "0" => vfs::with_vfs(|v| v.mount_slot(0, false, false)),
         "ps" | "1" => vfs::with_vfs(|v| v.mount_slot(0, false, true)),
         "sm" | "2" => vfs::with_vfs(|v| v.mount_slot(0, true, false)),
         "ss" | "3" => vfs::with_vfs(|v| v.mount_slot(0, true, true)),
         _ => {
-            console.write("Usage: mount [auto|nvme|virtio|ahci|pm|ps|sm|ss]\n", YELLOW);
+            console.write("Usage: mount [auto|nvme|virtio|ahci|usb|sd|pm|ps|sm|ss]\n", YELLOW);
             return;
         }
     };
@@ -369,6 +371,18 @@ pub fn cmd_diskinfo(console: &mut Console<'_>) {
                     console.write("NVMe PCI Express DMA (FreeBSD KPI, ", GREEN);
                     write_decimal(console, lba_size as u64);
                     console.write("B LBA, max ", GRAY);
+                    write_decimal(console, max_dma_sectors as u64);
+                    console.write(" sectors/batch)\n", GRAY);
+                }
+                Some(MountedBackend::UsbMass { max_dma_sectors }) => {
+                    console.write("  Backend:     ", GRAY);
+                    console.write("USB Mass Storage xHCI BOT (max ", GREEN);
+                    write_decimal(console, max_dma_sectors as u64);
+                    console.write(" sectors/batch)\n", GRAY);
+                }
+                Some(MountedBackend::Sdhci { max_dma_sectors, sdhc }) => {
+                    console.write("  Backend:     ", GRAY);
+                    console.write(if sdhc { "SDHCI SDHC v2 DMA (max " } else { "SDHCI SDSC DMA (max " }, GREEN);
                     write_decimal(console, max_dma_sectors as u64);
                     console.write(" sectors/batch)\n", GRAY);
                 }

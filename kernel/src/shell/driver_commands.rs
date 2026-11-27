@@ -680,3 +680,257 @@ pub fn cmd_kpi(console: &mut Console<'_>) {
     }
 }
 
+pub fn cmd_gop(console: &mut Console<'_>) {
+    let snap = crate::drivers::uefi_gop::snapshot();
+    console.write("\nUEFI GOP / Linear Framebuffer (efifb):\n", GREEN);
+    if !snap.initialized {
+        console.write("  GOP framebuffer is not active.\n", YELLOW);
+        return;
+    }
+    let line = alloc::format!(
+        "  Mode: {}x{} @ {} bpp (stride={} px, pitch={} B)\n  Fmt:  {} (masks R={:08x} G={:08x} B={:08x})\n  FB:   virt=0x{:x} phys=0x{:x} size={} KiB\n",
+        snap.width,
+        snap.height,
+        snap.bits_per_pixel,
+        snap.stride_pixels,
+        snap.pitch_bytes,
+        snap.format_name(),
+        snap.red_mask,
+        snap.green_mask,
+        snap.blue_mask,
+        snap.fb_virt,
+        snap.fb_phys,
+        snap.fb_size / 1024,
+    );
+    console.write(&line, WHITE);
+    if snap.pci_present {
+        let pci_line = alloc::format!(
+            "  PCI Display {:02}:{:02}.{} {:04x}:{:04x} LFB=0x{:x} MMIO=0x{:x}\n",
+            snap.pci_bus,
+            snap.pci_dev,
+            snap.pci_func,
+            snap.pci_vendor,
+            snap.pci_device,
+            snap.pci_lfb_phys,
+            snap.pci_mmio_phys,
+        );
+        console.write(&pci_line, GRAY);
+    }
+}
+
+pub fn cmd_usb(console: &mut Console<'_>) {
+    let snap = crate::drivers::usb::snapshot();
+    console.write("\nUSB xHCI Host Controller & Class Drivers:\n", GREEN);
+    if !snap.initialized {
+        console.write("  xHCI controller not present or not initialized.\n", YELLOW);
+        return;
+    }
+    let line = alloc::format!(
+        "  xHCI v{}.{:02} MMIO=0x{:x} IRQ={} GSI={:?} vec={:?} irqs={}\n  Slots={} Ports={} Connected={} Enumerated={}\n  HID: kbd_slot={} mouse_slot={} reports_rx={}\n",
+        (snap.hci_version >> 8) & 0xFF,
+        snap.hci_version & 0xFF,
+        snap.mmio_phys,
+        snap.irq_line,
+        snap.irq_gsi,
+        snap.irq_vector,
+        snap.irq_count,
+        snap.max_slots,
+        snap.max_ports,
+        snap.connected_ports,
+        snap.enumerated_devices,
+        snap.hid_keyboard_slot,
+        snap.hid_mouse_slot,
+        snap.hid_reports_rx,
+    );
+    console.write(&line, WHITE);
+
+    let msc = crate::drivers::usb::umass_snapshot();
+    if msc.present {
+        let mline = alloc::format!(
+            "  UMASS (slot={} bulk_in={} bulk_out={}): '{}' '{}' ready={} {} sectors ({} MiB) R={} W={}\n",
+            msc.slot_id,
+            msc.bulk_in_dci,
+            msc.bulk_out_dci,
+            msc.vendor_str(),
+            msc.product_str(),
+            msc.ready,
+            msc.sector_count,
+            (msc.sector_count * msc.block_size as u64) / (1024 * 1024),
+            msc.reads,
+            msc.writes,
+        );
+        console.write(&mline, WHITE);
+    } else {
+        console.write("  UMASS: no USB mass storage device attached.\n", GRAY);
+    }
+}
+
+pub fn cmd_re(console: &mut Console<'_>) {
+    let st = crate::drivers::re_nic::stats();
+    console.write("\nRealtek Ethernet (if_re / if_rl) FreeBSD-KPI Driver:\n", GREEN);
+    if !st.initialized {
+        console.write("  Realtek NIC not present or not initialized.\n", YELLOW);
+        return;
+    }
+    let line = alloc::format!(
+        "  Model: {} (dev=0x{:04x}) Link={}\n  MAC:   {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n  BARs:  MMIO=0x{:x} IO=0x{:x} IRQ={} GSI={:?} vec={:?}\n  Stats: tx_pkts={} ({} B) rx_pkts={} ({} B) tx_err={}\n",
+        if st.is_rtl8139 { "RTL8139" } else { "RTL8168/8169/8111/8125" },
+        st.device_id,
+        if st.link_up { "UP" } else { "DOWN" },
+        st.mac[0], st.mac[1], st.mac[2], st.mac[3], st.mac[4], st.mac[5],
+        st.mmio_phys,
+        st.io_base,
+        st.irq_line,
+        st.irq_gsi,
+        st.irq_vector,
+        st.tx_packets,
+        st.tx_bytes,
+        st.rx_packets,
+        st.rx_bytes,
+        st.tx_errors,
+    );
+    console.write(&line, WHITE);
+}
+
+pub fn cmd_hda(console: &mut Console<'_>) {
+    let st = crate::drivers::hda::stats();
+    console.write("\nIntel High Definition Audio (snd_hda) FreeBSD-KPI Driver:\n", GREEN);
+    if !st.initialized {
+        console.write("  Intel HDA controller not present or not initialized.\n", YELLOW);
+        return;
+    }
+    let line = alloc::format!(
+        "  HDA v{}.{} MMIO=0x{:x} IRQ={} GSI={:?} vec={:?}\n  CodecMask=0x{:04x} Codec={} DAC_NID={} Pin_NID={}\n  Audio: {} Hz vol={}% playing={} buffers_played={}\n",
+        st.version_major,
+        st.version_minor,
+        st.mmio_phys,
+        st.irq_line,
+        st.irq_gsi,
+        st.irq_vector,
+        st.codec_mask,
+        st.codec_addr,
+        st.dac_nid,
+        st.pin_nid,
+        st.sample_rate,
+        st.volume_percent,
+        st.playing,
+        st.buffers_played,
+    );
+    console.write(&line, WHITE);
+}
+
+pub fn cmd_sd(console: &mut Console<'_>, arguments: &str) {
+    let snap = crate::drivers::sdhci::snapshot();
+    console.write("\nSDHCI / SD Card Controller (sdhci_pci + mmcsd):\n", GREEN);
+    if !snap.initialized {
+        console.write("  SDHCI controller not present or not initialized.\n", YELLOW);
+        return;
+    }
+    let line = alloc::format!(
+        "  SDHCI v0x{:04x} BAR0=0x{:x} IRQ={} GSI={:?} vec={:?} irqs={}\n  Card: present={} ready={} SDHCv2={} RCA=0x{:04x} sectors={} ({} MiB) R={} W={}\n",
+        snap.host_version,
+        snap.bar0_phys,
+        snap.irq_line,
+        snap.irq_gsi,
+        snap.irq_vector,
+        crate::drivers::sdhci::irq_count(),
+        snap.card_present,
+        snap.card_ready,
+        snap.sdhc_v2,
+        snap.rca,
+        snap.sector_count,
+        (snap.sector_count * 512) / (1024 * 1024),
+        snap.reads,
+        snap.writes,
+    );
+    console.write(&line, WHITE);
+
+    let trimmed = arguments.trim();
+    if let Some(rest) = trimmed.strip_prefix("read ") {
+        if let Ok(lba) = rest.trim().parse::<u64>() {
+            let mut sec = [0u8; 512];
+            match crate::drivers::sdhci::read_sector_dma(lba, &mut sec) {
+                Ok(()) => {
+                    console.write("  SDHCI Read OK (first 32 bytes): ", GREEN);
+                    for b in &sec[..32] {
+                        console.write(&alloc::format!("{:02x} ", b), WHITE);
+                    }
+                    console.write("\n", WHITE);
+                }
+                Err(e) => {
+                    console.write(&alloc::format!("  SDHCI Read Error: {:?}\n", e), RED);
+                }
+            }
+        }
+    }
+}
+
+pub fn cmd_power(console: &mut Console<'_>) {
+    let snap = crate::drivers::acpi_pm::refresh();
+    console.write("\nACPI AML, Battery, Thermal & Power Management:\n", GREEN);
+    if !snap.initialized {
+        console.write("  ACPI subsystem not initialized.\n", YELLOW);
+        return;
+    }
+    let ac_str = match snap.ac_online {
+        Some(true) => "Online",
+        Some(false) => "Offline",
+        None => "Unknown",
+    };
+    let line = alloc::format!(
+        "  Tables: DSDT={} B SSDTs={} PMProfile={} SCI_IRQ={}\n  Regs:   PM1a_CNT=0x{:x} PM1b_CNT=0x{:x} PM_TMR=0x{:x} GPE0=0x{:x}\n  Sleep:  _S5 found={} (SLP_TYPa={} SLP_TYPb={})\n  Power:  AC={} (ACPI0003={}) Battery={} (count={} pct={:?}) EC={} (resp={}) PwrBtn={}\n  Therm:  ThermalZones={} CPU_DTS={} temp={:?} C (TjMax={} C)\n",
+        snap.dsdt_bytes,
+        snap.ssdt_count,
+        snap.pm_profile,
+        snap.sci_irq,
+        snap.pm1a_cnt,
+        snap.pm1b_cnt,
+        snap.pm_tmr,
+        snap.gpe0_blk,
+        snap.s5_found,
+        snap.s5_slp_typa,
+        snap.s5_slp_typb,
+        ac_str,
+        snap.ac_present,
+        snap.battery_present,
+        snap.battery_count,
+        snap.battery_percent,
+        snap.ec_present,
+        snap.ec_responsive,
+        snap.power_button_present,
+        snap.thermal_zone_count,
+        snap.cpu_dts_supported,
+        snap.cpu_temp_celsius,
+        snap.tj_max_celsius,
+    );
+    console.write(&line, WHITE);
+
+    if snap.device_count > 0 {
+        console.write("  AML Namespace Devices:\n", YELLOW);
+        for i in 0..snap.device_count {
+            let d = &snap.devices[i];
+            if !d.valid {
+                continue;
+            }
+            let dline = alloc::format!(
+                "    {} [{}] _HID={}\n",
+                d.name_str(),
+                d.kind.label(),
+                d.hid_str(),
+            );
+            console.write(&dline, GRAY);
+        }
+    }
+}
+
+pub fn cmd_reboot(console: &mut Console<'_>) {
+    console.write("Rebooting system via ACPI/Reset...\n", YELLOW);
+    crate::drivers::acpi_pm::reboot();
+}
+
+pub fn cmd_shutdown(console: &mut Console<'_>) {
+    console.write("Shutting down system via ACPI S5...\n", YELLOW);
+    crate::drivers::acpi_pm::shutdown();
+}
+
+

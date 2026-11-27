@@ -5,6 +5,8 @@ pub mod mouse;
 pub use keyboard::{
     decode_scancode,
     handle_interrupt,
+    push_hid_key_report,
+    push_scancode,
     read_scancode,
     scancode_to_char,
     KeyCode,
@@ -30,9 +32,17 @@ pub fn drain_mouse() {
 }
 
 pub fn poll_mouse_hw() -> usize {
-    mouse::poll_aux_if_pending()
+    let mut n = mouse::poll_aux_if_pending();
+    if crate::drivers::usb::is_ready() {
+        n += crate::drivers::usb::poll_hid();
+    }
+    n
 }
 
 pub fn poll_keyboard_hw() -> usize {
-    keyboard::poll_if_pending()
+    let mut n = keyboard::poll_if_pending();
+    if crate::drivers::usb::is_ready() {
+        n += crate::drivers::usb::poll_hid();
+    }
+    n
 }

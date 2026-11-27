@@ -296,7 +296,7 @@ impl ControlCenterModule {
 
     pub const fn title(self) -> &'static str {
         match self {
-            Self::Network => "Network (e1000)",
+            Self::Network => "Network",
             Self::Audio => "Audio Mute",
             Self::Theme => "Theme Switch",
             Self::Volume => "Volume Slider",

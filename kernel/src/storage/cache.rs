@@ -33,6 +33,8 @@ pub enum CacheBackendKind {
     AhciSata = 2,
     IdeAtaPio = 3,
     Nvme = 4,
+    UsbMass = 5,
+    Sdhci = 6,
 }
 
 impl CacheBackendKind {
@@ -43,6 +45,8 @@ impl CacheBackendKind {
             Self::AhciSata => "AHCI SATA DMA",
             Self::IdeAtaPio => "ATA PIO (Multi-sector)",
             Self::Nvme => "NVMe PCI DMA (FreeBSD KPI)",
+            Self::UsbMass => "USB Mass Storage (xHCI BOT)",
+            Self::Sdhci => "SDHCI SD/MMC Card (FreeBSD KPI)",
         }
     }
 
@@ -52,6 +56,8 @@ impl CacheBackendKind {
             2 => Self::AhciSata,
             3 => Self::IdeAtaPio,
             4 => Self::Nvme,
+            5 => Self::UsbMass,
+            6 => Self::Sdhci,
             _ => Self::None,
         }
     }

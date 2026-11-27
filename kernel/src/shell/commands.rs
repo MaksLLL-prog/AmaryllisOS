@@ -99,7 +99,7 @@ pub fn execute(
             console.write("  mkdir <path>       - Create directory\n", WHITE);
             console.write("  rm <path>          - Remove file or empty directory\n", WHITE);
             console.write("  diskinfo           - Show disks, partitions, Page Cache & VFS\n", WHITE);
-            console.write("  mount [target]     - Mount VFS disk (auto|nvme|virtio|ahci|pm|ps|sm|ss)\n", WHITE);
+            console.write("  mount [target]     - Mount VFS disk (auto|nvme|virtio|ahci|usb|sd|pm|ps|sm|ss)\n", WHITE);
             console.write("  sync               - Flush dirty Block/Page Cache pages to disk\n", WHITE);
 
             console.write("\nATA commands:\n", YELLOW);
@@ -111,20 +111,25 @@ pub fn execute(
             console.write("  drivers [--active] - List unified kernel drivers\n", WHITE);
             console.write("  ioreg              - XNU-style IOKit IORegistry, IOAPIC GSI & WorkLoop tree\n", WHITE);
             console.write("  acpi | apic | smp  - Inspect ACPI tables, LAPIC timer/IOAPIC & SMP cores\n", WHITE);
+            console.write("  power | thermal    - Inspect ACPI AML, battery, EC & CPU thermal sensors\n", WHITE);
+            console.write("  gop | fbinfo       - Inspect UEFI GOP / linear framebuffer mode & masks\n", WHITE);
             console.write("  klog [stats|clear] - Kernel ring log buffer & preempt/#PF telemetry\n", WHITE);
             console.write("  kthread [demo]     - Inspect preemptive kernel threads & guard stacks\n", WHITE);
             console.write("  ahci [read <LBA>]  - Inspect AHCI SATA DMA HBA & read sectors\n", WHITE);
             console.write("  virtio [read LBA]  - Inspect VirtIO-Blk split-ring DMA driver\n", WHITE);
             console.write("  nvme [read <LBA>]  - Inspect FreeBSD-KPI NVMe DMA driver & read sectors\n", WHITE);
+            console.write("  usb | xhci         - Inspect USB xHCI host, HID input & USB Mass Storage\n", WHITE);
+            console.write("  sd [read <LBA>]    - Inspect SDHCI / SD Card reader & read sectors\n", WHITE);
             console.write("  kpi                - Show FreeBSD Driver KPI Newbus, bus_dma & e1000/AHCI checks\n", WHITE);
             console.write("  ipc                - Inspect POSIX pipes, SHM, Mach ports & Bootstrap services\n", WHITE);
-            console.write("  netinfo            - Show Intel e1000 & IPv4 status\n", WHITE);
+            console.write("  netinfo | re       - Show active NIC (Intel e1000 / Realtek) & IPv4 status\n", WHITE);
             console.write("  dhcp               - Acquire IPv4 config via DHCP\n", WHITE);
             console.write("  ping <host_or_ip>  - Send 4 ICMP echo packets\n", WHITE);
             console.write("  httpget <url>      - HTTP GET request over TCP\n", WHITE);
-            console.write("  soundinfo          - Show Intel AC'97 audio status\n", WHITE);
+            console.write("  soundinfo | hda    - Show active audio (Intel HDA / AC'97) status\n", WHITE);
             console.write("  beep [freq] [ms]   - Play synthesized tone\n", WHITE);
             console.write("  play <file.wav>    - Stream WAV file from FAT32\n", WHITE);
+            console.write("  reboot | shutdown  - ACPI system reset / S5 poweroff\n", WHITE);
 
             console.write("\nUserland & ELF (Ring 3) commands:\n", YELLOW);
             console.write("  mkelf [all|path]   - Write /hello,/echo,/fault,/gui_demo,/counter,/net_demo,/lazy,/guard,/fork,/mach,/freebsd ELFs\n", WHITE);
@@ -181,6 +186,14 @@ pub fn execute(
         "ahci" => super::driver_commands::cmd_ahci(console, arguments),
         "virtio" => super::driver_commands::cmd_virtio(console, arguments),
         "nvme" => super::driver_commands::cmd_nvme(console, arguments),
+        "gop" | "fbinfo" => super::driver_commands::cmd_gop(console),
+        "usb" | "xhci" => super::driver_commands::cmd_usb(console),
+        "re" => super::driver_commands::cmd_re(console),
+        "hda" => super::driver_commands::cmd_hda(console),
+        "sd" | "sdhci" => super::driver_commands::cmd_sd(console, arguments),
+        "power" | "battery" | "thermal" => super::driver_commands::cmd_power(console),
+        "reboot" => super::driver_commands::cmd_reboot(console),
+        "shutdown" | "poweroff" => super::driver_commands::cmd_shutdown(console),
         "kpi" => super::driver_commands::cmd_kpi(console),
         "ipc" => super::driver_commands::cmd_ipc(console),
         "netinfo" => super::net_commands::cmd_netinfo(console),

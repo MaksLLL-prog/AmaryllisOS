@@ -1,3 +1,5 @@
+use crate::drivers::registry::AudioDevice;
+use crate::drivers::ac97::AC97_DRIVER;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -6,8 +8,7 @@ use crate::task::preempt::PreemptMutex;
 
 use crate::audio::sample_sine_q32;
 use crate::audio::wav::{inspect_wav, WavInfo};
-use crate::drivers::ac97::{self, AC97_DRIVER};
-use crate::drivers::registry::AudioDevice;
+use crate::drivers;
 use crate::storage::vfs;
 
 const MIX_RATE: u32 = 44_100;
@@ -423,7 +424,7 @@ impl BackgroundMixer {
     }
 
     fn snapshot(&self) -> MixerSnapshot {
-        let hw = ac97::is_ready();
+        let hw = drivers::audio_is_ready();
         let (sr, ch, bps, pos_ms, dur_ms, playing) = match &self.music {
             MusicSource::None => (
                 self.hardware_rate,
@@ -491,7 +492,7 @@ impl BackgroundMixer {
 static MIXER: PreemptMutex<BackgroundMixer> = PreemptMutex::new(BackgroundMixer::new());
 
 pub fn play_tone_async(freq_hz: u32, duration_ms: u32) {
-    if !ac97::is_ready() {
+    if !drivers::audio_is_ready() {
         return;
     }
     if let Some(mut mx) = MIXER.try_lock() {
@@ -502,12 +503,12 @@ pub fn play_tone_async(freq_hz: u32, duration_ms: u32) {
 
 pub fn play_builtin_async(track: BuiltinTrack) {
     let mut mx = MIXER.lock();
-    if ac97::is_ready() {
-        let mut dev = AC97_DRIVER.lock();
-        mx.hardware_rate = dev.prepare_nonblocking(MIX_RATE);
-        mx.volume_percent = dev.stats().volume_percent;
+    if drivers::audio_is_ready() {
+        let (rate, vol) = drivers::audio_prepare_nonblocking_with_vol(MIX_RATE);
+        mx.hardware_rate = rate;
+        mx.volume_percent = vol;
     } else {
-        mx.last_error = Some(String::from("AC'97 controller not present (-device AC97)"));
+        mx.last_error = Some(String::from("Audio controller not present (AC'97 or Intel HDA)"));
     }
     mx.start_builtin(track);
     drop(mx);
@@ -515,16 +516,15 @@ pub fn play_builtin_async(track: BuiltinTrack) {
 }
 
 pub fn play_wav_async(path: &str) -> Result<WavInfo, String> {
-    if !ac97::is_ready() {
-        let msg = String::from("Intel AC'97 is not active (boot QEMU with -device AC97)");
+    if !drivers::audio_is_ready() {
+        let msg = String::from("No audio hardware active (boot with -device AC97 or -device intel-hda)");
         MIXER.lock().last_error = Some(msg.clone());
         return Err(msg);
     }
     let mut mx = MIXER.lock();
-    let mut dev = AC97_DRIVER.lock();
-    mx.hardware_rate = dev.prepare_nonblocking(MIX_RATE);
-    mx.volume_percent = dev.stats().volume_percent;
-    drop(dev);
+    let (rate, vol) = drivers::audio_prepare_nonblocking_with_vol(MIX_RATE);
+    mx.hardware_rate = rate;
+    mx.volume_percent = vol;
     let res = mx.start_wav(path);
     drop(mx);
     if res.is_ok() {
@@ -541,9 +541,7 @@ pub fn pause_toggle() {
             mx.vu_left = 0;
             mx.vu_right = 0;
             mx.waveform = [0; 32];
-            if let Some(mut dev) = AC97_DRIVER.try_lock() {
-                dev.stop();
-            }
+            let _ = drivers::audio_try_stop();
         }
     }
 }
@@ -558,8 +556,8 @@ pub fn set_volume(percent: u8) {
     if let Some(mut mx) = MIXER.try_lock() {
         mx.volume_percent = pct;
     }
-    if ac97::is_ready() {
-        AC97_DRIVER.lock().set_volume(pct);
+    if drivers::audio_is_ready() {
+        drivers::audio_set_volume(pct);
     }
 }
 
@@ -578,29 +576,26 @@ pub fn snapshot() -> MixerSnapshot {
 
 /// Non-blocking tick driven by desktop/shell idle loop; feeds up to 6 BDL buffers (~140 ms) per call.
 pub fn tick() -> bool {
-    if !ac97::is_ready() {
+    if !drivers::audio_is_ready() {
         return false;
     }
     let Some(mut mx) = MIXER.try_lock() else {
         return false;
     };
     if !mx.has_active_audio() {
-        if let Some(mut dev) = AC97_DRIVER.try_lock() {
-            if dev.poll_halted() {
-                mx.vu_left = 0;
-                mx.vu_right = 0;
-                mx.waveform = [0; 32];
-            }
+        if drivers::audio_try_poll_halted() {
+            mx.vu_left = 0;
+            mx.vu_right = 0;
+            mx.waveform = [0; 32];
         }
         return false;
     }
 
-    let Some(mut dev) = AC97_DRIVER.try_lock() else {
+    let Some((rate, free)) = drivers::audio_try_prepare_and_free(MIX_RATE) else {
         return true;
     };
-    mx.hardware_rate = dev.prepare_nonblocking(MIX_RATE);
-    let free = dev.free_bdl_slots().min(6);
-    drop(dev);
+    mx.hardware_rate = rate;
+    let free = free.min(6);
 
     for _ in 0..free {
         if !mx.has_active_audio() {
@@ -611,8 +606,7 @@ pub fn tick() -> bool {
             break;
         }
         let samples = &mx.pcm_scratch[..frames * 2];
-        let mut dev = AC97_DRIVER.lock();
-        if !matches!(dev.try_queue_one_chunk(samples), Ok(true)) {
+        if !matches!(drivers::audio_try_queue_one_chunk(samples), Some(Ok(true))) {
             break;
         }
     }

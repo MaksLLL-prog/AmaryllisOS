@@ -197,8 +197,8 @@ fn wait_for_reply(xid: u32, expected_type: u8, timeout_ms: u64) -> Option<DhcpLe
 }
 
 pub fn discover_and_configure() -> Result<DhcpLease, &'static str> {
-    if !crate::drivers::e1000::is_ready() {
-        return Err("Network driver e1000 is not active");
+    if !crate::drivers::net_is_ready() {
+        return Err("No active network driver");
     }
 
     let mac = net::NET_STATE.lock().mac;

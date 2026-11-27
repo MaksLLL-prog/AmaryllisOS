@@ -1,5 +1,5 @@
 use crate::console::Console;
-use crate::drivers::e1000;
+use crate::drivers;
 use crate::graphics::Color;
 use crate::interrupts::timer;
 use crate::net::{self, dhcp, dns, http, icmp};
@@ -12,16 +12,17 @@ const RED: Color = (220, 90, 90);
 
 pub fn cmd_netinfo(console: &mut Console<'_>) {
     net::poll_rx();
-    let nic = e1000::stats();
+    let nic = drivers::net_stats();
     let state = net::NET_STATE.lock();
 
     console.write("\nNetwork Interface Information:\n", GREEN);
     console.write("  Driver:     ", GRAY);
-    console.write("Intel 82540EM (e1000)\n", WHITE);
+    console.write(nic.driver_name, WHITE);
+    console.write("\n", WHITE);
 
     console.write("  Status:     ", GRAY);
     if !nic.initialized {
-        console.write("NOT PRESENT (start QEMU with -netdev user,id=net0 -device e1000,netdev=net0)\n", YELLOW);
+        console.write("NOT PRESENT (start QEMU with -device e1000 or -device rtl8139)\n", YELLOW);
         return;
     }
     console.write("ACTIVE\n", GREEN);
@@ -78,8 +79,8 @@ pub fn cmd_netinfo(console: &mut Console<'_>) {
 }
 
 pub fn cmd_dhcp(console: &mut Console<'_>) {
-    if !e1000::is_ready() {
-        console.write("Network driver e1000 is not initialized.\n", RED);
+    if !drivers::net_is_ready() {
+        console.write("No active network driver is initialized.\n", RED);
         return;
     }
 
@@ -115,8 +116,8 @@ pub fn cmd_ping(console: &mut Console<'_>, arguments: &str) {
         return;
     }
 
-    if !e1000::is_ready() {
-        console.write("Network driver e1000 is not initialized.\n", RED);
+    if !drivers::net_is_ready() {
+        console.write("No active network driver is initialized.\n", RED);
         return;
     }
 
@@ -192,8 +193,8 @@ pub fn cmd_httpget(console: &mut Console<'_>, arguments: &str) {
         return;
     }
 
-    if !e1000::is_ready() {
-        console.write("Network driver e1000 is not initialized.\n", RED);
+    if !drivers::net_is_ready() {
+        console.write("No active network driver is initialized.\n", RED);
         return;
     }
 

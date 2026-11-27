@@ -266,17 +266,17 @@ impl MonitorApp {
         let r3_count = self.cached_procs.len();
         let net_state = crate::net::NET_STATE.lock();
         let ip = net_state.ip;
-        let net_txt = if crate::drivers::e1000::is_ready() {
-            format!("Intel e1000 READY ({}.{}.{}.{})", ip[0], ip[1], ip[2], ip[3])
+        let net_txt = if crate::drivers::net_is_ready() {
+            format!("{} READY ({}.{}.{}.{})", crate::drivers::net_driver_label(), ip[0], ip[1], ip[2], ip[3])
         } else {
-            String::from("Intel e1000 NOT DETECTED")
+            String::from("Network NIC NOT DETECTED")
         };
         drop(net_state);
 
-        let ac97_txt = if crate::drivers::ac97::is_ready() {
-            String::from("Intel AC'97 Async Mixer ACTIVE")
+        let ac97_txt = if crate::drivers::audio_is_ready() {
+            format!("{} Async Mixer ACTIVE", crate::drivers::audio_driver_label())
         } else {
-            String::from("Intel AC'97 fallback PC speaker")
+            String::from("Audio fallback PC speaker")
         };
 
         canvas.draw_text_clipped(

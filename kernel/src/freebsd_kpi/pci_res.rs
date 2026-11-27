@@ -16,7 +16,7 @@ pub const SYS_RES_IRQ: u32 = 1;
 pub const SYS_RES_MEMORY: u32 = 3;
 pub const SYS_RES_IOPORT: u32 = 4;
 
-pub const MAX_KPI_INTR_SLOTS: usize = 8;
+pub const MAX_KPI_INTR_SLOTS: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Resource {
@@ -71,6 +71,14 @@ fn kpi_intr_trampoline_4() -> bool { dispatch_kpi_intr(4) }
 fn kpi_intr_trampoline_5() -> bool { dispatch_kpi_intr(5) }
 fn kpi_intr_trampoline_6() -> bool { dispatch_kpi_intr(6) }
 fn kpi_intr_trampoline_7() -> bool { dispatch_kpi_intr(7) }
+fn kpi_intr_trampoline_8() -> bool { dispatch_kpi_intr(8) }
+fn kpi_intr_trampoline_9() -> bool { dispatch_kpi_intr(9) }
+fn kpi_intr_trampoline_10() -> bool { dispatch_kpi_intr(10) }
+fn kpi_intr_trampoline_11() -> bool { dispatch_kpi_intr(11) }
+fn kpi_intr_trampoline_12() -> bool { dispatch_kpi_intr(12) }
+fn kpi_intr_trampoline_13() -> bool { dispatch_kpi_intr(13) }
+fn kpi_intr_trampoline_14() -> bool { dispatch_kpi_intr(14) }
+fn kpi_intr_trampoline_15() -> bool { dispatch_kpi_intr(15) }
 
 const TRAMPOLINES: [fn() -> bool; MAX_KPI_INTR_SLOTS] = [
     kpi_intr_trampoline_0,
@@ -81,6 +89,14 @@ const TRAMPOLINES: [fn() -> bool; MAX_KPI_INTR_SLOTS] = [
     kpi_intr_trampoline_5,
     kpi_intr_trampoline_6,
     kpi_intr_trampoline_7,
+    kpi_intr_trampoline_8,
+    kpi_intr_trampoline_9,
+    kpi_intr_trampoline_10,
+    kpi_intr_trampoline_11,
+    kpi_intr_trampoline_12,
+    kpi_intr_trampoline_13,
+    kpi_intr_trampoline_14,
+    kpi_intr_trampoline_15,
 ];
 
 #[inline]
@@ -138,7 +154,7 @@ pub fn bus_alloc_resource_any(
                 }
                 if matches!(bar.kind, PciBarKind::Memory32 | PciBarKind::Memory64) {
                     let size = if bar.size_known && bar.size > 0 {
-                        bar.size.min(256 * 1024)
+                        bar.size.min(1024 * 1024)
                     } else {
                         0x4000
                     };

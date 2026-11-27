@@ -2474,7 +2474,7 @@ impl DesktopState {
             }
             match module {
                 ControlCenterModule::Network => {
-                    if crate::drivers::e1000::is_ready() {
+                    if crate::drivers::net_is_ready() {
                         let dhcp_ok = crate::net::NET_STATE.lock().dhcp_configured;
                         if !dhcp_ok {
                             if let Ok(lease) = crate::net::dhcp::discover_and_configure() {
@@ -2732,8 +2732,8 @@ impl DesktopState {
             None
         };
 
-        let net_up = crate::drivers::e1000::is_ready();
-        let snd_up = crate::drivers::ac97::is_ready();
+        let net_up = crate::drivers::net_is_ready();
+        let snd_up = crate::drivers::audio_is_ready();
         let mixer_snap = crate::audio::mixer::snapshot();
         let rtc_dt = self.rtc_now;
         let clock_txt = self.format_clock_text(&cfg.desktop);
@@ -3622,7 +3622,7 @@ fn draw_control_center_popover(
                     r,
                     LucideIcon::Wifi,
                     "Network",
-                    if net_up { "e1000 Ready" } else { "Offline" },
+                    if net_up { crate::drivers::net_driver_label() } else { "Offline" },
                     net_up,
                     ui_scale,
                     mono_ui,

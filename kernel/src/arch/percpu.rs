@@ -205,17 +205,6 @@ pub fn read_msr(msr: u32) -> u64 {
     unsafe { Msr::new(msr).read() }
 }
 
-pub fn ensure_kernel_gs_ready(fallback_stack_top: u64) {
-    let cpu = current_cpu_id();
-    unsafe {
-        if PER_CPU[cpu].kernel_rsp == 0 && fallback_stack_top != 0 {
-            PER_CPU[cpu].kernel_rsp = fallback_stack_top;
-        }
-        Msr::new(IA32_GS_BASE_MSR).write(0);
-        Msr::new(IA32_KERNEL_GS_BASE_MSR).write(addr_of_mut!(PER_CPU[cpu]) as u64);
-    }
-}
-
 pub fn swapgs_if_needed_on_fault() {
     let gs_base = read_msr(IA32_GS_BASE_MSR);
     let cpu = current_cpu_id();

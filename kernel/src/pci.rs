@@ -804,7 +804,25 @@ fn inspect_network_device(device: &PciDevice) -> Option<PciNetworkDescriptor> {
     if device.vendor_id != 0x8086 {
         return None;
     }
-    if !matches!(device.device_id, 0x100E | 0x100F | 0x10D3 | 0x1004 | 0x1019) {
+    if !matches!(
+        device.device_id,
+        0x100E
+            | 0x100F
+            | 0x10D3
+            | 0x1004
+            | 0x1019
+            | 0x10EA
+            | 0x10EF
+            | 0x1502
+            | 0x1503
+            | 0x153A
+            | 0x153B
+            | 0x15B7
+            | 0x15B8
+            | 0x15BC
+            | 0x15D8
+            | 0x15F3
+    ) {
         return None;
     }
 
@@ -1039,6 +1057,234 @@ fn inspect_nvme_device(device: &PciDevice) -> Option<PciNvmeDescriptor> {
     })
 }
 
+fn inspect_realtek_net_device(device: &PciDevice) -> Option<crate::hardware::PciRealtekNetDescriptor> {
+    if device.vendor_id != 0x10EC || device.class_code != 0x02 || device.subclass != 0x00 {
+        return None;
+    }
+    if !matches!(
+        device.device_id,
+        0x8139 | 0x8161 | 0x8167 | 0x8168 | 0x8169 | 0x8136 | 0x8125 | 0x2600 | 0x3000
+    ) {
+        return None;
+    }
+
+    let mut mmio_base = 0u64;
+    let mut mmio_size = 0u64;
+    let mut io_base = 0u16;
+    for i in 0..device.bar_count {
+        let bar = device.bars[i];
+        if !bar.valid || bar.base == 0 {
+            continue;
+        }
+        match bar.kind {
+            PciBarKind::Memory32 | PciBarKind::Memory64 => {
+                if mmio_base == 0 || bar.index == 2 {
+                    mmio_base = bar.base;
+                    mmio_size = if bar.size_known && bar.size > 0 {
+                        bar.size
+                    } else {
+                        0x1000
+                    };
+                }
+            }
+            PciBarKind::Io if io_base == 0 => {
+                io_base = bar.base as u16;
+            }
+            _ => {}
+        }
+    }
+
+    if mmio_base == 0 && io_base == 0 {
+        return None;
+    }
+
+    let irq_line = enable_pci_device(device, io_base != 0, mmio_base != 0, true);
+    Some(crate::hardware::PciRealtekNetDescriptor {
+        bus: device.bus,
+        device: device.device,
+        function: device.function,
+        vendor_id: device.vendor_id,
+        device_id: device.device_id,
+        irq_line,
+        mmio_base,
+        mmio_size,
+        io_base,
+        is_rtl8139: device.device_id == 0x8139,
+        valid: true,
+    })
+}
+
+fn inspect_hda_device(device: &PciDevice) -> Option<crate::hardware::PciHdaDescriptor> {
+    if !(device.class_code == 0x04 && device.subclass == 0x03) {
+        return None;
+    }
+
+    let mut mmio_base = 0u64;
+    let mut mmio_size = 0u64;
+    for i in 0..device.bar_count {
+        let bar = device.bars[i];
+        if !bar.valid || bar.base == 0 {
+            continue;
+        }
+        if matches!(bar.kind, PciBarKind::Memory32 | PciBarKind::Memory64) {
+            if bar.index == 0 || mmio_base == 0 {
+                mmio_base = bar.base;
+                mmio_size = if bar.size_known && bar.size > 0 {
+                    bar.size
+                } else {
+                    0x4000
+                };
+            }
+        }
+    }
+
+    if mmio_base == 0 {
+        return None;
+    }
+
+    let irq_line = enable_pci_device(device, false, true, true);
+    Some(crate::hardware::PciHdaDescriptor {
+        bus: device.bus,
+        device: device.device,
+        function: device.function,
+        vendor_id: device.vendor_id,
+        device_id: device.device_id,
+        irq_line,
+        mmio_base,
+        mmio_size,
+        valid: true,
+    })
+}
+
+fn inspect_xhci_device(device: &PciDevice) -> Option<crate::hardware::PciXhciDescriptor> {
+    if !(device.class_code == 0x0C
+        && device.subclass == 0x03
+        && device.programming_interface == 0x30)
+    {
+        return None;
+    }
+
+    let mut mmio_base = 0u64;
+    let mut mmio_size = 0u64;
+    for i in 0..device.bar_count {
+        let bar = device.bars[i];
+        if !bar.valid || bar.base == 0 {
+            continue;
+        }
+        if matches!(bar.kind, PciBarKind::Memory32 | PciBarKind::Memory64) {
+            if bar.index == 0 || mmio_base == 0 {
+                mmio_base = bar.base;
+                mmio_size = if bar.size_known && bar.size > 0 {
+                    bar.size
+                } else {
+                    0x10000
+                };
+            }
+        }
+    }
+
+    if mmio_base == 0 {
+        return None;
+    }
+
+    let irq_line = enable_pci_device(device, false, true, true);
+    Some(crate::hardware::PciXhciDescriptor {
+        bus: device.bus,
+        device: device.device,
+        function: device.function,
+        vendor_id: device.vendor_id,
+        device_id: device.device_id,
+        irq_line,
+        mmio_base,
+        mmio_size,
+        valid: true,
+    })
+}
+
+fn inspect_sdhci_device(device: &PciDevice) -> Option<crate::hardware::PciSdhciDescriptor> {
+    if !(device.class_code == 0x08 && device.subclass == 0x05) {
+        return None;
+    }
+
+    let mut bar0_phys = 0u64;
+    let mut bar0_size = 0u64;
+    for i in 0..device.bar_count {
+        let bar = device.bars[i];
+        if !bar.valid || bar.base == 0 {
+            continue;
+        }
+        if matches!(bar.kind, PciBarKind::Memory32 | PciBarKind::Memory64) {
+            if bar.index == 0 || bar0_phys == 0 {
+                bar0_phys = bar.base;
+                bar0_size = if bar.size_known && bar.size > 0 {
+                    bar.size
+                } else {
+                    0x1000
+                };
+            }
+        }
+    }
+
+    if bar0_phys == 0 {
+        return None;
+    }
+
+    let irq_line = enable_pci_device(device, false, true, true);
+    Some(crate::hardware::PciSdhciDescriptor {
+        bus: device.bus,
+        device: device.device,
+        function: device.function,
+        vendor_id: device.vendor_id,
+        device_id: device.device_id,
+        irq_line,
+        bar0_phys,
+        bar0_size,
+        prog_if: device.programming_interface,
+        valid: true,
+    })
+}
+
+fn inspect_display_device(device: &PciDevice) -> Option<crate::hardware::PciDisplayDescriptor> {
+    if device.class_code != 0x03 {
+        return None;
+    }
+
+    let mut lfb_phys = 0u64;
+    let mut lfb_size = 0u64;
+    let mut mmio_phys = 0u64;
+    for i in 0..device.bar_count {
+        let bar = device.bars[i];
+        if !bar.valid || bar.base == 0 {
+            continue;
+        }
+        if matches!(bar.kind, PciBarKind::Memory32 | PciBarKind::Memory64) {
+            let sz = if bar.size_known { bar.size } else { 0 };
+            if bar.index == 0 || sz > lfb_size {
+                if lfb_phys != 0 && mmio_phys == 0 {
+                    mmio_phys = lfb_phys;
+                }
+                lfb_phys = bar.base;
+                lfb_size = sz;
+            } else if mmio_phys == 0 {
+                mmio_phys = bar.base;
+            }
+        }
+    }
+
+    Some(crate::hardware::PciDisplayDescriptor {
+        bus: device.bus,
+        device: device.device,
+        function: device.function,
+        vendor_id: device.vendor_id,
+        device_id: device.device_id,
+        subclass: device.subclass,
+        lfb_phys,
+        lfb_size,
+        mmio_phys,
+        valid: true,
+    })
+}
+
 pub fn scan(console: &mut Console<'_>) -> HardwareDiscovery {
     // Используем заранее выделенную статическую память.
     // Не создаём большой PciInventory на стеке.
@@ -1160,6 +1406,36 @@ for index in 0..inventory.count {
             discovery.nvme = nvme_info;
         }
     }
+
+    if !discovery.realtek_net.valid {
+        if let Some(re_info) = inspect_realtek_net_device(device) {
+            discovery.realtek_net = re_info;
+        }
+    }
+
+    if !discovery.hda.valid {
+        if let Some(hda_info) = inspect_hda_device(device) {
+            discovery.hda = hda_info;
+        }
+    }
+
+    if !discovery.xhci.valid {
+        if let Some(xhci_info) = inspect_xhci_device(device) {
+            discovery.xhci = xhci_info;
+        }
+    }
+
+    if !discovery.sdhci.valid {
+        if let Some(sdhci_info) = inspect_sdhci_device(device) {
+            discovery.sdhci = sdhci_info;
+        }
+    }
+
+    if !discovery.display.valid {
+        if let Some(disp_info) = inspect_display_device(device) {
+            discovery.display = disp_info;
+        }
+    }
 }
 
 console.write("\nIDE Controller Summary:\n", GREEN);
@@ -1239,6 +1515,41 @@ if discovery.nvme.valid {
 } else {
     console.write("  NVMe Controller:   ", GRAY);
     console.write("NOT FOUND\n", YELLOW);
+}
+
+if discovery.realtek_net.valid {
+    console.write("  Realtek Ethernet:  ", GRAY);
+    console.write("DETECTED (dev=", GREEN);
+    write_hex16(console, discovery.realtek_net.device_id);
+    console.write(")\n", GREEN);
+}
+
+if discovery.hda.valid {
+    console.write("  Intel HDA Audio:   ", GRAY);
+    console.write("DETECTED (MMIO ", GREEN);
+    write_hex64(console, discovery.hda.mmio_base);
+    console.write(")\n", GREEN);
+}
+
+if discovery.xhci.valid {
+    console.write("  USB xHCI Host:     ", GRAY);
+    console.write("DETECTED (MMIO ", GREEN);
+    write_hex64(console, discovery.xhci.mmio_base);
+    console.write(")\n", GREEN);
+}
+
+if discovery.sdhci.valid {
+    console.write("  SDHCI Card Reader: ", GRAY);
+    console.write("DETECTED (BAR0 ", GREEN);
+    write_hex64(console, discovery.sdhci.bar0_phys);
+    console.write(")\n", GREEN);
+}
+
+if discovery.display.valid {
+    console.write("  PCI Display GPU:   ", GRAY);
+    console.write("DETECTED (LFB ", GREEN);
+    write_hex64(console, discovery.display.lfb_phys);
+    console.write(")\n", GREEN);
 }
 
 // Build the PCI BAR resource registry.

@@ -120,8 +120,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
         };
 
-    let info = framebuffer.info();
+    let mut info = framebuffer.info();
     let fb_slice = framebuffer.buffer_mut();
+    if (info.width > 1366 || info.height > 800)
+        && info.bytes_per_pixel == 4
+        && fb_slice.len() >= 1280 * 720 * 4
+        && drivers::uefi_gop::try_set_bga_mode(1280, 720, 32)
+    {
+        info.width = 1280;
+        info.height = 720;
+        info.stride = 1280;
+    }
+    let fb_virt = fb_slice.as_ptr() as u64;
+    let fb_size = fb_slice.len();
     serial::register_emergency_fb(
         fb_slice.as_mut_ptr(),
         fb_slice.len(),
@@ -443,6 +454,8 @@ if heap_initialized {
         &discovery,
         shell_mapping.as_ref(),
         &mut frame_allocator,
+        fb_virt,
+        fb_size,
         &info,
     );
     serial::log("boot", "drivers::init_all completed");
@@ -5882,7 +5895,7 @@ fn alloc_error(layout: Layout) -> ! {
     use core::fmt::Write;
     let mut l1 = serial::FixedBuf::<96>::new();
     let mut l2 = serial::FixedBuf::<96>::new();
-    let _ = write!(l1, "size={} align={} free={} maxblk={}", layout.size(), layout.align(), memory::heap::GLOBAL_ALLOCATOR.free_bytes(), memory::heap::GLOBAL_ALLOCATOR.largest_free_block());
+    let _ = write!(l1, "size={} align={}", layout.size(), layout.align());
     let _ = write!(l2, "cpu={}", arch::percpu::current_cpu_id());
     serial::panic_banner("KERNEL ALLOC ERROR", l1.as_str(), l2.as_str());
     halt_forever();

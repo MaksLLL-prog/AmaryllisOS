@@ -3,7 +3,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::Cell;
 
-use crate::drivers::e1000;
+use crate::drivers;
 use crate::graphics::alerts::{self, AlertSeverity, AlertSubsystem};
 use crate::graphics::theme::{self, ACCENT_ERR, ACCENT_MINT, ACCENT_WARN};
 use crate::graphics::widgets::{text_width, Canvas, Rect};
@@ -39,17 +39,18 @@ pub struct NetViewerApp {
 
 impl NetViewerApp {
     pub fn new() -> Self {
-        let net_ok = e1000::is_ready();
+        let net_ok = drivers::net_is_ready();
+        let nic_lbl = drivers::net_driver_label();
         let st = net::NET_STATE.lock();
         let ip = st.ip;
         drop(st);
 
         let init_status = if !net_ok {
-            String::from("Intel e1000 inactive — boot QEMU with -netdev user,id=n0 -device e1000,netdev=n0")
+            String::from("No NIC active — boot QEMU with -device e1000 or -device rtl8139")
         } else if ip == [0, 0, 0, 0] {
-            String::from("e1000 Link UP — press DHCP or Go to acquire IP and fetch HTTP")
+            format!("{} Link UP — press DHCP or Go to acquire IP and fetch HTTP", nic_lbl)
         } else {
-            format!("Ready — IP {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+            format!("{} Ready — IP {}.{}.{}.{}", nic_lbl, ip[0], ip[1], ip[2], ip[3])
         };
 
         let mut app = Self {
@@ -74,7 +75,7 @@ impl NetViewerApp {
         self.rendered_lines.push(String::from("Amaryllis Net / HTTP Viewer"));
         self.rendered_lines.push(String::from("------------------------------------------------"));
         self.rendered_lines.push(String::from("1. Edit URL above (type directly and press Enter or click Go)."));
-        self.rendered_lines.push(String::from("2. Click DHCP to configure IPv4 via Intel 82540EM (e1000)."));
+        self.rendered_lines.push(String::from("2. Click DHCP to configure IPv4 via active Ethernet NIC."));
         self.rendered_lines.push(String::from("3. Click Ping GW to test ICMP Echo latency to gateway."));
         self.rendered_lines.push(String::from("4. Toggle Text / Raw to inspect HTTP headers & HTML output."));
         self.raw_lines = self.rendered_lines.clone();
@@ -189,8 +190,8 @@ impl NetViewerApp {
     }
 
     pub fn run_dhcp(&mut self) {
-        if !e1000::is_ready() {
-            self.status_line = String::from("e1000 controller is not ready");
+        if !drivers::net_is_ready() {
+            self.status_line = String::from("Network controller is not ready");
             return;
         }
         if self.pending_job.is_some() {
@@ -204,8 +205,8 @@ impl NetViewerApp {
     }
 
     pub fn run_ping_gateway(&mut self) {
-        if !e1000::is_ready() {
-            self.status_line = String::from("e1000 controller is not ready");
+        if !drivers::net_is_ready() {
+            self.status_line = String::from("Network controller is not ready");
             return;
         }
         if self.pending_job.is_some() {
@@ -233,8 +234,8 @@ impl NetViewerApp {
     }
 
     pub fn fetch_url(&mut self) {
-        if !e1000::is_ready() {
-            self.status_line = String::from("Intel e1000 is not ready");
+        if !drivers::net_is_ready() {
+            self.status_line = String::from("Network interface is not ready");
             return;
         }
         if self.pending_job.is_some() {
@@ -458,7 +459,7 @@ impl NetViewerApp {
         let ip = st.ip;
         let gw = st.gateway;
         drop(st);
-        let nic = e1000::stats();
+        let nic = drivers::net_stats();
         let link_str = format!(
             "{}  IP {}.{}.{}.{}  GW {}.{}.{}.{}  TX/RX {}/{}",
             if nic.link_up { "UP" } else { "DOWN" },

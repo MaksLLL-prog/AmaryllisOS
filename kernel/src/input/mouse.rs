@@ -373,6 +373,19 @@ fn push_packet(pkt: MousePacket) {
     PKT_HEAD.store(next, Ordering::Release);
 }
 
+/// Injects a decoded USB HID Boot Mouse report directly into the desktop/input queues.
+pub fn push_usb_packet(dx: i16, dy: i16, wheel: i8, buttons: u8) {
+    if wheel != 0 {
+        push_wheel(wheel);
+    }
+    push_packet(MousePacket {
+        dx,
+        dy,
+        wheel,
+        buttons: buttons & 0x07,
+    });
+}
+
 #[inline]
 fn process_aux_byte(byte: u8) {
     if INITIALIZED.load(Ordering::Acquire) == 0 {

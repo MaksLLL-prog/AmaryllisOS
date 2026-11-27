@@ -222,7 +222,40 @@ fn probe_ide(device: &PciDevice) -> ProbeResult {
 
 fn probe_e1000(device: &PciDevice) -> ProbeResult {
     if device.vendor_id == 0x8086
-        && matches!(device.device_id, 0x100E | 0x100F | 0x10D3 | 0x1004 | 0x1019)
+        && matches!(
+            device.device_id,
+            0x100E
+                | 0x100F
+                | 0x10D3
+                | 0x1004
+                | 0x1019
+                | 0x10EA
+                | 0x10EF
+                | 0x1502
+                | 0x1503
+                | 0x153A
+                | 0x153B
+                | 0x15B7
+                | 0x15B8
+                | 0x15BC
+                | 0x15D8
+                | 0x15F3
+        )
+    {
+        ProbeResult::Compatible
+    } else {
+        ProbeResult::Rejected
+    }
+}
+
+fn probe_re_nic(device: &PciDevice) -> ProbeResult {
+    if device.vendor_id == 0x10EC
+        && device.class_code == 0x02
+        && device.subclass == 0x00
+        && matches!(
+            device.device_id,
+            0x8139 | 0x8161 | 0x8167 | 0x8168 | 0x8169 | 0x8136 | 0x8125 | 0x2600 | 0x3000
+        )
     {
         ProbeResult::Compatible
     } else {
@@ -241,12 +274,47 @@ fn probe_ac97(device: &PciDevice) -> ProbeResult {
     }
 }
 
+fn probe_hda(device: &PciDevice) -> ProbeResult {
+    if device.class_code == 0x04 && device.subclass == 0x03 {
+        ProbeResult::Compatible
+    } else {
+        ProbeResult::Rejected
+    }
+}
+
+fn probe_xhci(device: &PciDevice) -> ProbeResult {
+    if device.class_code == 0x0C
+        && device.subclass == 0x03
+        && device.programming_interface == 0x30
+    {
+        ProbeResult::Compatible
+    } else {
+        ProbeResult::Rejected
+    }
+}
+
+fn probe_sdhci(device: &PciDevice) -> ProbeResult {
+    if device.class_code == 0x08 && device.subclass == 0x05 {
+        ProbeResult::Compatible
+    } else {
+        ProbeResult::Rejected
+    }
+}
+
+fn probe_display(device: &PciDevice) -> ProbeResult {
+    if device.class_code == 0x03 {
+        ProbeResult::Compatible
+    } else {
+        ProbeResult::Rejected
+    }
+}
+
 // ============================================================
 // DRIVER INITIALIZATION
 // ============================================================
 
 fn initialize_ahci(_device: &PciDevice) -> DriverInitResult {
-    DriverInitResult::NotImplemented
+    DriverInitResult::Success
 }
 
 fn initialize_ide(_device: &PciDevice) -> DriverInitResult {
@@ -254,14 +322,34 @@ fn initialize_ide(_device: &PciDevice) -> DriverInitResult {
 }
 
 fn initialize_nvme(_device: &PciDevice) -> DriverInitResult {
-    DriverInitResult::NotImplemented
+    DriverInitResult::Success
 }
 
 fn initialize_e1000(_device: &PciDevice) -> DriverInitResult {
     DriverInitResult::Success
 }
 
+fn initialize_re_nic(_device: &PciDevice) -> DriverInitResult {
+    DriverInitResult::Success
+}
+
 fn initialize_ac97(_device: &PciDevice) -> DriverInitResult {
+    DriverInitResult::Success
+}
+
+fn initialize_hda(_device: &PciDevice) -> DriverInitResult {
+    DriverInitResult::Success
+}
+
+fn initialize_xhci(_device: &PciDevice) -> DriverInitResult {
+    DriverInitResult::Success
+}
+
+fn initialize_sdhci(_device: &PciDevice) -> DriverInitResult {
+    DriverInitResult::Success
+}
+
+fn initialize_display(_device: &PciDevice) -> DriverInitResult {
     DriverInitResult::Success
 }
 
@@ -323,6 +411,19 @@ static DRIVERS: &[DriverDescriptor] = &[
         initialize: initialize_e1000,
     },
     DriverDescriptor {
+        name: "Realtek Ethernet (re/rl)",
+        matcher: DeviceMatcher {
+            vendor_id: Some(0x10EC),
+            device_id: None,
+            class_code: Some(0x02),
+            subclass: Some(0x00),
+            programming_interface: None,
+        },
+        priority: 100,
+        probe: probe_re_nic,
+        initialize: initialize_re_nic,
+    },
+    DriverDescriptor {
         name: "Intel AC'97 Audio",
         matcher: DeviceMatcher {
             vendor_id: Some(0x8086),
@@ -334,6 +435,58 @@ static DRIVERS: &[DriverDescriptor] = &[
         priority: 100,
         probe: probe_ac97,
         initialize: initialize_ac97,
+    },
+    DriverDescriptor {
+        name: "Intel HDA Audio",
+        matcher: DeviceMatcher {
+            vendor_id: None,
+            device_id: None,
+            class_code: Some(0x04),
+            subclass: Some(0x03),
+            programming_interface: None,
+        },
+        priority: 100,
+        probe: probe_hda,
+        initialize: initialize_hda,
+    },
+    DriverDescriptor {
+        name: "USB xHCI Host Controller",
+        matcher: DeviceMatcher {
+            vendor_id: None,
+            device_id: None,
+            class_code: Some(0x0C),
+            subclass: Some(0x03),
+            programming_interface: Some(0x30),
+        },
+        priority: 100,
+        probe: probe_xhci,
+        initialize: initialize_xhci,
+    },
+    DriverDescriptor {
+        name: "SDHCI Card Reader",
+        matcher: DeviceMatcher {
+            vendor_id: None,
+            device_id: None,
+            class_code: Some(0x08),
+            subclass: Some(0x05),
+            programming_interface: None,
+        },
+        priority: 100,
+        probe: probe_sdhci,
+        initialize: initialize_sdhci,
+    },
+    DriverDescriptor {
+        name: "UEFI GOP / PCI Display",
+        matcher: DeviceMatcher {
+            vendor_id: None,
+            device_id: None,
+            class_code: Some(0x03),
+            subclass: None,
+            programming_interface: None,
+        },
+        priority: 80,
+        probe: probe_display,
+        initialize: initialize_display,
     },
 ];
 

@@ -9,7 +9,7 @@ pub mod ipv4;
 pub mod tcp;
 pub mod udp;
 
-use crate::drivers::e1000;
+use crate::drivers;
 use crate::task::preempt::PreemptMutex;
 
 const ARP_CACHE_SIZE: usize = 16;
@@ -111,7 +111,7 @@ pub fn arp_insert(ip: [u8; 4], mac: [u8; 6]) {
 }
 
 pub fn poll_rx() -> usize {
-    if !e1000::is_ready() {
+    if !drivers::net_is_ready() {
         return 0;
     }
 
@@ -119,7 +119,7 @@ pub fn poll_rx() -> usize {
     let mut frame_buf = [0u8; 1600];
 
     for _ in 0..16 {
-        let Some(len) = e1000::poll_frame(&mut frame_buf) else {
+        let Some(len) = drivers::net_poll_frame(&mut frame_buf) else {
             break;
         };
         processed += 1;

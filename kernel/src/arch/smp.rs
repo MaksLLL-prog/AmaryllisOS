@@ -18,8 +18,8 @@ use super::percpu::{self, MAX_SMP_CPUS};
 
 const TRAMPOLINE_PHYS: u64 = 0x8000;
 const TRAMPOLINE_SIPI_VEC: u8 = 0x08;
-const AP_BOOT_STACK_SIZE: usize = 32 * 1024;
-const AP_SYSCALL_STACK_SIZE: usize = 16 * 1024;
+const AP_BOOT_STACK_SIZE: usize = 64 * 1024;
+const AP_SYSCALL_STACK_SIZE: usize = 128 * 1024;
 
 // Mailbox offsets inside the 4 KiB page at 0x8000:
 // 0x8F00: GDT pointer (6B)

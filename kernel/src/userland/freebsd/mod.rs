@@ -290,17 +290,6 @@ pub fn dispatch_freebsd_syscall(
         }
 
         SYS_FBSD_WRITE => {
-            if arg1 == 1 && arg3 > 0 && arg3 <= 256 {
-                if let Some(m) = mapping_opt {
-                    let mut tmp = [0u8; 256];
-                    let n = (arg3 as usize).min(256);
-                    if copy_from_user_bytes_in(m, None, user_pml4, arg2, &mut tmp[..n]).is_ok() {
-                        if let Ok(txt) = core::str::from_utf8(&tmp[..n]) {
-                            crate::serial::write_str(txt);
-                        }
-                    }
-                }
-            }
             syscall::handle_sys_write(user_pml4, arg1, arg2, arg3, console_opt, mapping_opt, allocator_opt)
         }
 

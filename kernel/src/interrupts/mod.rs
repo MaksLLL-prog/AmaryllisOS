@@ -331,6 +331,9 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    unsafe {
+        ensure_kernel_segments();
+    }
     let cr2 = Cr2::read_raw();
     let from_ring3 = (stack_frame.code_segment.0 & 3) == 3;
 

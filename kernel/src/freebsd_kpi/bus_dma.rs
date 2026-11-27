@@ -111,7 +111,7 @@ pub fn bus_dma_tag_create(
         maxsegsz: maxsegsz.max(1),
     };
     let mut reg = DMA_TAG_REGISTRY.lock();
-    if reg.len() < 32 {
+    if reg.len() < 64 {
         reg.push(DmaTagSnapshot {
             name: tag.name,
             alignment: tag.alignment,

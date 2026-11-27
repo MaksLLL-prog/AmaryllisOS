@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 
 use crate::audio::mixer::{self, BuiltinTrack};
-use crate::drivers::ac97;
+use crate::drivers;
 use crate::graphics::theme::{self, ACCENT_ERR, ACCENT_MINT, ACCENT_WARN};
 use crate::graphics::widgets::{text_width, Canvas, Rect};
 use crate::input::{KeyCode, KeyEvent};
@@ -269,7 +269,7 @@ impl AudioPlayerApp {
         canvas.fill_rect(area, pal.win_bg_active);
 
         let snap = mixer::snapshot();
-        let hw_ok = ac97::is_ready();
+        let hw_ok = drivers::audio_is_ready();
 
         // Hero Now-Playing card
         let hero = Rect::new(area.x + 14, area.y + 10, area.w - 28, 130);

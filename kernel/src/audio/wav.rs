@@ -1,4 +1,4 @@
-use crate::drivers::ac97::{self, AC97_DRIVER};
+use crate::drivers;
 use crate::input;
 use crate::storage::vfs::{self, VfsError};
 
@@ -25,7 +25,7 @@ impl WavError {
     pub const fn message(self) -> &'static str {
         match self {
             Self::Vfs(err) => err.message(),
-            Self::NotAudioReady => "Intel AC'97 audio controller is not initialized",
+            Self::NotAudioReady => "Audio controller (AC'97 / Intel HDA) is not initialized",
             Self::InvalidHeader => "Invalid RIFF/WAVE file header",
             Self::UnsupportedFormat => "Only uncompressed PCM (8/16-bit, mono/stereo) WAV is supported",
         }
@@ -124,15 +124,12 @@ pub fn inspect_wav(path: &str) -> Result<WavInfo, WavError> {
 }
 
 pub fn play_wav_file(path: &str) -> Result<(WavInfo, bool), WavError> {
-    if !ac97::is_ready() {
+    if !drivers::audio_is_ready() {
         return Err(WavError::NotAudioReady);
     }
 
     let info = inspect_wav(path)?;
-    let actual_rate = {
-        let mut dev = AC97_DRIVER.lock();
-        dev.begin_playback(info.sample_rate)
-    };
+    let actual_rate = drivers::audio_begin_playback(info.sample_rate);
 
     let bytes_per_frame = (info.channels as usize) * (info.bits_per_sample as usize / 8);
     let mut file_pos = info.data_offset;
@@ -188,7 +185,7 @@ pub fn play_wav_file(path: &str) -> Result<(WavInfo, bool), WavError> {
                 pcm_out[out_len + 1] = r;
                 out_len += 2;
                 if out_len >= pcm_out.len() {
-                    let _ = AC97_DRIVER.lock().queue_pcm_s16le(&pcm_out[..out_len]);
+                    let _ = drivers::audio_queue_pcm_s16le(&pcm_out[..out_len]);
                     out_len = 0;
                 }
             } else {
@@ -201,7 +198,7 @@ pub fn play_wav_file(path: &str) -> Result<(WavInfo, bool), WavError> {
                     pcm_out[out_len + 1] = or as i16;
                     out_len += 2;
                     if out_len >= pcm_out.len() {
-                        let _ = AC97_DRIVER.lock().queue_pcm_s16le(&pcm_out[..out_len]);
+                        let _ = drivers::audio_queue_pcm_s16le(&pcm_out[..out_len]);
                         out_len = 0;
                     }
                     frac_q16 += ratio_q16;
@@ -214,14 +211,13 @@ pub fn play_wav_file(path: &str) -> Result<(WavInfo, bool), WavError> {
     }
 
     if !cancelled && out_len > 0 {
-        let _ = AC97_DRIVER.lock().queue_pcm_s16le(&pcm_out[..out_len]);
+        let _ = drivers::audio_queue_pcm_s16le(&pcm_out[..out_len]);
     }
 
     if cancelled {
-        use crate::drivers::registry::AudioDevice;
-        AC97_DRIVER.lock().stop();
+        drivers::audio_stop();
     } else {
-        AC97_DRIVER.lock().finish_playback();
+        drivers::audio_finish_playback();
     }
 
     Ok((info, cancelled))

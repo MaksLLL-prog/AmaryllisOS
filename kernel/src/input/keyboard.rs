@@ -42,6 +42,144 @@ pub(super) fn push_scancode_from_hw(scancode: u8) {
     }
 }
 
+/// Public entry point for USB HID keyboard drivers to inject PS/2 Set 1 scancodes.
+pub fn push_scancode(scancode: u8) {
+    push_scancode_from_hw(scancode);
+}
+
+static USB_PREV_MODIFIERS: AtomicU8 = AtomicU8::new(0);
+static USB_PREV_KEYS: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+
+fn hid_usage_to_set1(usage: u8) -> Option<(bool, u8)> {
+    let pair = match usage {
+        0x04 => (false, 0x1E), // A
+        0x05 => (false, 0x30), // B
+        0x06 => (false, 0x2E), // C
+        0x07 => (false, 0x20), // D
+        0x08 => (false, 0x12), // E
+        0x09 => (false, 0x21), // F
+        0x0A => (false, 0x22), // G
+        0x0B => (false, 0x23), // H
+        0x0C => (false, 0x17), // I
+        0x0D => (false, 0x24), // J
+        0x0E => (false, 0x25), // K
+        0x0F => (false, 0x26), // L
+        0x10 => (false, 0x32), // M
+        0x11 => (false, 0x31), // N
+        0x12 => (false, 0x18), // O
+        0x13 => (false, 0x19), // P
+        0x14 => (false, 0x10), // Q
+        0x15 => (false, 0x13), // R
+        0x16 => (false, 0x1F), // S
+        0x17 => (false, 0x14), // T
+        0x18 => (false, 0x16), // U
+        0x19 => (false, 0x2F), // V
+        0x1A => (false, 0x11), // W
+        0x1B => (false, 0x2D), // X
+        0x1C => (false, 0x15), // Y
+        0x1D => (false, 0x2C), // Z
+        0x1E => (false, 0x02), // 1
+        0x1F => (false, 0x03), // 2
+        0x20 => (false, 0x04), // 3
+        0x21 => (false, 0x05), // 4
+        0x22 => (false, 0x06), // 5
+        0x23 => (false, 0x07), // 6
+        0x24 => (false, 0x08), // 7
+        0x25 => (false, 0x09), // 8
+        0x26 => (false, 0x0A), // 9
+        0x27 => (false, 0x0B), // 0
+        0x28 => (false, 0x1C), // Enter
+        0x29 => (false, 0x01), // Escape
+        0x2A => (false, 0x0E), // Backspace
+        0x2B => (false, 0x0F), // Tab
+        0x2C => (false, 0x39), // Space
+        0x2D => (false, 0x0C), // -
+        0x2E => (false, 0x0D), // =
+        0x2F => (false, 0x1A), // [
+        0x30 => (false, 0x1B), // ]
+        0x31 => (false, 0x2B), // backslash
+        0x33 => (false, 0x27), // ;
+        0x34 => (false, 0x28), // '
+        0x35 => (false, 0x29), // `
+        0x36 => (false, 0x33), // ,
+        0x37 => (false, 0x34), // .
+        0x38 => (false, 0x35), // /
+        0x3A => (false, 0x3B), // F1
+        0x3B => (false, 0x3C), // F2
+        0x3C => (false, 0x3D), // F3
+        0x3D => (false, 0x3E), // F4
+        0x3E => (false, 0x3F), // F5
+        0x4A => (true, 0x47),  // Home
+        0x4B => (true, 0x49),  // PageUp
+        0x4C => (true, 0x53),  // Delete
+        0x4D => (true, 0x4F),  // End
+        0x4E => (true, 0x51),  // PageDown
+        0x4F => (true, 0x4D),  // Right
+        0x50 => (true, 0x4B),  // Left
+        0x51 => (true, 0x50),  // Down
+        0x52 => (true, 0x48),  // Up
+        0x58 => (true, 0x1C),  // KP Enter
+        _ => return None,
+    };
+    Some(pair)
+}
+
+#[inline]
+fn emit_set1(ext: bool, code: u8, released: bool) {
+    if ext {
+        push_scancode_from_hw(0xE0);
+    }
+    push_scancode_from_hw(if released { code | 0x80 } else { code });
+}
+
+/// Decodes a standard 8-byte USB HID Boot Keyboard report into PS/2 Set 1 make/break events.
+pub fn push_hid_key_report(modifiers: u8, keys: &[u8; 6]) {
+    let prev_mod = USB_PREV_MODIFIERS.swap(modifiers, Ordering::AcqRel);
+    let mod_map: [(u8, bool, u8); 8] = [
+        (0, false, 0x1D), // LCtrl
+        (1, false, 0x2A), // LShift
+        (2, false, 0x38), // LAlt
+        (3, true, 0x5B),  // LGui/Super
+        (4, true, 0x1D),  // RCtrl
+        (5, false, 0x36), // RShift
+        (6, true, 0x38),  // RAlt
+        (7, true, 0x5C),  // RGui/Super
+    ];
+    for &(bit, ext, sc) in &mod_map {
+        let was = (prev_mod & (1 << bit)) != 0;
+        let now = (modifiers & (1 << bit)) != 0;
+        if was != now {
+            emit_set1(ext, sc, !now);
+        }
+    }
+
+    let mut prev = [0u8; 6];
+    for i in 0..6 {
+        prev[i] = USB_PREV_KEYS[i].load(Ordering::Acquire);
+    }
+
+    // Break scancodes for released keys
+    for &old_k in &prev {
+        if old_k > 3 && !keys.contains(&old_k) {
+            if let Some((ext, sc)) = hid_usage_to_set1(old_k) {
+                emit_set1(ext, sc, true);
+            }
+        }
+    }
+    // Make scancodes for newly pressed keys
+    for &new_k in keys {
+        if new_k > 3 && !prev.contains(&new_k) {
+            if let Some((ext, sc)) = hid_usage_to_set1(new_k) {
+                emit_set1(ext, sc, false);
+            }
+        }
+    }
+
+    for i in 0..6 {
+        USB_PREV_KEYS[i].store(keys[i], Ordering::Release);
+    }
+}
+
 // Called from the keyboard interrupt handler.
 pub fn handle_interrupt() {
     let status = unsafe { inb(STATUS_PORT) };

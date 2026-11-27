@@ -73,8 +73,8 @@ pub fn http_get(
     url: &str,
     on_chunk: &mut dyn FnMut(&[u8]),
 ) -> Result<([u8; 4], usize), &'static str> {
-    if !crate::drivers::e1000::is_ready() {
-        return Err("Network interface e1000 is not initialized");
+    if !crate::drivers::net_is_ready() {
+        return Err("No active network interface initialized");
     }
     if net::NET_STATE.lock().ip == [0, 0, 0, 0] {
         return Err("No IP address assigned (run 'dhcp' first)");

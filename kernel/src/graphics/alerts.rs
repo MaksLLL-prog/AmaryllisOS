@@ -56,8 +56,8 @@ impl AlertSubsystem {
             Self::CpuRing3 => "Userland / CPU",
             Self::Memory => "PMM / Virtual Mem",
             Self::StorageVfs => "FAT32 / VFS",
-            Self::Network => "Intel e1000 Net",
-            Self::Audio => "Intel AC'97 Audio",
+            Self::Network => "Network Driver",
+            Self::Audio => "Audio Driver",
             Self::ElfLoader => "ELF64 Loader",
             Self::Desktop => "Amaryllis WM",
         }

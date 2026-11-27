@@ -1022,7 +1022,7 @@ pub fn build_freebsd_demo_elf() -> Vec<u8> {
     };
 
     // Save FreeBSD initial stack pointer (rdi) into r15
-    b.emit(&[0x49, 0x89, 0xE7]); // mov r15, rsp
+    b.emit(&[0x49, 0x89, 0xFF]); // mov r15, rdi
 
     emit_fbsd_write_lit(&mut b, b"[freebsd_demo] ELFOSABI_FREEBSD (9) started, argc=");
     b.emit(&[0x49, 0x8B, 0x07]); // mov rax, [r15]
@@ -1162,7 +1162,6 @@ pub fn build_freebsd_demo_elf() -> Vec<u8> {
 
     // Parent path: r13 = child_pid
     b.emit(&[0x49, 0x89, 0xC5]); // mov r13, rax
-    emit_fbsd_write_lit(&mut b, b"[freebsd_demo parent] fork() returned child_pid\n");
     b.emit(&[0x4C, 0x89, 0x2C, 0x24]); // mov [rsp], r13 (ident = child_pid)
     b.emit(&[0x66, 0xC7, 0x44, 0x24, 8, 0xFB, 0xFF]); // filter = -5 (EVFILT_PROC)
     b.emit(&[0x66, 0xC7, 0x44, 0x24, 10, 0x11, 0x00]); // flags = EV_ADD | EV_ONESHOT
@@ -1211,7 +1210,6 @@ pub fn build_freebsd_demo_elf() -> Vec<u8> {
     b.emit_mov_edx(0);
     b.emit_syscall();
 
-    b.emit(&[0x49, 0xC7, 0x47, 64, 0, 0, 0, 0]); // mov qword ptr [r15 + 64], 0
     b.emit_mov_eax(20); // SYS_FBSD_GETPID
     b.emit_syscall();
     b.emit(&[0x48, 0x89, 0xC7]); // rdi = pid
@@ -1219,8 +1217,12 @@ pub fn build_freebsd_demo_elf() -> Vec<u8> {
     b.emit_mov_eax(37); // SYS_FBSD_KILL
     b.emit_syscall();
 
-    // After return from SIGUSR1 handler via USER_SIGTRAMP_ADDR -> sigreturn(417), check [r15 + 64] == 1
-    b.emit(&[0x49, 0x83, 0x7F, 64, 1]); // cmp qword ptr [r15 + 64], 1
+    // After return from SIGUSR1 handler via USER_SIGTRAMP_ADDR -> sigreturn(417), check [sig_flag] == 1
+    b.emit(&[0x48, 0x8D, 0x05]); // lea rax, [rip + disp32]
+    let f_disp_chk = b.code.len();
+    b.emit(&[0, 0, 0, 0]);
+    b.lea_patches.push((f_disp_chk, sig_flag_off));
+    b.emit(&[0x48, 0x83, 0x38, 1]); // cmp qword ptr [rax], 1
     let je_sig = b.code.len();
     b.emit(&[0x0F, 0x84, 0, 0, 0, 0]);
     emit_fbsd_write_lit(&mut b, b"[freebsd_demo] FAIL: SIGUSR1 handler did not run!\n");
@@ -1249,10 +1251,14 @@ pub fn build_freebsd_demo_elf() -> Vec<u8> {
     b.emit(&[0x48, 0x83, 0xC4, 80]);
     emit_fbsd_exit(&mut b, 77);
 
-    // SIGUSR1 handler function: sets [r15 + 64] = 1 and returns (via USER_SIGTRAMP_ADDR)
+    // SIGUSR1 handler function: sets sig_flag = 1 and returns (via USER_SIGTRAMP_ADDR)
     let handler_lbl = b.code.len();
     b.code_lea_patches.push((h_disp, handler_lbl));
-    b.emit(&[0x49, 0xC7, 0x47, 64, 1, 0, 0, 0]); // mov qword ptr [r15 + 64], 1
+    b.emit(&[0x48, 0x8D, 0x05]); // lea rax, [rip + disp32]
+    let f_disp_set = b.code.len();
+    b.emit(&[0, 0, 0, 0]);
+    b.lea_patches.push((f_disp_set, sig_flag_off));
+    b.emit(&[0x48, 0xC7, 0x00, 1, 0, 0, 0]); // mov qword ptr [rax], 1
     b.emit(&[0xC3]); // ret -> USER_SIGTRAMP_ADDR -> SYS_FBSD_SIGRETURN(417)
 
     b.build()

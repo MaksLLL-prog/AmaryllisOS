@@ -11,13 +11,14 @@ use crate::klog::{self, KLogLevel};
 use crate::task::kthread;
 use crate::task::preempt::PreemptMutex;
 
-pub const MAX_IOREG_NODES: usize = 32;
+pub const MAX_IOREG_NODES: usize = 64;
 pub const MAX_HANDLERS_PER_VECTOR: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IOServiceClass {
     IOPlatformExpert,
     IOACPIPlatformDevice,
+    IOACPIPowerDevice,
     IOAPICController,
     IOPCIDevice,
     IOEthernetController,
@@ -25,6 +26,8 @@ pub enum IOServiceClass {
     IOAudioDevice,
     IOHIDDevice,
     IOGraphicsDevice,
+    IOUSBHostController,
+    IOSDHCIController,
     IOInterruptEventSource,
     IOWorkLoop,
 }
@@ -34,6 +37,7 @@ impl IOServiceClass {
         match self {
             Self::IOPlatformExpert => "IOPlatformExpert",
             Self::IOACPIPlatformDevice => "IOACPIPlatformDevice",
+            Self::IOACPIPowerDevice => "IOACPIPowerDevice",
             Self::IOAPICController => "IOAPICController",
             Self::IOPCIDevice => "IOPCIDevice",
             Self::IOEthernetController => "IOEthernetController",
@@ -41,6 +45,8 @@ impl IOServiceClass {
             Self::IOAudioDevice => "IOAudioDevice",
             Self::IOHIDDevice => "IOHIDDevice",
             Self::IOGraphicsDevice => "IOGraphicsDevice",
+            Self::IOUSBHostController => "IOUSBHostController",
+            Self::IOSDHCIController => "IOSDHCIController",
             Self::IOInterruptEventSource => "IOInterruptEventSource",
             Self::IOWorkLoop => "IOWorkLoop",
         }
@@ -422,6 +428,34 @@ pub fn init_io_services(discovery: &HardwareDiscovery) {
         None
     };
 
+    let re_snap = crate::drivers::re_nic::stats();
+    let re_route = if re_snap.initialized {
+        re_snap.irq_gsi.zip(re_snap.irq_vector)
+    } else {
+        None
+    };
+
+    let hda_snap = crate::drivers::hda::stats();
+    let hda_route = if hda_snap.initialized {
+        hda_snap.irq_gsi.zip(hda_snap.irq_vector)
+    } else {
+        None
+    };
+
+    let xhci_snap = crate::drivers::usb::snapshot();
+    let xhci_route = if xhci_snap.initialized {
+        xhci_snap.irq_gsi.zip(xhci_snap.irq_vector)
+    } else {
+        None
+    };
+
+    let sd_snap = crate::drivers::sdhci::snapshot();
+    let sd_route = if sd_snap.initialized {
+        sd_snap.irq_gsi.zip(sd_snap.irq_vector)
+    } else {
+        None
+    };
+
     let nvme_snap = crate::drivers::nvme::snapshot();
     let nvme_route = if nvme_snap.initialized {
         nvme_snap.irq_gsi.zip(nvme_snap.irq_vector)
@@ -500,15 +534,23 @@ pub fn init_io_services(discovery: &HardwareDiscovery) {
                 IOServiceClass::IOHIDDevice
             }
             registry::DeviceClass::Framebuffer => IOServiceClass::IOGraphicsDevice,
+            registry::DeviceClass::Usb => IOServiceClass::IOUSBHostController,
+            registry::DeviceClass::CardReader => IOServiceClass::IOSDHCIController,
+            registry::DeviceClass::Power => IOServiceClass::IOACPIPowerDevice,
             registry::DeviceClass::Timer | registry::DeviceClass::Controller => continue,
         };
 
         let (route, workloop) = match dev.name {
             "Intel e1000" => (net_route, "knet_worker"),
+            "Realtek Ethernet" => (re_route, "knet_worker"),
             "Intel AC'97" => (audio_route, "kiokit_audio"),
+            "Intel HDA" => (hda_route, "kiokit_audio"),
             "VirtIO-Blk" => (virtio_route, "kiokit_blk"),
             "AHCI SATA" => (ahci_route, "kiokit_blk"),
             "NVMe" => (nvme_route, "kiokit_blk"),
+            "USB Mass Storage" => (xhci_route, "kiokit_blk"),
+            "SDHCI Card Reader" => (sd_route, "kiokit_blk"),
+            "USB xHCI" => (xhci_route, ""),
             _ => (None, ""),
         };
 

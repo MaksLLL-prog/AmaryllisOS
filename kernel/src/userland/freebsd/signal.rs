@@ -23,7 +23,7 @@ pub const SIG_UNBLOCK: i32 = 2;
 pub const SIG_SETMASK: i32 = 3;
 
 /// Read+Exec user trampoline page mapped lazily on caught signals so NX user stacks work cleanly.
-pub const USER_SIGTRAMP_ADDR: u64 = 0x0000_007F_FFF0_0000;
+pub const USER_SIGTRAMP_ADDR: u64 = 0x0000_007F_0000_0000;
 
 /// Machine code placed at `USER_SIGTRAMP_ADDR`:
 ///   mov rdi, rsp        ; 48 89 E7 (ucontext frame sits at top of signal handler stack)

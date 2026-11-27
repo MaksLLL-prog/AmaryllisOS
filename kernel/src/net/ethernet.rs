@@ -1,4 +1,4 @@
-use crate::drivers::e1000;
+use crate::drivers;
 
 pub const ETH_HEADER_LEN: usize = 14;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -47,5 +47,5 @@ pub fn send(
     frame[ETH_HEADER_LEN..ETH_HEADER_LEN + payload.len()].copy_from_slice(payload);
 
     let total_len = (ETH_HEADER_LEN + payload.len()).max(60);
-    e1000::send_frame(&frame[..total_len])
+    drivers::net_send_frame(&frame[..total_len])
 }

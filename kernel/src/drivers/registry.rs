@@ -2,7 +2,7 @@ use core::fmt;
 
 use crate::task::preempt::PreemptMutex;
 
-pub const MAX_DRIVERS: usize = 32;
+pub const MAX_DRIVERS: usize = 48;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DeviceClass {
@@ -14,6 +14,9 @@ pub enum DeviceClass {
     Network,
     Audio,
     Controller,
+    Usb,
+    CardReader,
+    Power,
 }
 
 impl DeviceClass {
@@ -27,6 +30,9 @@ impl DeviceClass {
             Self::Network => "NETWORK",
             Self::Audio => "AUDIO",
             Self::Controller => "CTRL",
+            Self::Usb => "USB",
+            Self::CardReader => "CARD",
+            Self::Power => "POWER",
         }
     }
 }

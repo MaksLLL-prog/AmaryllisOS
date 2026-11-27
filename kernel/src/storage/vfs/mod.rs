@@ -5,6 +5,8 @@ use crate::task::preempt::PreemptMutex;
 
 use crate::drivers::ahci::{self, AhciBlockDevice};
 use crate::drivers::nvme::{self, NvmeBlockDevice};
+use crate::drivers::sdhci::{self, SdhciBlockDevice};
+use crate::drivers::usb::{self, UsbMassBlockDevice};
 use crate::drivers::virtio_blk::{self, VirtioBlockDevice};
 use crate::storage::block::{BlockDevice, BlockDeviceError};
 use crate::storage::cache::{CacheBackendKind, CachedBlockDevice};
@@ -16,6 +18,8 @@ pub enum SystemBlockDevice {
     Virtio(VirtioBlockDevice),
     Ahci(AhciBlockDevice),
     Nvme(NvmeBlockDevice),
+    Usb(UsbMassBlockDevice),
+    Sdhci(SdhciBlockDevice),
     Ide(IdeBlockDevice),
 }
 
@@ -25,6 +29,8 @@ impl BlockDevice for SystemBlockDevice {
             Self::Virtio(d) => d.sector_size(),
             Self::Ahci(d) => d.sector_size(),
             Self::Nvme(d) => d.sector_size(),
+            Self::Usb(d) => d.sector_size(),
+            Self::Sdhci(d) => d.sector_size(),
             Self::Ide(d) => d.sector_size(),
         }
     }
@@ -34,6 +40,8 @@ impl BlockDevice for SystemBlockDevice {
             Self::Virtio(d) => d.sector_count(),
             Self::Ahci(d) => d.sector_count(),
             Self::Nvme(d) => d.sector_count(),
+            Self::Usb(d) => d.sector_count(),
+            Self::Sdhci(d) => d.sector_count(),
             Self::Ide(d) => d.sector_count(),
         }
     }
@@ -43,6 +51,8 @@ impl BlockDevice for SystemBlockDevice {
             Self::Virtio(d) => d.max_transfer_sectors(),
             Self::Ahci(d) => d.max_transfer_sectors(),
             Self::Nvme(d) => d.max_transfer_sectors(),
+            Self::Usb(d) => d.max_transfer_sectors(),
+            Self::Sdhci(d) => d.max_transfer_sectors(),
             Self::Ide(d) => d.max_transfer_sectors(),
         }
     }
@@ -52,6 +62,8 @@ impl BlockDevice for SystemBlockDevice {
             Self::Virtio(d) => d.read_sector(lba, buffer),
             Self::Ahci(d) => d.read_sector(lba, buffer),
             Self::Nvme(d) => d.read_sector(lba, buffer),
+            Self::Usb(d) => d.read_sector(lba, buffer),
+            Self::Sdhci(d) => d.read_sector(lba, buffer),
             Self::Ide(d) => d.read_sector(lba, buffer),
         }
     }
@@ -61,6 +73,8 @@ impl BlockDevice for SystemBlockDevice {
             Self::Virtio(d) => d.write_sector(lba, buffer),
             Self::Ahci(d) => d.write_sector(lba, buffer),
             Self::Nvme(d) => d.write_sector(lba, buffer),
+            Self::Usb(d) => d.write_sector(lba, buffer),
+            Self::Sdhci(d) => d.write_sector(lba, buffer),
             Self::Ide(d) => d.write_sector(lba, buffer),
         }
     }
@@ -75,6 +89,8 @@ impl BlockDevice for SystemBlockDevice {
             Self::Virtio(d) => d.read_sectors(start_lba, sector_count, buffer),
             Self::Ahci(d) => d.read_sectors(start_lba, sector_count, buffer),
             Self::Nvme(d) => d.read_sectors(start_lba, sector_count, buffer),
+            Self::Usb(d) => d.read_sectors(start_lba, sector_count, buffer),
+            Self::Sdhci(d) => d.read_sectors(start_lba, sector_count, buffer),
             Self::Ide(d) => d.read_sectors(start_lba, sector_count, buffer),
         }
     }
@@ -89,6 +105,8 @@ impl BlockDevice for SystemBlockDevice {
             Self::Virtio(d) => d.write_sectors(start_lba, sector_count, buffer),
             Self::Ahci(d) => d.write_sectors(start_lba, sector_count, buffer),
             Self::Nvme(d) => d.write_sectors(start_lba, sector_count, buffer),
+            Self::Usb(d) => d.write_sectors(start_lba, sector_count, buffer),
+            Self::Sdhci(d) => d.write_sectors(start_lba, sector_count, buffer),
             Self::Ide(d) => d.write_sectors(start_lba, sector_count, buffer),
         }
     }
@@ -98,6 +116,8 @@ impl BlockDevice for SystemBlockDevice {
             Self::Virtio(d) => d.flush(),
             Self::Ahci(d) => d.flush(),
             Self::Nvme(d) => d.flush(),
+            Self::Usb(d) => d.flush(),
+            Self::Sdhci(d) => d.flush(),
             Self::Ide(d) => d.flush(),
         }
     }
@@ -115,6 +135,13 @@ pub enum MountedBackend {
     Nvme {
         max_dma_sectors: usize,
         lba_size: u32,
+    },
+    UsbMass {
+        max_dma_sectors: usize,
+    },
+    Sdhci {
+        max_dma_sectors: usize,
+        sdhc: bool,
     },
     IdeAta {
         controller: usize,
@@ -756,6 +783,8 @@ enum ProbeTarget {
     Virtio,
     Ahci(u8),
     Nvme,
+    Usb,
+    Sdhci,
     Ide(usize, bool, bool),
 }
 
@@ -810,6 +839,37 @@ fn open_probe_target(
                 MountedBackend::Nvme {
                     max_dma_sectors: max_dma,
                     lba_size: snap.lba_size,
+                },
+                None,
+            ))
+        }
+        ProbeTarget::Usb => {
+            let snap = usb::umass_snapshot();
+            if !snap.ready || snap.sector_count == 0 {
+                return None;
+            }
+            let dev = SystemBlockDevice::Usb(UsbMassBlockDevice);
+            let max_dma = dev.max_transfer_sectors();
+            Some((
+                CachedBlockDevice::new(dev, CacheBackendKind::UsbMass),
+                MountedBackend::UsbMass {
+                    max_dma_sectors: max_dma,
+                },
+                None,
+            ))
+        }
+        ProbeTarget::Sdhci => {
+            let snap = sdhci::snapshot();
+            if !snap.initialized || !snap.card_ready || snap.sector_count == 0 {
+                return None;
+            }
+            let dev = SystemBlockDevice::Sdhci(SdhciBlockDevice);
+            let max_dma = dev.max_transfer_sectors();
+            Some((
+                CachedBlockDevice::new(dev, CacheBackendKind::Sdhci),
+                MountedBackend::Sdhci {
+                    max_dma_sectors: max_dma,
+                    sdhc: snap.sdhc_v2,
                 },
                 None,
             ))
@@ -951,6 +1011,16 @@ impl KernelVfs {
             candidates.push(ProbeTarget::Nvme);
         }
 
+        let u_snap = usb::umass_snapshot();
+        if u_snap.ready && u_snap.sector_count > 0 {
+            candidates.push(ProbeTarget::Usb);
+        }
+
+        let sd_snap = sdhci::snapshot();
+        if sd_snap.initialized && sd_snap.card_ready && sd_snap.sector_count > 0 {
+            candidates.push(ProbeTarget::Sdhci);
+        }
+
         let count = crate::storage::ide::controller_count();
         for controller_index in 0..count {
             for secondary in [false, true] {
@@ -966,7 +1036,7 @@ impl KernelVfs {
             return Err(VfsError::NoDisk);
         }
 
-        // Pass 1: Prefer writable FAT32 volumes across fastest DMA controllers first (VirtIO -> AHCI -> NVMe -> IDE).
+        // Pass 1: Prefer writable FAT32 volumes across fastest DMA controllers first.
         for &target in &candidates {
             let Some((cached, backend, slot)) = open_probe_target(target) else {
                 continue;
@@ -1004,6 +1074,14 @@ impl KernelVfs {
 
     pub fn mount_nvme(&mut self) -> Result<(), VfsError> {
         self.mount_probe_target(ProbeTarget::Nvme)
+    }
+
+    pub fn mount_usb(&mut self) -> Result<(), VfsError> {
+        self.mount_probe_target(ProbeTarget::Usb)
+    }
+
+    pub fn mount_sd(&mut self) -> Result<(), VfsError> {
+        self.mount_probe_target(ProbeTarget::Sdhci)
     }
 
     pub fn mount_slot(

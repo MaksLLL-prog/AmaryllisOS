@@ -109,7 +109,7 @@ const IA32_FS_BASE_MSR: u32 = 0xC000_0100;
 const EFER_SCE: u64 = 1 << 0;
 const EFER_NXE: u64 = 1 << 11;
 
-const SYSCALL_STACK_SIZE: usize = 32 * 1024;
+const SYSCALL_STACK_SIZE: usize = 256 * 1024;
 
 #[repr(align(16))]
 struct AlignedSyscallStack([u8; SYSCALL_STACK_SIZE]);
@@ -242,7 +242,11 @@ global_asm!(
     "pop r9",
     "pop rcx",
     "pop r11",
-
+    "push rax",
+    "mov ax, 0x1B",
+    "mov ds, ax",
+    "mov es, ax",
+    "pop rax",
     "pop rsp",
     "swapgs",
     "sysretq",
@@ -657,7 +661,6 @@ pub unsafe fn run_user_quantum(
             asm!("fxsave64 [{}]", in(reg) kernel_fx.0.as_mut_ptr(), options(nostack));
             asm!("fxrstor64 [{}]", in(reg) user_fx.0.as_ptr(), options(nostack));
         }
-        crate::arch::percpu::ensure_kernel_gs_ready(SYSCALL_STACK_TOP);
         resume_user_context_asm(ctx as *const UserCpuContext);
         if has_fx {
             asm!("fxsave64 [{}]", in(reg) user_fx.0.as_mut_ptr(), options(nostack));
